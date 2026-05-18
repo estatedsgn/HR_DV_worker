@@ -102,3 +102,27 @@ Run the API:
 ```bash
 uvicorn app.main:app --reload
 ```
+
+## CRMchat connector scaffold
+
+The CRMchat integration is isolated behind `CRMChatConnector`. The connector is prepared for real API calls, but tests should inject a mock `httpx.AsyncClient` so no external network is required during development.
+
+Prepared connector capabilities:
+
+- Bearer-token CRMchat REST client configuration from environment variables.
+- Bootstrap helpers for organizations, workspaces, and active Telegram accounts.
+- A local allowlist for Telegram Raw API methods before forwarding calls to CRMchat.
+- A universal Telegram Raw API method caller for `/v1/workspaces/{workspaceId}/telegram-accounts/{accountId}/call/{method}`.
+- Thin wrappers for `contacts.resolveUsername`, `contacts.search`, `messages.getDialogs`, `messages.getHistory`, `messages.readHistory`, and `messages.sendMessage`.
+- `FLOOD_WAIT_N` parsing into a typed `TelegramFloodWaitError` for future Sendler retry scheduling.
+- Webhook signature verification with HMAC-SHA256 using `CRMCHAT_WEBHOOK_SECRET`.
+
+Additional CRMchat settings:
+
+- `CRMCHAT_API_KEY` — bearer token for API calls; keep it only in local/secret environment storage.
+- `CRMCHAT_ORGANIZATION_ID` — optional explicit organization selection.
+- `CRMCHAT_WORKSPACE_ID` — optional explicit workspace selection.
+- `CRMCHAT_DEFAULT_TELEGRAM_ACCOUNT_ID` — optional explicit Telegram account selection.
+- `CRMCHAT_TIMEOUT_SECONDS` — HTTP timeout for CRMchat requests.
+
+Telegram peer metadata is stored on dialogs so future outbound messages can use the correct `InputPeer` data. Outbound send logs also have `telegram_random_id` for Telegram `messages.sendMessage` idempotency.

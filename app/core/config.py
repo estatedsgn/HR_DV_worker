@@ -7,7 +7,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """Runtime configuration loaded from environment variables."""
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
     app_env: str = Field(default="local", alias="APP_ENV")
     database_url: str = Field(
@@ -17,7 +19,20 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     crmchat_api_base_url: str | None = Field(default=None, alias="CRMCHAT_API_BASE_URL")
-    crmchat_webhook_secret: str | None = Field(default=None, alias="CRMCHAT_WEBHOOK_SECRET")
+    crmchat_api_key: str | None = Field(default=None, alias="CRMCHAT_API_KEY")
+    crmchat_webhook_secret: str | None = Field(
+        default=None, alias="CRMCHAT_WEBHOOK_SECRET"
+    )
+    crmchat_organization_id: str | None = Field(
+        default=None, alias="CRMCHAT_ORGANIZATION_ID"
+    )
+    crmchat_workspace_id: str | None = Field(default=None, alias="CRMCHAT_WORKSPACE_ID")
+    crmchat_default_telegram_account_id: str | None = Field(
+        default=None, alias="CRMCHAT_DEFAULT_TELEGRAM_ACCOUNT_ID"
+    )
+    crmchat_timeout_seconds: float = Field(
+        default=10.0, alias="CRMCHAT_TIMEOUT_SECONDS"
+    )
     llm_provider: str | None = Field(default=None, alias="LLM_PROVIDER")
     llm_api_key: str | None = Field(default=None, alias="LLM_API_KEY")
 

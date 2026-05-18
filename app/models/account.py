@@ -10,10 +10,16 @@ class Account(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     __tablename__ = "accounts"
 
-    crmchat_account_id: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    crmchat_account_id: Mapped[str] = mapped_column(
+        String(255), unique=True, index=True, nullable=False
+    )
+    crmchat_organization_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    crmchat_workspace_id: Mapped[str | None] = mapped_column(String(255), index=True)
     telegram_username: Mapped[str | None] = mapped_column(String(255))
     display_name: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(50), default="active", nullable=False)
     metadata_json: Mapped[str | None] = mapped_column(Text)
 
-    dialogs: Mapped[list["Dialog"]] = relationship(back_populates="account", cascade="all, delete-orphan")
+    dialogs: Mapped[list["Dialog"]] = relationship(
+        back_populates="account", cascade="all, delete-orphan"
+    )
