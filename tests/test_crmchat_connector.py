@@ -63,7 +63,7 @@ async def test_get_dialogs_includes_required_hash_param() -> None:
     assert result == {"dialogs": []}
     assert captured["body"] == (
         '{"params":{"offsetDate":0,"offsetId":0,'
-        '"offsetPeer":{"_":"inputPeerEmpty"},"limit":5,"hash":0}}'
+        '"offsetPeer":{"_":"inputPeerEmpty"},"limit":5,"hash":"0"}}'
     )
 
     await client.aclose()
@@ -93,7 +93,7 @@ async def test_get_history_includes_required_pagination_params() -> None:
     assert captured["body"] == (
         '{"params":{"peer":{"_":"inputPeerUser","userId":123,"accessHash":"hash"},'
         '"offsetId":0,"offsetDate":0,"addOffset":0,"limit":5,'
-        '"maxId":0,"minId":0,"hash":0}}'
+        '"maxId":0,"minId":0,"hash":"0"}}'
     )
 
     await client.aclose()

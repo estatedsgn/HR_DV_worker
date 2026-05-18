@@ -347,7 +347,7 @@ class CRMChatConnector:
         offset_date: int = 0,
         offset_id: int = 0,
         offset_peer: Mapping[str, Any] | None = None,
-        hash_value: int = 0,
+        hash_value: int | str = "0",
     ) -> Mapping[str, Any]:
         return await self.call_telegram_method(
             workspace_id,
@@ -358,7 +358,7 @@ class CRMChatConnector:
                 "offsetId": offset_id,
                 "offsetPeer": offset_peer or {"_": "inputPeerEmpty"},
                 "limit": limit,
-                "hash": hash_value,
+                "hash": str(hash_value),
             },
         )
 
@@ -373,7 +373,7 @@ class CRMChatConnector:
         add_offset: int = 0,
         max_id: int = 0,
         min_id: int = 0,
-        hash_value: int = 0,
+        hash_value: int | str = "0",
     ) -> Mapping[str, Any]:
         return await self.call_telegram_method(
             workspace_id,
@@ -387,7 +387,7 @@ class CRMChatConnector:
                 "limit": limit,
                 "maxId": max_id,
                 "minId": min_id,
-                "hash": hash_value,
+                "hash": str(hash_value),
             },
         )
 
