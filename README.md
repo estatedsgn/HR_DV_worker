@@ -119,6 +119,7 @@ Prepared connector capabilities:
 
 Additional CRMchat settings:
 
+- `CRMCHAT_API_BASE_URL` — CRMchat API server URL, usually `https://api.crmchat.ai`.
 - `CRMCHAT_API_KEY` — bearer token for API calls; keep it only in local/secret environment storage.
 - `CRMCHAT_ORGANIZATION_ID` — optional explicit organization selection.
 - `CRMCHAT_WORKSPACE_ID` — optional explicit workspace selection.
@@ -126,6 +127,74 @@ Additional CRMchat settings:
 - `CRMCHAT_TIMEOUT_SECONDS` — HTTP timeout for CRMchat requests.
 
 Telegram peer metadata is stored on dialogs so future outbound messages can use the correct `InputPeer` data. Outbound send logs also have `telegram_random_id` for Telegram `messages.sendMessage` idempotency.
+
+## CRMchat webhooks
+
+The service exposes a CRMchat webhook receiver at:
+
+```http
+POST /webhooks/crmchat
+```
+
+The receiver verifies `X-Webhook-Signature` with `CRMCHAT_WEBHOOK_SECRET`, parses the CRMchat webhook envelope, stores the event in `crmchat_webhook_events`, and returns an idempotent response for repeated `eventId` values.
+
+Supported CRM contact events are stored with `status=received`:
+
+- `contact.created`
+- `contact.updated`
+- `contact.deleted`
+
+Other event types are stored with `status=ignored` so we can inspect future CRMchat payloads without breaking delivery retries.
+
+For local CRMchat webhook testing:
+
+1. Run the API:
+
+   ```bash
+   uvicorn app.main:app --reload
+   ```
+
+2. Expose it through a public tunnel, for example:
+
+   ```bash
+   ngrok http 8000
+   ```
+
+3. Register the public URL in CRMchat:
+
+   ```text
+   https://<ngrok-domain>/webhooks/crmchat
+   ```
+
+4. Configure the same signing secret in CRMchat and in `.env` as `CRMCHAT_WEBHOOK_SECRET`.
+
+Contact webhooks are useful for CRM contact synchronization, but they are not enough by themselves for an auto-reply Telegram agent. If CRMchat does not provide message webhooks, inbound Telegram messages should be ingested through polling with `messages.getDialogs` and `messages.getHistory`.
+
+## Telegram polling sync
+
+CRMchat contact webhooks do not provide a full Telegram message stream. Until a message webhook is available, the worker can read recent Telegram activity through CRMchat Telegram Raw API polling.
+
+Default polling settings:
+
+- `TELEGRAM_POLL_INTERVAL_SECONDS=60` — recommended cadence is one request cycle per minute.
+- `TELEGRAM_POLL_DIALOGS_LIMIT=20` — maximum recent dialogs requested per cycle.
+- `TELEGRAM_POLL_HISTORY_LIMIT=20` — maximum recent messages requested per dialog.
+
+Run one safe read-only polling cycle and persist new dialogs/messages:
+
+```bash
+python scripts/poll_telegram_updates.py
+```
+
+Run continuous polling:
+
+```bash
+python scripts/poll_telegram_updates.py --loop
+```
+
+The polling service stores each run in `telegram_polling_runs`, creates/updates `Account` and `Dialog` records, and inserts new `Message` rows with stable external ids. New user dialogs start with `status=pending_review`; non-user peers are marked `ignored`. This keeps noisy/warmup/non-target conversations out of the agent pipeline until lead qualification is implemented.
+
+If Telegram returns `FLOOD_WAIT_N`, the service records `status=rate_limited`, stores `flood_wait_seconds`, calculates `next_run_at`, and waits at least the larger value of `N` or `TELEGRAM_POLL_INTERVAL_SECONDS` before the next loop iteration.
 
 ## Verifying CRMchat API credentials
 

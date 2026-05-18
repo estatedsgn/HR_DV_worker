@@ -15,6 +15,7 @@ from app.services.lead_qualifier import LeadQualifier
 from app.services.llm_adapter import LLMAdapter
 from app.services.message_handler import MessageHandler
 from app.services.sendler import Sendler
+from app.services.telegram_polling import TelegramPollingService
 
 __all__ = [
     "CRMCHAT_TELEGRAM_ALLOWED_METHODS",
@@ -29,5 +30,6 @@ __all__ = [
     "MessageHandler",
     "Sendler",
     "TelegramFloodWaitError",
+    "TelegramPollingService",
     "verify_webhook_signature",
 ]

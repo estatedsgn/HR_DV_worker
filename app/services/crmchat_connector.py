@@ -347,6 +347,7 @@ class CRMChatConnector:
         offset_date: int = 0,
         offset_id: int = 0,
         offset_peer: Mapping[str, Any] | None = None,
+        hash_value: int = 0,
     ) -> Mapping[str, Any]:
         return await self.call_telegram_method(
             workspace_id,
@@ -357,6 +358,7 @@ class CRMChatConnector:
                 "offsetId": offset_id,
                 "offsetPeer": offset_peer or {"_": "inputPeerEmpty"},
                 "limit": limit,
+                "hash": hash_value,
             },
         )
 
@@ -498,6 +500,50 @@ def normalize_dialogs_response(
                     dialog.get("unreadCount") or dialog.get("unread_count")
                 ),
                 raw={"dialog": dialog, "top_message": raw_message},
+            )
+        )
+    return snapshots
+
+
+def normalize_messages_response(
+    payload: Mapping[str, Any], fallback_peer: TelegramPeer | None = None
+) -> list[TelegramMessageSnapshot]:
+    users_by_id = {
+        str(user.get("id")): user
+        for user in payload.get("users", [])
+        if isinstance(user, Mapping)
+    }
+    chats_by_id = {
+        str(chat.get("id")): chat
+        for chat in payload.get("chats", [])
+        if isinstance(chat, Mapping)
+    }
+
+    snapshots: list[TelegramMessageSnapshot] = []
+    for raw_message in payload.get("messages", []):
+        if not isinstance(raw_message, Mapping):
+            continue
+        message_id = optional_str(raw_message.get("id"))
+        if not message_id:
+            continue
+        raw_peer = raw_message.get("peerId") or raw_message.get("peer_id")
+        peer = (
+            normalize_peer(raw_peer, users_by_id=users_by_id, chats_by_id=chats_by_id)
+            or fallback_peer
+        )
+        snapshots.append(
+            TelegramMessageSnapshot(
+                message_id=message_id,
+                peer=peer,
+                text=optional_str(
+                    raw_message.get("message")
+                    or raw_message.get("text")
+                    or raw_message.get("body")
+                    or ""
+                ),
+                date=optional_str(raw_message.get("date")),
+                outgoing=bool(raw_message.get("out") or raw_message.get("outgoing")),
+                raw=raw_message,
             )
         )
     return snapshots

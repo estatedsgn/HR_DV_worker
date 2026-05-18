@@ -9,9 +9,11 @@ class Base(DeclarativeBase):
 from app.models import (  # noqa: E402,F401
     Account,
     AgentActionLog,
+    CRMChatWebhookEvent,
     Dialog,
     HumanHandoff,
     Lead,
     Message,
     OutboundSendLog,
+    TelegramPollingRun,
 )

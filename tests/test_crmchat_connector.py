@@ -46,6 +46,30 @@ async def test_call_telegram_method_uses_expected_url_and_payload() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_dialogs_includes_required_hash_param() -> None:
+    captured = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = request.content.decode()
+        return httpx.Response(200, json={"result": {"dialogs": []}})
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.crmchat.ai"
+    )
+    connector = CRMChatConnector(settings=Settings(), http_client=client)
+
+    result = await connector.get_dialogs("workspace-1", "account-1", limit=5)
+
+    assert result == {"dialogs": []}
+    assert captured["body"] == (
+        '{"params":{"offsetDate":0,"offsetId":0,'
+        '"offsetPeer":{"_":"inputPeerEmpty"},"limit":5,"hash":0}}'
+    )
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_call_telegram_method_rejects_disallowed_method() -> None:
     client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda request: httpx.Response(200)),

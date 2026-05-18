@@ -33,6 +33,15 @@ class Settings(BaseSettings):
     crmchat_timeout_seconds: float = Field(
         default=10.0, alias="CRMCHAT_TIMEOUT_SECONDS"
     )
+    telegram_poll_interval_seconds: int = Field(
+        default=60, alias="TELEGRAM_POLL_INTERVAL_SECONDS"
+    )
+    telegram_poll_dialogs_limit: int = Field(
+        default=20, alias="TELEGRAM_POLL_DIALOGS_LIMIT"
+    )
+    telegram_poll_history_limit: int = Field(
+        default=20, alias="TELEGRAM_POLL_HISTORY_LIMIT"
+    )
     llm_provider: str | None = Field(default=None, alias="LLM_PROVIDER")
     llm_api_key: str | None = Field(default=None, alias="LLM_API_KEY")
 
