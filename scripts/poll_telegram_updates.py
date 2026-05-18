@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 
 from app.core.config import get_settings
 from app.db.session import AsyncSessionLocal
 from app.services.crmchat_connector import CRMChatAPIError, CRMChatConnector
+from app.services.crmchat_diagnostics import redact_value
 from app.services.telegram_polling import TelegramPollingService
 
 
@@ -76,4 +78,7 @@ if __name__ == "__main__":
         print(f"CRMchat API error: {exc}")
         if exc.status_code:
             print(f"Status code: {exc.status_code}")
+        if exc.payload:
+            print("Redacted error payload:")
+            print(json.dumps(redact_value(exc.payload), ensure_ascii=False, indent=2))
         raise SystemExit(1) from exc

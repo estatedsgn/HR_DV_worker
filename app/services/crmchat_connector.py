@@ -368,12 +368,27 @@ class CRMChatConnector:
         account_id: str,
         peer: Mapping[str, Any],
         limit: int = 50,
+        offset_id: int = 0,
+        offset_date: int = 0,
+        add_offset: int = 0,
+        max_id: int = 0,
+        min_id: int = 0,
+        hash_value: int = 0,
     ) -> Mapping[str, Any]:
         return await self.call_telegram_method(
             workspace_id,
             account_id,
             "messages.getHistory",
-            {"peer": dict(peer), "limit": limit},
+            {
+                "peer": dict(peer),
+                "offsetId": offset_id,
+                "offsetDate": offset_date,
+                "addOffset": add_offset,
+                "limit": limit,
+                "maxId": max_id,
+                "minId": min_id,
+                "hash": hash_value,
+            },
         )
 
     async def read_history(

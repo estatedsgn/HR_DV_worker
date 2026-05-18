@@ -70,6 +70,36 @@ async def test_get_dialogs_includes_required_hash_param() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_history_includes_required_pagination_params() -> None:
+    captured = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = request.content.decode()
+        return httpx.Response(200, json={"result": {"messages": []}})
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.crmchat.ai"
+    )
+    connector = CRMChatConnector(settings=Settings(), http_client=client)
+
+    result = await connector.get_history(
+        "workspace-1",
+        "account-1",
+        {"_": "inputPeerUser", "userId": 123, "accessHash": "hash"},
+        limit=5,
+    )
+
+    assert result == {"messages": []}
+    assert captured["body"] == (
+        '{"params":{"peer":{"_":"inputPeerUser","userId":123,"accessHash":"hash"},'
+        '"offsetId":0,"offsetDate":0,"addOffset":0,"limit":5,'
+        '"maxId":0,"minId":0,"hash":0}}'
+    )
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_call_telegram_method_rejects_disallowed_method() -> None:
     client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda request: httpx.Response(200)),
