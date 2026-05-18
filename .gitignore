@@ -27,3 +27,7 @@ venv/
 build/
 dist/
 *.egg-info/
+
+# Local CRMchat diagnostics
+docs/samples/*.local.json
+docs/samples/*.local.*.json

@@ -126,3 +126,32 @@ Additional CRMchat settings:
 - `CRMCHAT_TIMEOUT_SECONDS` — HTTP timeout for CRMchat requests.
 
 Telegram peer metadata is stored on dialogs so future outbound messages can use the correct `InputPeer` data. Outbound send logs also have `telegram_random_id` for Telegram `messages.sendMessage` idempotency.
+
+## Verifying CRMchat API credentials
+
+Use the read-only probe script after filling CRMchat settings in `.env`:
+
+```bash
+python scripts/crmchat_probe.py --dialogs-limit 5
+```
+
+The probe performs safe read-only checks only:
+
+1. Bootstraps the selected organization, workspace, and active Telegram account.
+2. Lists workspace/account counts for the selected context.
+3. Calls `messages.getDialogs` through CRMchat Telegram Raw API.
+4. Prints normalized dialog summaries without printing Telegram `accessHash` values.
+
+To inspect recent history for the first normalized dialog, run:
+
+```bash
+python scripts/crmchat_probe.py --dialogs-limit 5 --with-history --history-limit 5
+```
+
+To save a shareable diagnostic snapshot, use a local redacted file path:
+
+```bash
+python scripts/crmchat_probe.py --dialogs-limit 5 --save-redacted docs/samples/crmchat_probe.local.json
+```
+
+Files matching `docs/samples/*.local.json` are ignored by Git. Do not paste API keys, access hashes, phone numbers, or raw private message text into issues or chats.
