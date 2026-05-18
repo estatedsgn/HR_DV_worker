@@ -9,7 +9,10 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
-from app.models import Account, Dialog, Message, TelegramPollingRun
+from app.models.account import Account
+from app.models.dialog import Dialog
+from app.models.message import Message
+from app.models.telegram_polling_run import TelegramPollingRun
 from app.repositories.account import AccountRepository
 from app.repositories.dialog import DialogRepository
 from app.repositories.message import MessageRepository

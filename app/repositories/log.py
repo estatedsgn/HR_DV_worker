@@ -1,4 +1,6 @@
-from app.models import AgentActionLog, HumanHandoff, OutboundSendLog
+from app.models.agent_action_log import AgentActionLog
+from app.models.human_handoff import HumanHandoff
+from app.models.outbound_send_log import OutboundSendLog
 from app.repositories.base import BaseRepository
 
 

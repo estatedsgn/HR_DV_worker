@@ -1,6 +1,6 @@
 from sqlalchemy import select
 
-from app.models import Dialog
+from app.models.dialog import Dialog
 from app.repositories.base import BaseRepository
 
 
