@@ -3,6 +3,7 @@ from app.models.agent_action_log import AgentActionLog
 from app.models.crmchat_webhook_event import CRMChatWebhookEvent
 from app.models.dialog import Dialog
 from app.models.human_handoff import HumanHandoff
+from app.models.inbound_event import InboundEvent
 from app.models.lead import Lead
 from app.models.message import Message
 from app.models.outbound_send_log import OutboundSendLog
@@ -14,6 +15,7 @@ __all__ = [
     "CRMChatWebhookEvent",
     "Dialog",
     "HumanHandoff",
+    "InboundEvent",
     "Lead",
     "Message",
     "OutboundSendLog",

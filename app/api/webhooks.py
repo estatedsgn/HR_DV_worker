@@ -1,4 +1,5 @@
 import json
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
@@ -14,8 +15,10 @@ from app.services.crmchat_webhooks import (
     parse_webhook_envelope,
     verify_webhook_signature,
 )
+from app.services.inbound_pipeline import InboundPipelineService
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
+logger = logging.getLogger(__name__)
 
 SUPPORTED_CRMCHAT_EVENTS = frozenset(
     {
@@ -76,6 +79,7 @@ async def receive_crmchat_webhook(
     if existing:
         return {
             "status": "duplicate",
+            "duplicate_scope": "webhook_event",
             "event_id": existing.event_id,
             "event_type": existing.event_type,
         }
@@ -92,12 +96,36 @@ async def receive_crmchat_webhook(
     )
     await repository.add(event)
 
+    inbound_service = InboundPipelineService(session)
+    _, is_new = await inbound_service.enqueue(
+        source="crmchat_webhook",
+        payload=payload,
+        external_event_id=event_id,
+    )
+    if not is_new:
+        logger.info(
+            "crmchat inbound queue duplicate",
+            extra={
+                "event_id": event_id,
+                "event_type": event_type,
+                "source": "crmchat_webhook",
+                "queue_status": "duplicate",
+            },
+        )
+        return {
+            "status": "duplicate",
+            "duplicate_scope": "inbound_queue",
+            "event_id": event_id,
+            "event_type": event_type,
+        }
+
     try:
         await session.commit()
     except IntegrityError:
         await session.rollback()
         return {
             "status": "duplicate",
+            "duplicate_scope": "webhook_event",
             "event_id": event_id,
             "event_type": event_type,
         }

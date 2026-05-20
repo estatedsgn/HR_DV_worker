@@ -27,6 +27,7 @@ from app.services.crmchat_connector import (
     normalize_messages_response,
 )
 from app.services.crmchat_diagnostics import build_input_peer, redact_value
+from app.services.inbound_pipeline import InboundPipelineService
 
 
 @dataclass(slots=True, frozen=True)
@@ -59,6 +60,7 @@ class TelegramPollingService:
         self.session = session
         self.settings = settings or get_settings()
         self.connector = connector or CRMChatConnector(settings=self.settings)
+        self.inbound_pipeline = InboundPipelineService(session)
 
     async def poll_once(self) -> TelegramPollingResult:
         started_at = datetime.now(UTC)
@@ -225,6 +227,20 @@ class TelegramPollingService:
             message_kwargs["sent_at"] = sent_at
         message = Message(**message_kwargs)
         await repository.add(message)
+        await self.inbound_pipeline.enqueue(
+            source="telegram_polling",
+            payload={
+                "workspace_id": context.workspace.id,
+                "account_id": context.telegram_account.id,
+                "dialog_id": str(dialog.id),
+                "message_id": message_snapshot.message_id,
+                "text": message_snapshot.text or "",
+                "outgoing": message_snapshot.outgoing,
+            },
+            external_message_id=external_message_id,
+            account_id=dialog.account_id,
+            dialog_id=dialog.id,
+        )
         return True
 
     async def _mark_rate_limited(
