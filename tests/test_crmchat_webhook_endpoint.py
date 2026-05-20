@@ -36,20 +36,32 @@ class FakeWebhookEventRepository:
         return instance
 
 
+class FakeInboundPipelineService:
+    event_ids = set()
+
+    def __init__(self, session: FakeSession) -> None:
+        self.session = session
+
+    async def enqueue(self, *, source: str, payload: dict, external_event_id=None, external_message_id=None, account_id=None, dialog_id=None):
+        if external_event_id and external_event_id in self.event_ids:
+            return object(), False
+        if external_event_id:
+            self.event_ids.add(external_event_id)
+        return object(), True
+
+
 @pytest.fixture(autouse=True)
 def override_dependencies(monkeypatch: pytest.MonkeyPatch):
     FakeWebhookEventRepository.events = {}
-    monkeypatch.setattr(
-        webhooks, "CRMChatWebhookEventRepository", FakeWebhookEventRepository
-    )
+    FakeInboundPipelineService.event_ids = set()
+    monkeypatch.setattr(webhooks, "CRMChatWebhookEventRepository", FakeWebhookEventRepository)
+    monkeypatch.setattr(webhooks, "InboundPipelineService", FakeInboundPipelineService)
 
     async def override_get_session() -> AsyncGenerator[FakeSession, None]:
         yield FakeSession()
 
     app.dependency_overrides[get_session] = override_get_session
-    app.dependency_overrides[get_settings] = lambda: Settings(
-        CRMCHAT_WEBHOOK_SECRET="secret"
-    )
+    app.dependency_overrides[get_settings] = lambda: Settings(CRMCHAT_WEBHOOK_SECRET="secret")
     yield
     app.dependency_overrides.clear()
 
@@ -116,6 +128,7 @@ def test_crmchat_webhook_is_idempotent_by_event_id() -> None:
     assert second.status_code == 202
     assert second.json() == {
         "status": "duplicate",
+        "duplicate_scope": "webhook_event",
         "event_id": "evt_1",
         "event_type": "contact.deleted",
     }
@@ -134,3 +147,24 @@ def test_crmchat_webhook_stores_unknown_events_as_ignored() -> None:
     assert response.status_code == 202
     assert response.json()["status"] == "ignored"
     assert FakeWebhookEventRepository.events["evt_1"].status == "ignored"
+
+
+def test_crmchat_webhook_duplicate_on_inbound_queue_logs_scope(caplog: pytest.LogCaptureFixture) -> None:
+    raw_body = b'{"eventId":"evt_1","eventType":"contact.created"}'
+    FakeInboundPipelineService.event_ids.add("evt_1")
+
+    with caplog.at_level("INFO"):
+        response = TestClient(app).post(
+            "/webhooks/crmchat",
+            content=raw_body,
+            headers={"X-Webhook-Signature": signature_for(raw_body)},
+        )
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "status": "duplicate",
+        "duplicate_scope": "inbound_queue",
+        "event_id": "evt_1",
+        "event_type": "contact.created",
+    }
+    assert "crmchat inbound queue duplicate" in caplog.text

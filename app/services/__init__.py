@@ -1,4 +1,15 @@
+from app.services.agent_policy import AgentPolicyService, PolicyDecision
+from app.services.agent_toolkit import (
+    AgentToolkitService,
+    ProposeReplyInput,
+    ProposeReplyOutput,
+    ReadDialogContextInput,
+    ReadDialogContextOutput,
+    RequestHumanHandoffInput,
+    RequestHumanHandoffOutput,
+)
 from app.services.conversation_memory import ConversationMemory
+from app.services.dialog_state import DialogStateService, DialogStateSnapshot
 from app.services.crmchat_connector import (
     CRMCHAT_TELEGRAM_ALLOWED_METHODS,
     CRMChatAPIError,
@@ -18,12 +29,23 @@ from app.services.sendler import Sendler
 from app.services.telegram_polling import TelegramPollingService
 
 __all__ = [
+    "PolicyDecision",
+    "AgentPolicyService",
+    "RequestHumanHandoffOutput",
+    "RequestHumanHandoffInput",
+    "ProposeReplyOutput",
+    "ProposeReplyInput",
+    "ReadDialogContextOutput",
+    "ReadDialogContextInput",
+    "AgentToolkitService",
     "CRMCHAT_TELEGRAM_ALLOWED_METHODS",
     "CRMChatAPIError",
     "CRMChatConnector",
     "CRMChatMethodNotAllowedError",
     "CRMChatWebhookEnvelope",
     "ConversationMemory",
+    "DialogStateService",
+    "DialogStateSnapshot",
     "HumanHandoffService",
     "LeadQualifier",
     "LLMAdapter",
