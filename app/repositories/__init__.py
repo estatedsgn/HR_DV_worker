@@ -6,6 +6,7 @@ from app.repositories.lead import LeadRepository
 from app.repositories.log import LogRepository
 from app.repositories.message import MessageRepository
 from app.repositories.telegram_polling_run import TelegramPollingRunRepository
+from app.repositories.telegram_dialog_target import TelegramDialogTargetRepository
 
 __all__ = [
     "AccountRepository",
@@ -16,4 +17,5 @@ __all__ = [
     "LogRepository",
     "MessageRepository",
     "TelegramPollingRunRepository",
+    "TelegramDialogTargetRepository",
 ]

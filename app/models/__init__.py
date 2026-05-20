@@ -8,6 +8,7 @@ from app.models.lead import Lead
 from app.models.message import Message
 from app.models.outbound_send_log import OutboundSendLog
 from app.models.telegram_polling_run import TelegramPollingRun
+from app.models.telegram_dialog_target import TelegramDialogTarget
 
 __all__ = [
     "Account",
@@ -20,4 +21,5 @@ __all__ = [
     "Message",
     "OutboundSendLog",
     "TelegramPollingRun",
+    "TelegramDialogTarget",
 ]

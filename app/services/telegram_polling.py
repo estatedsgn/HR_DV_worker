@@ -17,6 +17,7 @@ from app.repositories.account import AccountRepository
 from app.repositories.dialog import DialogRepository
 from app.repositories.message import MessageRepository
 from app.repositories.telegram_polling_run import TelegramPollingRunRepository
+from app.repositories.telegram_dialog_target import TelegramDialogTargetRepository
 from app.services.crmchat_connector import (
     CRMChatBootstrapContext,
     CRMChatConnector,
@@ -28,6 +29,7 @@ from app.services.crmchat_connector import (
 )
 from app.services.crmchat_diagnostics import build_input_peer, redact_value
 from app.services.inbound_pipeline import InboundPipelineService
+from app.services.new_message_handler import NewMessageHandler
 
 
 @dataclass(slots=True, frozen=True)
@@ -61,6 +63,7 @@ class TelegramPollingService:
         self.settings = settings or get_settings()
         self.connector = connector or CRMChatConnector(settings=self.settings)
         self.inbound_pipeline = InboundPipelineService(session)
+        self.new_message_handler = NewMessageHandler()
 
     async def poll_once(self) -> TelegramPollingResult:
         started_at = datetime.now(UTC)
@@ -116,7 +119,15 @@ class TelegramPollingService:
         dialog_snapshot: TelegramDialogSnapshot,
     ) -> tuple[bool, int, int]:
         dialog = await self._get_or_create_dialog(account, dialog_snapshot)
-        if dialog.status == "ignored":
+        target_repo = TelegramDialogTargetRepository(self.session)
+        is_target = await target_repo.is_target(
+            account_id=account.id,
+            peer_type=dialog_snapshot.peer.peer_type,
+            peer_id=dialog_snapshot.peer.peer_id,
+        )
+        if not is_target:
+            if dialog.status != "ignored":
+                dialog.status = "ignored"
             await self.session.flush()
             return True, 0, 0
         try:
@@ -227,6 +238,9 @@ class TelegramPollingService:
             message_kwargs["sent_at"] = sent_at
         message = Message(**message_kwargs)
         await repository.add(message)
+        await self.new_message_handler.on_new_message(
+            dialog_id=str(dialog.id), crmchat_message_id=external_message_id
+        )
         await self.inbound_pipeline.enqueue(
             source="telegram_polling",
             payload={
