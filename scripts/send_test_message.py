@@ -34,7 +34,11 @@ def build_peer_from_resolve_username(payload: Mapping[str, Any]) -> Mapping[str,
             access_hash = _find_access_hash_for_user(data, user_id)
             if access_hash is None:
                 raise ValueError("Unable to find accessHash for resolved user")
-            return {"_": "inputPeerUser", "userId": user_id, "accessHash": str(access_hash)}
+            return {
+                "_": "inputPeerUser",
+                "userId": int(user_id),
+                "accessHash": str(access_hash),
+            }
 
     # fallback: direct user object
     users = data.get("users") if isinstance(data.get("users"), list) else []
@@ -72,7 +76,7 @@ async def main() -> None:
         )
         peer = build_peer_from_resolve_username(resolved)
 
-        random_id = random.getrandbits(63)
+        random_id = str(random.getrandbits(63))
         print(
             f"prepared send workspace={ctx.workspace.id} account={ctx.telegram_account.id} "
             f"username={args.username} random_id={random_id}"
