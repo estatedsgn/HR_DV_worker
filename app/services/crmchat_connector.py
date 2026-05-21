@@ -411,13 +411,13 @@ class CRMChatConnector:
         account_id: str,
         peer: Mapping[str, Any],
         message: str,
-        random_id: int,
+        random_id: int | str,
     ) -> Mapping[str, Any]:
         return await self.call_telegram_method(
             workspace_id,
             account_id,
             "messages.sendMessage",
-            {"peer": dict(peer), "message": message, "randomId": random_id},
+            {"peer": dict(peer), "message": message, "randomId": str(random_id)},
         )
 
     async def parse_incoming_message(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -562,6 +562,49 @@ def normalize_messages_response(
             )
         )
     return snapshots
+
+
+def build_input_peer_from_resolve_username(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    data = payload.get("data") if isinstance(payload.get("data"), Mapping) else payload
+    if not isinstance(data, Mapping):
+        raise ValueError("resolveUsername payload must be an object")
+
+    peer = data.get("peer")
+    if isinstance(peer, Mapping):
+        peer_type = str(peer.get("_") or "").lower()
+        if "peeruser" in peer_type and peer.get("userId") is not None:
+            user_id = int(peer["userId"])
+            access_hash = find_access_hash_for_user(data, user_id)
+            if access_hash is None:
+                raise ValueError("Unable to find accessHash for resolved user")
+            return {
+                "_": "inputPeerUser",
+                "userId": user_id,
+                "accessHash": str(access_hash),
+            }
+
+    users = data.get("users") if isinstance(data.get("users"), list) else []
+    if users and isinstance(users[0], Mapping):
+        user = users[0]
+        if user.get("id") is None or user.get("accessHash") is None:
+            raise ValueError("Resolved user payload missing id/accessHash")
+        return {
+            "_": "inputPeerUser",
+            "userId": int(user["id"]),
+            "accessHash": str(user["accessHash"]),
+        }
+
+    raise ValueError("Could not build inputPeerUser from resolveUsername payload")
+
+
+def find_access_hash_for_user(data: Mapping[str, Any], user_id: int) -> str | None:
+    users = data.get("users") if isinstance(data.get("users"), list) else []
+    for raw_user in users:
+        if not isinstance(raw_user, Mapping):
+            continue
+        if int(raw_user.get("id", -1)) == user_id and raw_user.get("accessHash") is not None:
+            return str(raw_user["accessHash"])
+    return None
 
 
 def normalize_peer(

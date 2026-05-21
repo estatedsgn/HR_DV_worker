@@ -26,6 +26,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Polling interval for --loop. Defaults to TELEGRAM_POLL_INTERVAL_SECONDS.",
     )
+    parser.add_argument(
+        "--all-accounts",
+        action="store_true",
+        help="Poll every active Telegram account in the selected workspace.",
+    )
+    parser.add_argument(
+        "--only-username",
+        help="Only sync one Telegram username, for example @iamnekiy.",
+    )
     return parser.parse_args()
 
 
@@ -40,18 +49,32 @@ async def run() -> None:
             while True:
                 async with AsyncSessionLocal() as session:
                     service = TelegramPollingService(
-                        session=session, connector=connector, settings=settings
+                        session=session,
+                        connector=connector,
+                        settings=settings,
+                        only_username=args.only_username,
                     )
-                    result = await service.poll_once()
+                    result = (
+                        await service.poll_all_active_accounts_once()
+                        if args.all_accounts
+                        else await service.poll_once()
+                    )
                     print_result(result)
                     sleep_seconds = max(interval, result.flood_wait_seconds or 0)
                 await asyncio.sleep(sleep_seconds)
         else:
             async with AsyncSessionLocal() as session:
                 service = TelegramPollingService(
-                    session=session, connector=connector, settings=settings
+                    session=session,
+                    connector=connector,
+                    settings=settings,
+                    only_username=args.only_username,
                 )
-                result = await service.poll_once()
+                result = (
+                    await service.poll_all_active_accounts_once()
+                    if args.all_accounts
+                    else await service.poll_once()
+                )
                 print_result(result)
 
 

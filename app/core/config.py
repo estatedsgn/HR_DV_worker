@@ -44,6 +44,23 @@ class Settings(BaseSettings):
     )
     llm_provider: str | None = Field(default=None, alias="LLM_PROVIDER")
     llm_api_key: str | None = Field(default=None, alias="LLM_API_KEY")
+    llm_model: str = Field(default="gpt-5.4-mini", alias="LLM_MODEL")
+    llm_mock_decision_json: str = Field(
+        default='{"decision":"reply","lead_status":"interested","reply_text":"Спасибо, передам детали менеджеру.","handoff_reason":null,"confidence":0.7}',
+        alias="LLM_MOCK_DECISION_JSON",
+    )
+    outbound_real_send_enabled: bool = Field(
+        default=False, alias="OUTBOUND_REAL_SEND_ENABLED"
+    )
+    outbound_allowed_usernames: str = Field(
+        default="@iamnekiy", alias="OUTBOUND_ALLOWED_USERNAMES"
+    )
+    outbound_default_send_interval_seconds: int = Field(
+        default=300, alias="OUTBOUND_DEFAULT_SEND_INTERVAL_SECONDS"
+    )
+    outbound_default_send_jitter_seconds: int = Field(
+        default=60, alias="OUTBOUND_DEFAULT_SEND_JITTER_SECONDS"
+    )
 
 
 @lru_cache

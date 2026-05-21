@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.inbound_event import InboundEvent
 from app.repositories.inbound_event import InboundEventRepository
+from app.services.campaign_sequence import CampaignSequenceService
 
 logger = logging.getLogger(__name__)
 
@@ -110,3 +111,11 @@ class InboundQueueWorker:
             raise RetryableInboundEventError("temporary downstream error")
         if payload.get("simulate") == "fail":
             raise RuntimeError("non-retryable processing error")
+        if payload.get("outgoing"):
+            return
+        dialog_id = getattr(event, "dialog_id", None) or payload.get("dialog_id")
+        if dialog_id:
+            await CampaignSequenceService(self.session).handle_inbound_message(
+                dialog_id=str(dialog_id),
+                message_id=payload.get("db_message_id"),
+            )

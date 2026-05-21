@@ -224,3 +224,65 @@ python scripts/crmchat_probe.py --dialogs-limit 5 --save-redacted docs/samples/c
 ```
 
 Files matching `docs/samples/*.local.json` are ignored by Git. Do not paste API keys, access hashes, phone numbers, or raw private message text into issues or chats.
+
+## V1 test-production runbook
+
+The V1 worker has a durable skeleton for lead intake, campaign sequencing, inbound/outbound queues, conservative sending, and a mini-LLM decision step.
+
+Prepare the database and default campaign:
+
+```powershell
+.\.venv\Scripts\alembic upgrade head
+.\.venv\Scripts\python scripts\seed_default_campaign.py
+```
+
+Sync CRMChat Telegram accounts into the local account table:
+
+```powershell
+.\.venv\Scripts\python scripts\sync_crmchat_accounts.py --dry-run --report
+.\.venv\Scripts\python scripts\sync_crmchat_accounts.py --report
+```
+
+Enqueue a controlled test lead:
+
+```powershell
+.\.venv\Scripts\python scripts\enqueue_lead.py --source smoke --external-lead-id smoke-1 --username '@iamnekiy'
+```
+
+Run workers once:
+
+```powershell
+.\.venv\Scripts\python scripts\poll_telegram_updates.py --all-accounts
+.\.venv\Scripts\python scripts\process_inbound_queue.py --limit 100
+.\.venv\Scripts\python scripts\process_outbound_queue.py --allow-real-send --limit 50
+```
+
+Run workers continuously:
+
+```powershell
+.\.venv\Scripts\python scripts\poll_telegram_updates.py --all-accounts --loop
+.\.venv\Scripts\python scripts\process_inbound_queue.py --loop --interval-seconds 10
+.\.venv\Scripts\python scripts\process_outbound_queue.py --allow-real-send --loop --interval-seconds 10
+```
+
+Outbound safety defaults:
+
+- `OUTBOUND_REAL_SEND_ENABLED=false` prevents accidental sends unless the worker is started with an explicit send flag.
+- `OUTBOUND_ALLOWED_USERNAMES=@iamnekiy` restricts controlled real sends.
+- `scripts/process_outbound_queue.py` exits without mutating jobs unless `--allow-real-send` is passed.
+
+Safe smoke checks:
+
+```powershell
+.\.venv\Scripts\python scripts\crmchat_smoke.py
+.\.venv\Scripts\python scripts\crmchat_smoke.py --send-test
+.\.venv\Scripts\python scripts\llm_decision_smoke.py
+```
+
+For local E2E without OpenAI calls, set `LLM_PROVIDER=mock`. The mock decision is read from `LLM_MOCK_DECISION_JSON`.
+
+Recover stale sequence runs:
+
+```powershell
+.\.venv\Scripts\python scripts\recover_sequence_runs.py --older-than-seconds 900
+```

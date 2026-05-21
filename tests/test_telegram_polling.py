@@ -10,6 +10,7 @@ from app.services.telegram_polling import (
     build_message_external_id,
     initial_dialog_status,
     parse_telegram_datetime,
+    should_sync_dialog,
 )
 
 
@@ -75,3 +76,17 @@ def test_initial_dialog_status_ignores_non_user_and_bot_dialogs() -> None:
     assert initial_dialog_status(human) == "pending_review"
     assert initial_dialog_status(bot) == "ignored"
     assert initial_dialog_status(channel) == "ignored"
+
+
+def test_should_sync_dialog_filters_by_username() -> None:
+    target = TelegramDialogSnapshot(
+        peer=TelegramPeer(peer_type="user", peer_id="123", username="IamNekiy")
+    )
+    other = TelegramDialogSnapshot(
+        peer=TelegramPeer(peer_type="user", peer_id="456", username="someone_else")
+    )
+    missing = TelegramDialogSnapshot(peer=TelegramPeer(peer_type="user", peer_id="789"))
+
+    assert should_sync_dialog(target, "@iamnekiy")
+    assert not should_sync_dialog(other, "@iamnekiy")
+    assert not should_sync_dialog(missing, "@iamnekiy")

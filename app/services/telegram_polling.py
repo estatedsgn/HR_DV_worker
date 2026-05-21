@@ -56,11 +56,13 @@ class TelegramPollingService:
         session: AsyncSession,
         connector: CRMChatConnector | None = None,
         settings: Settings | None = None,
+        only_username: str | None = None,
     ) -> None:
         self.session = session
         self.settings = settings or get_settings()
         self.connector = connector or CRMChatConnector(settings=self.settings)
         self.inbound_pipeline = InboundPipelineService(session)
+        self.only_username = normalize_username(only_username) if only_username else None
 
     async def poll_once(self) -> TelegramPollingResult:
         started_at = datetime.now(UTC)
@@ -70,32 +72,7 @@ class TelegramPollingService:
 
         try:
             context = await self.connector.bootstrap()
-            account = await self._get_or_create_account(context)
-            run.crmchat_organization_id = context.organization.id
-            run.crmchat_workspace_id = context.workspace.id
-            run.crmchat_account_id = context.telegram_account.id
-
-            dialogs_payload = await self.connector.get_dialogs(
-                context.workspace.id,
-                context.telegram_account.id,
-                limit=self.settings.telegram_poll_dialogs_limit,
-            )
-            dialogs = normalize_dialogs_response(dialogs_payload)
-            run.dialogs_seen = len(dialogs)
-
-            for dialog_snapshot in dialogs:
-                synced, seen, created = await self._sync_dialog(
-                    context, account, dialog_snapshot
-                )
-                run.dialogs_synced += int(synced)
-                run.messages_seen += seen
-                run.messages_created += created
-
-            run.status = "completed"
-            run.finished_at = datetime.now(UTC)
-            run.next_run_at = run.finished_at + timedelta(
-                seconds=self.settings.telegram_poll_interval_seconds
-            )
+            await self._poll_context_into_run(context, run)
             await self.session.commit()
             return result_from_run(run)
         except TelegramFloodWaitError as exc:
@@ -108,6 +85,61 @@ class TelegramPollingService:
             run.finished_at = datetime.now(UTC)
             await self.session.commit()
             raise
+
+    async def poll_all_active_accounts_once(self) -> TelegramPollingResult:
+        aggregate = TelegramPollingResult(status="completed")
+        context = await self.connector.bootstrap()
+        accounts = await self.connector.list_telegram_accounts(context.workspace.id)
+        for telegram_account in accounts:
+            if telegram_account.status != "active":
+                continue
+            run = TelegramPollingRun(status="started", started_at=datetime.now(UTC))
+            await TelegramPollingRunRepository(self.session).add(run)
+            await self.session.flush()
+            account_context = CRMChatBootstrapContext(
+                organization=context.organization,
+                workspace=context.workspace,
+                telegram_account=telegram_account,
+            )
+            try:
+                await self._poll_context_into_run(account_context, run)
+            except TelegramFloodWaitError as exc:
+                await self._mark_rate_limited(run, exc)
+            aggregate = merge_polling_results(aggregate, result_from_run(run))
+        await self.session.commit()
+        return aggregate
+
+    async def _poll_context_into_run(
+        self, context: CRMChatBootstrapContext, run: TelegramPollingRun
+    ) -> None:
+        account = await self._get_or_create_account(context)
+        run.crmchat_organization_id = context.organization.id
+        run.crmchat_workspace_id = context.workspace.id
+        run.crmchat_account_id = context.telegram_account.id
+
+        dialogs_payload = await self.connector.get_dialogs(
+            context.workspace.id,
+            context.telegram_account.id,
+            limit=self.settings.telegram_poll_dialogs_limit,
+        )
+        dialogs = normalize_dialogs_response(dialogs_payload)
+        run.dialogs_seen = len(dialogs)
+
+        for dialog_snapshot in dialogs:
+            if not should_sync_dialog(dialog_snapshot, self.only_username):
+                continue
+            synced, seen, created = await self._sync_dialog(
+                context, account, dialog_snapshot
+            )
+            run.dialogs_synced += int(synced)
+            run.messages_seen += seen
+            run.messages_created += created
+
+        run.status = "completed"
+        run.finished_at = datetime.now(UTC)
+        run.next_run_at = run.finished_at + timedelta(
+            seconds=self.settings.telegram_poll_interval_seconds
+        )
 
     async def _sync_dialog(
         self,
@@ -165,6 +197,8 @@ class TelegramPollingService:
             telegram_username=context.telegram_account.username,
             display_name=context.telegram_account.username,
             status=context.telegram_account.status or "active",
+            send_interval_seconds=self.settings.outbound_default_send_interval_seconds,
+            send_jitter_seconds=self.settings.outbound_default_send_jitter_seconds,
             metadata_json=json.dumps(
                 redact_value(context.telegram_account.raw or {}), default=str
             ),
@@ -233,6 +267,7 @@ class TelegramPollingService:
                 "workspace_id": context.workspace.id,
                 "account_id": context.telegram_account.id,
                 "dialog_id": str(dialog.id),
+                "db_message_id": str(message.id),
                 "message_id": message_snapshot.message_id,
                 "text": message_snapshot.text or "",
                 "outgoing": message_snapshot.outgoing,
@@ -282,6 +317,23 @@ def initial_dialog_status(dialog_snapshot: TelegramDialogSnapshot) -> str:
     if isinstance(raw_user, dict) and raw_user.get("bot"):
         return "ignored"
     return "pending_review"
+
+
+def should_sync_dialog(
+    dialog_snapshot: TelegramDialogSnapshot, only_username: str | None = None
+) -> bool:
+    if only_username is None:
+        return True
+    return normalize_username(dialog_snapshot.peer.username) == only_username
+
+
+def normalize_username(value: str | None) -> str | None:
+    if not value:
+        return None
+    username = value.strip().lower()
+    if username and not username.startswith("@"):
+        username = f"@{username}"
+    return username or None
 
 
 def update_dialog_from_snapshot(
@@ -337,4 +389,20 @@ def result_from_run(run: TelegramPollingRun) -> TelegramPollingResult:
         flood_wait_seconds=run.flood_wait_seconds,
         next_run_at=run.next_run_at,
         error_message=run.error_message,
+    )
+
+
+def merge_polling_results(
+    left: TelegramPollingResult, right: TelegramPollingResult
+) -> TelegramPollingResult:
+    status = "completed" if left.status == right.status == "completed" else right.status
+    return TelegramPollingResult(
+        status=status,
+        dialogs_seen=left.dialogs_seen + right.dialogs_seen,
+        dialogs_synced=left.dialogs_synced + right.dialogs_synced,
+        messages_seen=left.messages_seen + right.messages_seen,
+        messages_created=left.messages_created + right.messages_created,
+        flood_wait_seconds=right.flood_wait_seconds or left.flood_wait_seconds,
+        next_run_at=right.next_run_at or left.next_run_at,
+        error_message=right.error_message or left.error_message,
     )
