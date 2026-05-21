@@ -90,3 +90,11 @@ def test_should_sync_dialog_filters_by_username() -> None:
     assert should_sync_dialog(target, "@iamnekiy")
     assert not should_sync_dialog(other, "@iamnekiy")
     assert not should_sync_dialog(missing, "@iamnekiy")
+
+
+def test_should_sync_dialog_accepts_username_without_at() -> None:
+    target = TelegramDialogSnapshot(
+        peer=TelegramPeer(peer_type="user", peer_id="123", username="IamNekiy")
+    )
+
+    assert should_sync_dialog(target, "iamnekiy")

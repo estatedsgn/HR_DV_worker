@@ -212,11 +212,24 @@ class TelegramPollingService:
         crmchat_dialog_id = build_dialog_external_id(
             account.crmchat_account_id, dialog_snapshot
         )
-        dialog = await repository.get_by_crmchat_dialog_id(crmchat_dialog_id)
-        if not dialog:
-            dialog = await repository.get_by_telegram_peer(
-                dialog_snapshot.peer.peer_type, dialog_snapshot.peer.peer_id
+        dialog = None
+        if dialog_snapshot.peer.username:
+            username_dialog = await repository.get_by_telegram_username(
+                dialog_snapshot.peer.username
             )
+            if username_dialog and username_dialog.crmchat_dialog_id.startswith("intake:"):
+                dialog = username_dialog
+        if not dialog:
+            dialog = await repository.get_by_crmchat_dialog_id(crmchat_dialog_id)
+        if not dialog:
+            if dialog_snapshot.peer.username:
+                dialog = await repository.get_by_telegram_username(
+                    dialog_snapshot.peer.username
+                )
+            if not dialog:
+                dialog = await repository.get_by_telegram_peer(
+                    dialog_snapshot.peer.peer_type, dialog_snapshot.peer.peer_id
+                )
         if dialog:
             update_dialog_from_snapshot(dialog, dialog_snapshot)
             await self.session.flush()
@@ -324,7 +337,7 @@ def should_sync_dialog(
 ) -> bool:
     if only_username is None:
         return True
-    return normalize_username(dialog_snapshot.peer.username) == only_username
+    return normalize_username(dialog_snapshot.peer.username) == normalize_username(only_username)
 
 
 def normalize_username(value: str | None) -> str | None:

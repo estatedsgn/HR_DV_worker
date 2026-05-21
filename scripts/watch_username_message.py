@@ -4,7 +4,7 @@ import argparse
 import asyncio
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.db.session import AsyncSessionLocal
 from app.models.dialog import Dialog
@@ -69,11 +69,12 @@ async def main() -> None:
 
 async def latest_inbound_message(username: str | None) -> LatestMessage | None:
     async with AsyncSessionLocal() as session:
+        normalized = (username or "").strip().lower().lstrip("@")
         result = await session.execute(
             select(Message)
             .join(Dialog, Message.dialog_id == Dialog.id)
             .where(
-                Dialog.telegram_username == username,
+                func.lower(func.replace(Dialog.telegram_username, "@", "")) == normalized,
                 Message.direction == "inbound",
             )
             .order_by(Message.sent_at.desc(), Message.created_at.desc())
