@@ -27,6 +27,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--username", default="@iamnekiy")
     parser.add_argument("--timeout-seconds", type=int, default=600)
     parser.add_argument("--interval-seconds", type=int, default=30)
+    parser.add_argument(
+        "--mark-read",
+        action="store_true",
+        help="Mark inbound messages from this username as read after syncing.",
+    )
     return parser.parse_args()
 
 
@@ -47,6 +52,7 @@ async def main() -> None:
                     session,
                     connector=connector,
                     only_username=username,
+                    mark_read=args.mark_read,
                 )
                 result = await service.poll_all_active_accounts_once()
                 print(

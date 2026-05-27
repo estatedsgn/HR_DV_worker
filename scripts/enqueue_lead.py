@@ -5,6 +5,7 @@ import asyncio
 import json
 
 from app.db.session import AsyncSessionLocal
+from app.repositories.campaign import CampaignRepository
 from app.services.lead_intake import LeadIntakeService
 
 
@@ -14,6 +15,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--external-lead-id", required=True)
     parser.add_argument("--username", required=True)
     parser.add_argument("--campaign-id")
+    parser.add_argument("--campaign-name")
     parser.add_argument("--payload-json", default="{}")
     return parser.parse_args()
 
@@ -24,11 +26,17 @@ async def main() -> None:
     if not isinstance(payload, dict):
         raise ValueError("--payload-json must decode to a JSON object")
     async with AsyncSessionLocal() as session:
+        campaign_id = args.campaign_id
+        if args.campaign_name:
+            campaign = await CampaignRepository(session).get_by_name_with_steps(args.campaign_name)
+            if campaign is None:
+                raise ValueError(f"Campaign not found by name: {args.campaign_name}")
+            campaign_id = str(campaign.id)
         result = await LeadIntakeService(session).enqueue_lead(
             source=args.source,
             external_lead_id=args.external_lead_id,
             telegram_username=args.username,
-            campaign_id=args.campaign_id,
+            campaign_id=campaign_id,
             payload=payload,
         )
     print(

@@ -4,11 +4,14 @@ from app.repositories.crmchat_webhook_event import CRMChatWebhookEventRepository
 from app.repositories.dialog import DialogRepository
 from app.repositories.dialog_sequence_run import DialogSequenceRunRepository
 from app.repositories.inbound_event import InboundEventRepository
+from app.repositories.knowledge_snippet import KnowledgeSnippetRepository
 from app.repositories.lead import LeadRepository
+from app.repositories.lead_fact import LeadFactRepository
 from app.repositories.lead_intake_event import LeadIntakeEventRepository
 from app.repositories.log import LogRepository
 from app.repositories.message import MessageRepository
 from app.repositories.outbound_job import OutboundJobRepository
+from app.repositories.prompt_version import PromptVersionRepository
 from app.repositories.telegram_polling_run import TelegramPollingRunRepository
 
 __all__ = [
@@ -19,10 +22,13 @@ __all__ = [
     "DialogRepository",
     "DialogSequenceRunRepository",
     "InboundEventRepository",
+    "KnowledgeSnippetRepository",
     "LeadRepository",
+    "LeadFactRepository",
     "LeadIntakeEventRepository",
     "LogRepository",
     "MessageRepository",
     "OutboundJobRepository",
+    "PromptVersionRepository",
     "TelegramPollingRunRepository",
 ]

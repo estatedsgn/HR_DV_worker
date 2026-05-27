@@ -21,6 +21,7 @@ async def main() -> None:
         )
     print(
         "llm decision: "
+        f"action={decision.action} state_after={decision.state_after} "
         f"decision={decision.decision} lead_status={decision.lead_status} "
         f"confidence={decision.confidence} has_reply={bool(decision.reply_text)}"
     )

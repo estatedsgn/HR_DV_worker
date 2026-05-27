@@ -29,6 +29,15 @@ class CampaignRepository(BaseRepository[Campaign]):
         )
         return result.scalar_one_or_none()
 
+    async def get_by_name_with_steps(self, name: str) -> Campaign | None:
+        result = await self.session.execute(
+            select(Campaign)
+            .options(selectinload(Campaign.steps))
+            .where(Campaign.name == name)
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
 
 class CampaignStepRepository(BaseRepository[CampaignStep]):
     model = CampaignStep

@@ -1,0 +1,57 @@
+[
+  {
+    "item_key": "qualification.clarify_confusion",
+    "stage": "qualification_faq",
+    "priority": 82,
+    "required": false,
+    "slot_key": "confusion_clarified",
+    "default_question": "что именно тебе не понятно?",
+    "completion_signal": [
+      "specific_confusion_identified"
+    ]
+  },
+  {
+    "item_key": "qualification.explain_platforms",
+    "stage": "qualification_faq",
+    "priority": 83,
+    "required": false,
+    "slot_key": "platform_question_answered",
+    "default_goal": "Объяснить, на каких платформах проходят стримы и что выдается готовый продюсерский аккаунт",
+    "completion_signal": [
+      "platform_question_answered"
+    ]
+  },
+  {
+    "item_key": "company.resend_telegram_link",
+    "stage": "company_info",
+    "priority": 112,
+    "required": false,
+    "slot_key": "telegram_link_resent",
+    "default_goal": "Продублировать Telegram-ссылку отдельным сообщением, если она не открывается",
+    "completion_signal": [
+      "telegram_link_resent"
+    ]
+  },
+  {
+    "item_key": "schedule.handle_timezone_difference",
+    "stage": "scheduling",
+    "priority": 163,
+    "required": false,
+    "slot_key": "candidate_timezone_offset_to_moscow",
+    "default_goal": "Уточнить часовой пояс кандидата и согласовать время по МСК и локальному времени",
+    "completion_signal": [
+      "timezone_confirmed"
+    ]
+  },
+  {
+    "item_key": "support.resolve_zoom_link_issue",
+    "stage": "post_schedule_support",
+    "priority": 180,
+    "required": false,
+    "slot_key": "zoom_issue_resolved",
+    "default_goal": "Помочь кандидату открыть Zoom или скачать приложение",
+    "completion_signal": [
+      "zoom_issue_resolved"
+    ]
+  }
+]

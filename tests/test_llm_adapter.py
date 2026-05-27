@@ -57,7 +57,12 @@ async def test_llm_adapter_parses_structured_decision() -> None:
         base_url="https://api.openai.com",
     )
     adapter = LLMAdapter(
-        settings=Settings(LLM_API_KEY="test-key", LLM_MODEL="gpt-test"),
+        settings=Settings(
+            LLM_PROVIDER="openai",
+            LLM_API_KEY="test-key",
+            LLM_ENDPOINT="responses",
+            LLM_MODEL="gpt-test",
+        ),
         http_client=client,
     )
 
@@ -71,6 +76,73 @@ async def test_llm_adapter_parses_structured_decision() -> None:
     assert decision.lead_status == "qualified"
     assert captured["body"]["model"] == "gpt-test"
     assert captured["body"]["text"]["format"]["type"] == "json_schema"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_llm_adapter_openrouter_chat_completion_payload() -> None:
+    captured = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content.decode())
+        return httpx.Response(
+            200,
+            json={
+                "id": "gen-1",
+                "model": "openai/gpt-5.4-mini",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "state_before": "WAITING_AFTER_INFO",
+                                    "state_after": "QUALIFICATION_IN_PROGRESS",
+                                    "action": "ask_question",
+                                    "lead_status": "interested",
+                                    "reply_text": "Сколько тебе лет?",
+                                    "lead_interest": "positive",
+                                    "facts_extracted": {},
+                                    "missing_required_facts": ["age"],
+                                    "handoff_reason": None,
+                                    "confidence": 0.8,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+            },
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://openrouter.ai/api/v1",
+    )
+    adapter = LLMAdapter(
+        settings=Settings(
+            LLM_PROVIDER="openrouter",
+            LLM_API_KEY="test-key",
+            LLM_BASE_URL="https://openrouter.ai/api/v1",
+            LLM_ENDPOINT="chat_completions",
+            LLM_MODEL="openai/gpt-5.4-mini",
+        ),
+        http_client=client,
+    )
+
+    decision = await adapter.decide_next_action(
+        dialog_messages=[{"direction": "inbound", "body": "Да, интересно"}],
+        lead_context={"funnel_state": "WAITING_AFTER_INFO"},
+    )
+
+    assert decision.action == "ask_question"
+    assert decision.decision == "reply"
+    assert captured["path"] == "/api/v1/chat/completions"
+    assert captured["body"]["response_format"]["type"] == "json_schema"
+    assert captured["body"]["model"] == "openai/gpt-5.4-mini"
+    assert adapter.last_metadata["usage"]["total_tokens"] == 30
     await client.aclose()
 
 

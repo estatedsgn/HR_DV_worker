@@ -1,0 +1,802 @@
+[
+  {
+    "card_key": "first_touch.streamer_offer",
+    "card_type": "workflow",
+    "stage": "first_touch",
+    "topic": "initial_offer",
+    "priority": 10,
+    "tags": [
+      "first_touch",
+      "offer",
+      "streaming",
+      "cold_outreach"
+    ],
+    "triggers": [
+      "первое касание",
+      "новый лид",
+      "первое сообщение"
+    ],
+    "fact_text": "Первое касание объясняет предложение: работа стримером на платформах, похожих на Twitch, возможный доход за смену, дополнительные материалы для продвижения и предложение рассказать подробнее.",
+    "example_answer": "привет! у меня есть интересное предложение: работа стримером на платформах, похожих на twitch. если тебе интересно, могу коротко рассказать подробности.",
+    "next_goal": "wait_first_reply",
+    "answer_style": "коротко, дружелюбно, без давления",
+    "metadata": {
+      "source": "template_dialogue_001",
+      "can_be_template": true,
+      "llm_needed": false
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "trust.contact_source",
+    "card_type": "objection",
+    "stage": "trust_source",
+    "topic": "contact_source",
+    "priority": 20,
+    "tags": [
+      "trust",
+      "source",
+      "cold_outreach",
+      "contact"
+    ],
+    "triggers": [
+      "откуда у вас мой контакт",
+      "откуда мой контакт",
+      "где вы меня нашли",
+      "почему вы мне пишете",
+      "как вы меня нашли"
+    ],
+    "fact_text": "Контакт мог быть найден в открытых чатах, группах, объявлениях или других публичных источниках. Если точный источник неизвестен, можно спокойно сказать, что сейчас уже нельзя точно подсказать, откуда именно.",
+    "example_answer": "ищу в разных чатах, группах и открытых источниках, сейчас уже точно не подскажу, откуда именно.",
+    "next_goal": "answer_why_candidate",
+    "answer_style": "спокойно, без оправданий, коротко",
+    "metadata": {
+      "source": "template_dialogue_001",
+      "typical_lead_phrase": "а откуда у вас мой контакт?"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "trust.why_candidate",
+    "card_type": "objection",
+    "stage": "trust_source",
+    "topic": "why_candidate",
+    "priority": 21,
+    "tags": [
+      "trust",
+      "selection",
+      "criteria",
+      "appearance"
+    ],
+    "triggers": [
+      "почему я заинтересовала",
+      "по какой причине я заинтересовала",
+      "почему выбрали меня",
+      "чем я подошла",
+      "почему я"
+    ],
+    "fact_text": "Жестких критериев по внешности нет. Важны опрятность, нормальная подача, коммуникабельность и готовность рассмотреть формат.",
+    "example_answer": "у нас нет каких-то жестких критериев по внешности, главное — опрятность, нормальная подача и желание попробовать формат.",
+    "next_goal": "ask_permission_to_explain",
+    "answer_style": "мягко, без оценки тела или внешности, без давления",
+    "metadata": {
+      "source": "template_dialogue_001",
+      "typical_lead_phrase": "по какой причине я заинтересовала вас?"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "workflow.ask_permission_to_explain",
+    "card_type": "workflow",
+    "stage": "trust_source",
+    "topic": "permission_to_explain",
+    "priority": 25,
+    "tags": [
+      "workflow",
+      "transition",
+      "explain_offer"
+    ],
+    "triggers": [
+      "рассказать подробнее",
+      "можно рассказать",
+      "интересно",
+      "ну хорошо расскажи"
+    ],
+    "fact_text": "После ответа на вопросы про источник контакта и причину выбора нужно мягко спросить, можно ли рассказать подробнее.",
+    "example_answer": "рассказать подробнее?",
+    "next_goal": "age_gate",
+    "answer_style": "короткий мягкий CTA",
+    "metadata": {
+      "source": "template_dialogue_001",
+      "cta": true
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "age.confirm_18",
+    "card_type": "qualification_rule",
+    "stage": "age_gate",
+    "topic": "age",
+    "priority": 30,
+    "tags": [
+      "age",
+      "qualification",
+      "required",
+      "18_plus"
+    ],
+    "triggers": [
+      "сколько тебе лет",
+      "возраст",
+      "мне 18",
+      "18",
+      "мне восемнадцать"
+    ],
+    "fact_text": "Перед подробным продолжением нужно подтвердить, что кандидату есть 18 лет.",
+    "example_answer": "давай расскажу подробнее, но для начала уточним небольшую формальность: сколько тебе лет?",
+    "next_goal": "send_basic_info_pack",
+    "answer_style": "коротко, как формальность",
+    "metadata": {
+      "required_slot": "is_18_plus",
+      "source": "template_dialogue_001"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "workflow.after_age_send_info_pack",
+    "card_type": "workflow",
+    "stage": "basic_info_pack",
+    "topic": "send_voice_pack",
+    "priority": 35,
+    "tags": [
+      "workflow",
+      "voice",
+      "info_pack",
+      "after_age"
+    ],
+    "triggers": [
+      "18",
+      "возраст подтвержден",
+      "после возраста",
+      "отправить голосовые"
+    ],
+    "fact_text": "После подтверждения возраста рекрутер отправляет два информационных сообщения или голосовых с базовым описанием сферы.",
+    "example_answer": "[отправить голосовое 00:49]\n[отправить голосовое 01:00]",
+    "next_goal": "ask_salary_schedule_interest",
+    "answer_style": "информационный блок без лишних вопросов",
+    "metadata": {
+      "source": "template_dialogue_001",
+      "llm_needed": false,
+      "action_type": "send_info_pack"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "workflow.ask_salary_schedule_interest",
+    "card_type": "workflow",
+    "stage": "basic_info_pack",
+    "topic": "salary_schedule_transition",
+    "priority": 36,
+    "tags": [
+      "workflow",
+      "salary",
+      "schedule",
+      "transition"
+    ],
+    "triggers": [
+      "зп",
+      "зарплата",
+      "график",
+      "рассказать про зп",
+      "рассказать про график"
+    ],
+    "fact_text": "После базового инфопака можно предложить рассказать про зарплату и график, если кандидату интересна сфера.",
+    "example_answer": "если интересна наша сфера, давай расскажу про зп и график",
+    "next_goal": "handle_format_boundaries",
+    "answer_style": "короткий переход к следующему блоку",
+    "metadata": {
+      "source": "template_dialogue_001"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "trust.no_nudity_onlyfans",
+    "card_type": "objection",
+    "stage": "format_boundaries",
+    "topic": "nudity_onlyfans",
+    "priority": 40,
+    "tags": [
+      "trust",
+      "format",
+      "nudity",
+      "onlyfans",
+      "boundaries",
+      "safety"
+    ],
+    "triggers": [
+      "что значит уделять внимание",
+      "это онлифанс",
+      "onlyfans",
+      "оголенка",
+      "надо оголяться",
+      "надо раздеваться",
+      "это интим",
+      "или что-то другое"
+    ],
+    "fact_text": "Формат не требует оголения и не является OnlyFans. Имеется в виду привлечение внимания на стриме через активность: рисование, готовка, танцы, общение и другие темы. Тематика подбирается под увлечения и комфорт кандидата.",
+    "example_answer": "нет, никакой оголенки и никакого онлифанс. имеется в виду привлекать внимание на стриме: можно рисовать, готовить, танцевать или просто общаться. тематика подбирается под твои увлечения и комфорт.",
+    "next_goal": "continue_deep_info_pack",
+    "answer_style": "сначала снять тревогу, затем объяснить формат, без давления",
+    "metadata": {
+      "source": "template_dialogue_001",
+      "typical_lead_phrase": "что значит уделять внимание? это онлифанс тема?"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "workflow.deep_info_pack_after_format_ok",
+    "card_type": "workflow",
+    "stage": "deep_info_pack",
+    "topic": "send_second_voice_pack",
+    "priority": 45,
+    "tags": [
+      "workflow",
+      "voice",
+      "details",
+      "after_boundaries"
+    ],
+    "triggers": [
+      "хорошо",
+      "слушаю",
+      "можно дальше",
+      "рассказывай"
+    ],
+    "fact_text": "Если кандидат после объяснения формата готов слушать дальше, рекрутер отправляет следующий информационный блок.",
+    "example_answer": "[отправить голосовое 01:18]\n[отправить голосовое 01:09]",
+    "next_goal": "qualification_faq",
+    "answer_style": "информационный блок",
+    "metadata": {
+      "source": "template_dialogue_001",
+      "llm_needed": false,
+      "action_type": "send_deep_info_pack"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "qualification.equipment_basic",
+    "card_type": "faq",
+    "stage": "qualification_faq",
+    "topic": "equipment",
+    "priority": 50,
+    "tags": [
+      "qualification",
+      "equipment",
+      "phone",
+      "streaming"
+    ],
+    "triggers": [
+      "оборудование",
+      "какое оборудование",
+      "что я должна иметь",
+      "что нужно иметь",
+      "телефон",
+      "камера",
+      "стриминговое оборудование"
+    ],
+    "fact_text": "Для старта не требуется сложное оборудование: может подойти телефон. Если у кандидата уже есть стриминговое оборудование, это плюс. При долгосрочной работе компания может помочь с оборудованием.",
+    "example_answer": "из оборудования ничего сложного не требуется, для начала подойдет телефон. если у тебя уже есть стриминговое оборудование — это отлично, а при долгосроке компания может помочь с техникой.",
+    "next_goal": "ask_phone_model",
+    "answer_style": "практично, снять барьер входа",
+    "metadata": {
+      "source": "template_dialogue_001"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "qualification.ask_phone_model",
+    "card_type": "workflow",
+    "stage": "equipment_check",
+    "topic": "phone_model",
+    "priority": 51,
+    "tags": [
+      "qualification",
+      "equipment",
+      "phone_model"
+    ],
+    "triggers": [
+      "какая модель",
+      "модель телефона",
+      "samsung",
+      "iphone",
+      "телефон"
+    ],
+    "fact_text": "После вопроса про оборудование можно уточнить модель телефона, чтобы понять, подходит ли устройство для старта.",
+    "example_answer": "для начала подойдет телефончик. какая у тебя модель?",
+    "next_goal": "continue_qualification_or_rapport",
+    "answer_style": "коротко, естественно",
+    "metadata": {
+      "source": "template_dialogue_001",
+      "slot": "equipment"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "qualification.contract_gph",
+    "card_type": "faq",
+    "stage": "qualification_faq",
+    "topic": "contract",
+    "priority": 52,
+    "tags": [
+      "qualification",
+      "contract",
+      "legal",
+      "gph"
+    ],
+    "triggers": [
+      "работа не официальная",
+      "не официальная",
+      "договоренности",
+      "договор",
+      "гпх",
+      "официально"
+    ],
+    "fact_text": "По желанию может подписываться договор ГПХ.",
+    "example_answer": "по желанию можно подписать договор ГПХ.",
+    "next_goal": "resume_qualification",
+    "answer_style": "коротко, без юридических подробностей",
+    "metadata": {
+      "source": "template_dialogue_001"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "qualification.schedule_flexible",
+    "card_type": "faq",
+    "stage": "qualification_faq",
+    "topic": "schedule",
+    "priority": 53,
+    "tags": [
+      "qualification",
+      "schedule",
+      "availability",
+      "flexible",
+      "study",
+      "work"
+    ],
+    "triggers": [
+      "график",
+      "3 дня в неделю",
+      "три дня в неделю",
+      "совмещать с учебой",
+      "совмещать с работой",
+      "я работаю",
+      "я учусь"
+    ],
+    "fact_text": "График гибкий и может подойти для совмещения с учебой или работой. Несколько дней в неделю могут быть подходящим вариантом.",
+    "example_answer": "у нас гибкий график, поэтому это можно совмещать с учебой или работой. 3 дня в неделю в целом может подойти.",
+    "next_goal": "continue_personalization",
+    "answer_style": "поддерживающе, показать совместимость с занятостью",
+    "metadata": {
+      "source": "template_dialogue_001",
+      "slot": "availability"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "qualification.payment_general",
+    "card_type": "faq",
+    "stage": "qualification_faq",
+    "topic": "payment",
+    "priority": 54,
+    "tags": [
+      "qualification",
+      "payment",
+      "salary",
+      "money"
+    ],
+    "triggers": [
+      "оплата",
+      "как происходит оплата",
+      "сколько платят",
+      "зп",
+      "зарплата",
+      "доход"
+    ],
+    "fact_text": "В первом касании используется ориентир дохода от 5 до 9 тысяч рублей за смену. Подробности оплаты лучше разбирать в информационном блоке или на собеседовании.",
+    "example_answer": "по доходу ориентир обсуждается отдельно, в первом сообщении я писала про 5–9 тысяч за смену. подробнее по оплате лучше разобрать на собеседовании, чтобы все было понятно по условиям.",
+    "next_goal": "continue_qualification_or_interview",
+    "answer_style": "аккуратно, без гарантий и лишней конкретики",
+    "metadata": {
+      "source": "template_dialogue_001",
+      "sensitive": true
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "style.light_phone_rapport",
+    "card_type": "style_example",
+    "stage": "equipment_check",
+    "topic": "phone_small_talk",
+    "priority": 60,
+    "tags": [
+      "style",
+      "rapport",
+      "phone",
+      "small_talk"
+    ],
+    "triggers": [
+      "samsung s25 ultra",
+      "samsung",
+      "iphone",
+      "айфон",
+      "камера огонь",
+      "телефон хороший"
+    ],
+    "fact_text": "Если кандидат сам поддерживает легкий разговор про телефон, можно коротко отреагировать живо, но затем вернуться к цели диалога.",
+    "example_answer": "да, новые самсунги реально хвалят. тогда по делу: остались ли у тебя еще вопросы по формату?",
+    "next_goal": "ask_remaining_questions",
+    "answer_style": "живой короткий small talk плюс возврат к воронке",
+    "metadata": {
+      "source": "template_dialogue_001",
+      "do_not_overuse": true
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "workflow.ask_remaining_questions",
+    "card_type": "workflow",
+    "stage": "qualification_faq",
+    "topic": "remaining_questions",
+    "priority": 65,
+    "tags": [
+      "workflow",
+      "questions",
+      "transition"
+    ],
+    "triggers": [
+      "остались вопросы",
+      "есть вопросы",
+      "пока нет",
+      "вопросов нет",
+      "по ходу разберемся",
+      "для меня это в новинку"
+    ],
+    "fact_text": "После ответов на основные вопросы нужно уточнить, остались ли вопросы. Если вопросов нет или кандидат готов разбираться по ходу, можно переходить к рассказу о компании и следующему шагу.",
+    "example_answer": "такс, остались ли у тебя какие-нибудь еще вопросы?",
+    "next_goal": "company_info",
+    "answer_style": "мягкая проверка готовности двигаться дальше",
+    "metadata": {
+      "source": "template_dialogue_001"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "company.profitcast_info",
+    "card_type": "company_info",
+    "stage": "company_info",
+    "topic": "company",
+    "priority": 70,
+    "tags": [
+      "company",
+      "profitcast",
+      "social_proof",
+      "telegram_channel"
+    ],
+    "triggers": [
+      "что за компания",
+      "расскажи про компанию",
+      "как называется компания",
+      "profitcast",
+      "тгк",
+      "телеграм канал"
+    ],
+    "fact_text": "Компания называется Profitcast. В шаблонной переписке указывается, что она зарегистрирована в британской юрисдикции, работает с более чем 1000 контент-моделей, а пример прямых трансляций можно посмотреть в Telegram-канале.",
+    "example_answer": "компания называется Profitcast, зарегистрирована в британской юрисдикции. у нас работает более 1000 контент-моделей, а как реализуются прямые трансляции можно посмотреть в нашем ТГ-канале.",
+    "next_goal": "ask_wants_to_try",
+    "answer_style": "дать социальное доказательство и перейти к пробе",
+    "metadata": {
+      "source": "template_dialogue_001",
+      "telegram_channel": "https://t.me/profitcast_ru"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "closing.ask_wants_to_try",
+    "card_type": "closing_script",
+    "stage": "try_close",
+    "topic": "try_sphere",
+    "priority": 75,
+    "tags": [
+      "closing",
+      "try",
+      "conversion"
+    ],
+    "triggers": [
+      "хочу попробовать",
+      "попробовала бы",
+      "желаете попробовать",
+      "желаешь попробовать",
+      "да я бы попробовала"
+    ],
+    "fact_text": "После объяснения компании и закрытия основных вопросов следующий шаг — спросить, хочет ли кандидат попробовать сферу.",
+    "example_answer": "желаешь попробовать нашу сферу?",
+    "next_goal": "personalization",
+    "answer_style": "короткий прямой вопрос без давления",
+    "metadata": {
+      "source": "template_dialogue_001"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "personalization.ask_about_self",
+    "card_type": "workflow",
+    "stage": "personalization",
+    "topic": "about_candidate",
+    "priority": 80,
+    "tags": [
+      "personalization",
+      "hobbies",
+      "work",
+      "study",
+      "stream_theme"
+    ],
+    "triggers": [
+      "расскажи о себе",
+      "учишься",
+      "работаешь",
+      "чем занимаешься",
+      "свободное время",
+      "хобби"
+    ],
+    "fact_text": "После согласия попробовать нужно узнать, учится или работает кандидат, чем занимается в свободное время и какие интересы можно использовать для подбора тематики стримов.",
+    "example_answer": "тогда расскажи немного о себе: учишься или работаешь? чем любишь заниматься в свободное время? помогу подобрать тематику для стримов.",
+    "next_goal": "suggest_stream_theme",
+    "answer_style": "дружелюбно, с пользой для кандидата",
+    "metadata": {
+      "source": "template_dialogue_001",
+      "slots": [
+        "work_study",
+        "hobbies"
+      ]
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "workflow.delay_request_wait",
+    "card_type": "workflow",
+    "stage": "personalization",
+    "topic": "delay_request",
+    "priority": 81,
+    "tags": [
+      "delay",
+      "followup",
+      "busy",
+      "wait"
+    ],
+    "triggers": [
+      "через час",
+      "сейчас занята",
+      "потом напишу",
+      "жди сообщение",
+      "позже отвечу"
+    ],
+    "fact_text": "Если кандидат просит время и обещает ответить позже, нужно спокойно согласиться и подождать, не давить.",
+    "example_answer": "да хорошо, буду ждать.",
+    "next_goal": "wait_candidate_followup",
+    "answer_style": "коротко, спокойно",
+    "metadata": {
+      "source": "template_dialogue_001",
+      "action_type": "schedule_followup"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "personalization.hobbies_to_theme",
+    "card_type": "workflow",
+    "stage": "personalization",
+    "topic": "hobbies_to_stream_theme",
+    "priority": 85,
+    "tags": [
+      "personalization",
+      "hobbies",
+      "drawing",
+      "makeup",
+      "crafts",
+      "conversation"
+    ],
+    "triggers": [
+      "рисование",
+      "рисую",
+      "бар люблю",
+      "учусь",
+      "работаю",
+      "практика",
+      "две работы",
+      "макияж",
+      "рукоделие",
+      "общаться"
+    ],
+    "fact_text": "Хобби и занятия кандидата можно использовать для подбора тематики стрима. В шаблоне упоминаются макияж, рисование, рукоделие и простое общение с аудиторией. Если кандидат любит рисование, можно предложить творческую тему стрима.",
+    "example_answer": "у нас как раз гибкий график, он подойдет для совмещения с учебой и работой. рисование отлично может зайти как тематика: можно рисовать что-то интересное и параллельно общаться с аудиторией.",
+    "next_goal": "interview_offer",
+    "answer_style": "персонализировать, показать что формат подходит",
+    "metadata": {
+      "source": "template_dialogue_001",
+      "slots": [
+        "hobbies",
+        "availability",
+        "work_study"
+      ]
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "interview.offer_after_questions_closed",
+    "card_type": "closing_script",
+    "stage": "interview_close",
+    "topic": "interview_offer",
+    "priority": 90,
+    "tags": [
+      "interview",
+      "closing",
+      "handoff",
+      "next_step"
+    ],
+    "triggers": [
+      "вопросов больше нет",
+      "хорошо",
+      "готова",
+      "можем записаться",
+      "собеседование"
+    ],
+    "fact_text": "Если основные вопросы закрыты и кандидат заинтересован, можно предложить собеседование, где интервьюер подробнее разберет формат и условия.",
+    "example_answer": "если вопросов больше нет, мы можем записаться на собеседование, где ты познакомишься с интервьюером и вместе с ним подробнее все разберете.",
+    "next_goal": "collect_contact",
+    "answer_style": "мягко закрыть на следующий шаг",
+    "metadata": {
+      "source": "template_dialogue_001"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "contact.collect_name_phone",
+    "card_type": "workflow",
+    "stage": "contact_collection",
+    "topic": "contact",
+    "priority": 95,
+    "tags": [
+      "contact",
+      "phone",
+      "name",
+      "interview"
+    ],
+    "triggers": [
+      "номер",
+      "телефон",
+      "имя",
+      "для записи",
+      "записаться"
+    ],
+    "fact_text": "Для записи на собеседование нужно получить имя и номер телефона кандидата.",
+    "example_answer": "для записи мне нужен твой номер телефона и имя.",
+    "next_goal": "schedule_day",
+    "answer_style": "коротко и конкретно",
+    "metadata": {
+      "source": "template_dialogue_001",
+      "slots": [
+        "contact_phone",
+        "contact_name"
+      ]
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "schedule.ask_day",
+    "card_type": "workflow",
+    "stage": "scheduling",
+    "topic": "interview_day",
+    "priority": 100,
+    "tags": [
+      "schedule",
+      "interview",
+      "day"
+    ],
+    "triggers": [
+      "завтра",
+      "сегодня",
+      "будет удобно",
+      "когда удобно",
+      "собеседование"
+    ],
+    "fact_text": "После получения имени и телефона нужно уточнить, удобно ли провести собеседование в предложенный день.",
+    "example_answer": "завтра будет удобно провести собеседование?",
+    "next_goal": "schedule_time",
+    "answer_style": "конкретный вопрос про день",
+    "metadata": {
+      "source": "template_dialogue_001"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "schedule.ask_time_window",
+    "card_type": "workflow",
+    "stage": "scheduling",
+    "topic": "interview_time",
+    "priority": 101,
+    "tags": [
+      "schedule",
+      "time",
+      "interview",
+      "time_window"
+    ],
+    "triggers": [
+      "в какое время",
+      "17.00",
+      "17:00",
+      "с 11 до 18",
+      "с 11:00 по 18:00",
+      "примерно в 17"
+    ],
+    "fact_text": "После согласия на день нужно уточнить время в доступном окне, например с 11:00 до 18:00.",
+    "example_answer": "с 11:00 по 18:00 в какое время будет удобнее?",
+    "next_goal": "handoff_to_recruiter",
+    "answer_style": "конкретно согласовать время",
+    "metadata": {
+      "source": "template_dialogue_001",
+      "slot": "preferred_interview_time"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "handoff.after_time_selected",
+    "card_type": "workflow",
+    "stage": "handoff",
+    "topic": "handoff_after_scheduling",
+    "priority": 110,
+    "tags": [
+      "handoff",
+      "scheduled",
+      "summary"
+    ],
+    "triggers": [
+      "примерно в 17.00",
+      "17:00",
+      "время выбрано",
+      "собеседование назначено"
+    ],
+    "fact_text": "После получения имени, телефона и времени собеседования нужно передать кандидата человеку/интервьюеру с кратким summary.",
+    "example_answer": "супер, тогда передам данные, и по собеседованию с тобой свяжутся.",
+    "next_goal": "handoff_complete",
+    "answer_style": "подтвердить следующий шаг",
+    "metadata": {
+      "source": "template_dialogue_001",
+      "action_type": "handoff"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  }
+]

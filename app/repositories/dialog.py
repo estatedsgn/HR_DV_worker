@@ -1,6 +1,8 @@
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, or_, select
 
 from app.models.dialog import Dialog
+from app.models.dialog_sequence_run import DialogSequenceRun
+from app.models.lead import Lead
 from app.repositories.base import BaseRepository
 
 
@@ -30,6 +32,36 @@ class DialogRepository(BaseRepository[Dialog]):
             .order_by(
                 case((Dialog.crmchat_dialog_id.like("intake:%"), 0), else_=1),
                 Dialog.created_at.asc(),
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    async def get_latest_active_intake_by_telegram_username(self, username: str) -> Dialog | None:
+        normalized = normalize_username(username)
+        result = await self.session.execute(
+            select(Dialog)
+            .outerjoin(DialogSequenceRun, DialogSequenceRun.dialog_id == Dialog.id)
+            .outerjoin(Lead, Lead.dialog_id == Dialog.id)
+            .where(
+                func.lower(func.replace(Dialog.telegram_username, "@", "")) == normalized,
+                Dialog.crmchat_dialog_id.like("intake:%"),
+                or_(
+                    DialogSequenceRun.status.in_(["active", "waiting_outbound", "awaiting_reply", "awaiting_llm"]),
+                    Lead.funnel_state.notin_(["CONVERTED", "LOST", "DO_NOT_CONTACT", "HUMAN_HANDOFF"]),
+                ),
+            )
+            .order_by(
+                case(
+                    (
+                        DialogSequenceRun.status.in_(["active", "waiting_outbound", "awaiting_reply", "awaiting_llm"]),
+                        0,
+                    ),
+                    (Lead.funnel_state.notin_(["NEW_LEAD", "CONVERTED", "LOST", "DO_NOT_CONTACT", "HUMAN_HANDOFF"]), 1),
+                    else_=2,
+                ),
+                DialogSequenceRun.created_at.desc().nullslast(),
+                Dialog.created_at.desc(),
             )
             .limit(1)
         )

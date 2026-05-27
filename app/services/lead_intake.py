@@ -137,7 +137,13 @@ class LeadIntakeService:
         existing = await LeadRepository(self.session).get_by_dialog(dialog.id)
         if existing:
             return
-        self.session.add(Lead(dialog_id=dialog.id, qualification_status="new"))
+        self.session.add(
+            Lead(
+                dialog_id=dialog.id,
+                qualification_status="new",
+                funnel_state="NEW_LEAD",
+            )
+        )
         await self.session.flush()
 
 

@@ -1,0 +1,63 @@
+{
+  "source": "telegram_voice_intro_2026-04-11",
+  "format": "ogg_opus_voice_note",
+  "purpose": "Initial template voice overview before the candidate moves into Brain V2 dialogue.",
+  "recording_action": "sendMessageRecordAudioAction",
+  "items": [
+    {
+      "order": 1,
+      "file": "voice_intro_01_offer_overview.ogg",
+      "source_file": "voice_11-04-2026_11-14-18",
+      "stage_hint": "first_touch_sent",
+      "topic": "initial_offer_overview",
+      "related_cards": [
+        "first_touch.streamer_offer",
+        "dialogue_chunk.nastya_001_first_touch_interest"
+      ],
+      "caption": "",
+      "recording_delay_seconds": 6
+    },
+    {
+      "order": 2,
+      "file": "voice_intro_02_work_format.ogg",
+      "source_file": "voice_11-04-2026_11-16-40",
+      "stage_hint": "info_messages_sent",
+      "topic": "work_format_overview",
+      "related_cards": [
+        "info.send_basic_pack",
+        "trust.answer_boundaries",
+        "mentor.stream_activities_hobbies_conversation"
+      ],
+      "caption": "",
+      "recording_delay_seconds": 7
+    },
+    {
+      "order": 3,
+      "file": "voice_intro_03_platform_process.ogg",
+      "source_file": "voice_11-04-2026_11-19-36",
+      "stage_hint": "qualification",
+      "topic": "platforms_process_and_support",
+      "related_cards": [
+        "mentor.platforms_streaming_platforms",
+        "platform.dacast_restream_producer_account",
+        "qualification.foreign_audience_english_moderator"
+      ],
+      "caption": "",
+      "recording_delay_seconds": 8
+    },
+    {
+      "order": 4,
+      "file": "voice_intro_04_next_steps.ogg",
+      "source_file": "voice_11-04-2026_11-27-20",
+      "stage_hint": "interview_close",
+      "topic": "next_steps_and_interview",
+      "related_cards": [
+        "interview.offer",
+        "schedule.collect_day_time",
+        "schedule.offer_available_time_window"
+      ],
+      "caption": "",
+      "recording_delay_seconds": 8
+    }
+  ]
+}

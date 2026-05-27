@@ -8,6 +8,8 @@ from app.services.agent_toolkit import (
     RequestHumanHandoffInput,
     RequestHumanHandoffOutput,
 )
+from app.services.brain_orchestrator import BrainOrchestrator
+from app.services.brain_v2 import BrainGateway
 from app.services.conversation_memory import ConversationMemory
 from app.services.dialog_state import DialogStateService, DialogStateSnapshot
 from app.services.crmchat_connector import (
@@ -38,6 +40,8 @@ __all__ = [
     "ReadDialogContextOutput",
     "ReadDialogContextInput",
     "AgentToolkitService",
+    "BrainOrchestrator",
+    "BrainGateway",
     "CRMCHAT_TELEGRAM_ALLOWED_METHODS",
     "CRMChatAPIError",
     "CRMChatConnector",

@@ -1,0 +1,178 @@
+[
+  {
+    "item_key": "trust.answer_contact_source",
+    "stage": "trust_source",
+    "priority": 10,
+    "required": false,
+    "slot_key": null,
+    "default_goal": "Закрыть вопрос кандидата про источник контакта",
+    "completion_signal": [
+      "contact_source_answered"
+    ]
+  },
+  {
+    "item_key": "trust.answer_why_candidate",
+    "stage": "trust_source",
+    "priority": 20,
+    "required": false,
+    "slot_key": null,
+    "default_goal": "Объяснить, почему кандидат подходит под формат",
+    "completion_signal": [
+      "why_candidate_answered"
+    ]
+  },
+  {
+    "item_key": "trust.ask_permission_to_explain",
+    "stage": "trust_source",
+    "priority": 30,
+    "required": true,
+    "slot_key": "permission_to_explain",
+    "default_question": "рассказать подробнее?",
+    "completion_signal": [
+      "lead_agreed_to_details"
+    ]
+  },
+  {
+    "item_key": "age.confirm_18",
+    "stage": "age_gate",
+    "priority": 40,
+    "required": true,
+    "slot_key": "is_18_plus",
+    "default_question": "сколько тебе лет?",
+    "completion_signal": [
+      "age_confirmed"
+    ]
+  },
+  {
+    "item_key": "info.send_basic_pack",
+    "stage": "basic_info_pack",
+    "priority": 50,
+    "required": true,
+    "slot_key": "basic_info_pack_sent",
+    "default_action": "send_basic_voice_pack",
+    "completion_signal": [
+      "basic_info_pack_sent"
+    ]
+  },
+  {
+    "item_key": "trust.answer_boundaries",
+    "stage": "format_boundaries",
+    "priority": 60,
+    "required": true,
+    "slot_key": "boundaries_answered",
+    "default_goal": "Снять тревогу про OnlyFans, оголение и формат",
+    "completion_signal": [
+      "boundaries_answered"
+    ]
+  },
+  {
+    "item_key": "info.send_deep_pack",
+    "stage": "deep_info_pack",
+    "priority": 70,
+    "required": true,
+    "slot_key": "deep_info_pack_sent",
+    "default_action": "send_deep_voice_pack",
+    "completion_signal": [
+      "deep_info_pack_sent"
+    ]
+  },
+  {
+    "item_key": "qualification.answer_faq",
+    "stage": "qualification_faq",
+    "priority": 80,
+    "required": true,
+    "slot_key": "core_questions_answered",
+    "default_goal": "Ответить на вопросы про оборудование, график, договор, оплату",
+    "completion_signal": [
+      "core_questions_answered"
+    ]
+  },
+  {
+    "item_key": "qualification.check_equipment",
+    "stage": "equipment_check",
+    "priority": 90,
+    "required": false,
+    "slot_key": "equipment",
+    "default_question": "какая у тебя модель телефона?",
+    "completion_signal": [
+      "equipment_known"
+    ]
+  },
+  {
+    "item_key": "qualification.check_availability",
+    "stage": "qualification_faq",
+    "priority": 100,
+    "required": false,
+    "slot_key": "availability",
+    "default_question": "какой график тебе был бы удобен?",
+    "completion_signal": [
+      "availability_known"
+    ]
+  },
+  {
+    "item_key": "company.send_info",
+    "stage": "company_info",
+    "priority": 110,
+    "required": true,
+    "slot_key": "company_info_sent",
+    "default_goal": "Коротко рассказать о компании",
+    "completion_signal": [
+      "company_info_sent"
+    ]
+  },
+  {
+    "item_key": "closing.ask_wants_to_try",
+    "stage": "try_close",
+    "priority": 120,
+    "required": true,
+    "slot_key": "wants_to_try",
+    "default_question": "желаешь попробовать нашу сферу?",
+    "completion_signal": [
+      "lead_wants_to_try"
+    ]
+  },
+  {
+    "item_key": "personalization.collect_hobbies",
+    "stage": "personalization",
+    "priority": 130,
+    "required": true,
+    "slot_key": "hobbies",
+    "default_question": "чем любишь заниматься в свободное время?",
+    "completion_signal": [
+      "hobbies_known"
+    ]
+  },
+  {
+    "item_key": "interview.offer",
+    "stage": "interview_close",
+    "priority": 140,
+    "required": true,
+    "slot_key": "interview_offer_accepted",
+    "default_question": "можем записаться на собеседование?",
+    "completion_signal": [
+      "interview_accepted"
+    ]
+  },
+  {
+    "item_key": "contact.collect_name_phone",
+    "stage": "contact_collection",
+    "priority": 150,
+    "required": true,
+    "slot_key": "contact",
+    "default_question": "для записи нужен номер телефона и имя",
+    "completion_signal": [
+      "contact_collected"
+    ]
+  },
+  {
+    "item_key": "schedule.collect_day_time",
+    "stage": "scheduling",
+    "priority": 160,
+    "required": true,
+    "slot_key": "preferred_interview_time",
+    "default_question": "в какое время будет удобнее?",
+    "completion_signal": [
+      "interview_time_selected"
+    ]
+  }
+]

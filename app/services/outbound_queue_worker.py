@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
+from uuid import UUID
 
+import httpx
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
 from app.models.account import Account
+from app.models.brain_v2 import LeadBrainState
 from app.models.dialog import Dialog
 from app.models.message import Message
 from app.models.outbound_job import OutboundJob
@@ -35,6 +41,7 @@ class OutboundQueueBatchResult:
     failed: int
     dead_letter: int
     rescheduled: int
+    cancelled: int = 0
 
 
 class OutboundSendBlockedError(Exception):
@@ -42,6 +49,10 @@ class OutboundSendBlockedError(Exception):
 
 
 class RetryableOutboundJobError(Exception):
+    pass
+
+
+class StaleOutboundJobError(Exception):
     pass
 
 
@@ -55,6 +66,7 @@ class OutboundQueueWorker:
         lease_owner: str = "outbound-worker",
         lease_seconds: int = 60,
         allow_real_send: bool | None = None,
+        typing_delay_seconds: float | None = None,
     ) -> None:
         self.session = session
         self.repository = OutboundJobRepository(session)
@@ -68,6 +80,11 @@ class OutboundQueueWorker:
             if allow_real_send is None
             else allow_real_send
         )
+        self.typing_delay_seconds = (
+            self.settings.outbound_typing_delay_seconds
+            if typing_delay_seconds is None
+            else typing_delay_seconds
+        )
 
     async def aclose(self) -> None:
         if self._owns_connector:
@@ -79,7 +96,7 @@ class OutboundQueueWorker:
             limit=limit,
             lease_seconds=self.lease_seconds,
         )
-        sent = blocked = retry = failed = dead_letter = rescheduled = 0
+        sent = blocked = retry = failed = dead_letter = rescheduled = cancelled = 0
 
         for job in jobs:
             if job.lease_owner != self.lease_owner:
@@ -99,8 +116,11 @@ class OutboundQueueWorker:
                 await self.session.flush()
                 await self._send_job(job, account)
             except OutboundSendBlockedError as exc:
-                self._mark_terminal(job, "blocked", exc)
+                await self._mark_terminal(job, "blocked", exc)
                 blocked += 1
+            except StaleOutboundJobError as exc:
+                await self._mark_terminal(job, "cancelled", exc)
+                cancelled += 1
             except TelegramFloodWaitError as exc:
                 self._mark_flood_wait(job, account, exc)
                 retry += 1
@@ -109,17 +129,24 @@ class OutboundQueueWorker:
                     self._mark_retry(job, exc)
                     retry += 1
                 else:
-                    self._mark_terminal(job, "dead_letter", exc)
+                    await self._mark_terminal(job, "dead_letter", exc)
                     dead_letter += 1
             except RetryableOutboundJobError as exc:
                 if self._can_retry(job):
                     self._mark_retry(job, exc)
                     retry += 1
                 else:
-                    self._mark_terminal(job, "dead_letter", exc)
+                    await self._mark_terminal(job, "dead_letter", exc)
+                    dead_letter += 1
+            except httpx.TransportError as exc:
+                if self._can_retry(job):
+                    self._mark_retry(job, exc)
+                    retry += 1
+                else:
+                    await self._mark_terminal(job, "dead_letter", exc)
                     dead_letter += 1
             except Exception as exc:
-                self._mark_terminal(job, "failed", exc)
+                await self._mark_terminal(job, "failed", exc)
                 failed += 1
             else:
                 sent += 1
@@ -136,6 +163,7 @@ class OutboundQueueWorker:
             failed=failed,
             dead_letter=dead_letter,
             rescheduled=rescheduled,
+            cancelled=cancelled,
         )
 
     def _account_not_ready(self, account: Account) -> bool:
@@ -167,16 +195,24 @@ class OutboundQueueWorker:
     async def _send_job(self, job: OutboundJob, account: Account) -> None:
         if not account.crmchat_workspace_id:
             raise RetryableOutboundJobError("Account has no CRMchat workspace id")
+        if self.settings.brain_cancel_outbound_on_inbound and await self._has_newer_candidate_activity(job):
+            raise StaleOutboundJobError("New candidate activity arrived before outbound send")
         peer = job.peer or await self._resolve_peer(job, account)
         random_id = str(job.telegram_random_id or random.getrandbits(63))
         job.telegram_random_id = random_id
-        result = await self.connector.send_message(
-            account.crmchat_workspace_id,
-            account.crmchat_account_id,
-            peer,
-            job.text,
-            random_id,
-        )
+        await self._simulate_typing(job, account, peer)
+        if self.settings.brain_cancel_outbound_on_inbound and await self._has_newer_candidate_activity(job):
+            raise StaleOutboundJobError("New candidate activity arrived during outbound typing delay")
+        if job.job_type == "voice":
+            result = await self._send_voice_job(job, account, peer, random_id)
+        else:
+            result = await self.connector.send_message(
+                account.crmchat_workspace_id,
+                account.crmchat_account_id,
+                peer,
+                job.text,
+                random_id,
+            )
         now = datetime.now(UTC)
         job.status = "sent"
         job.sent_at = now
@@ -190,6 +226,42 @@ class OutboundQueueWorker:
             seconds=account.send_interval_seconds + random.randint(0, account.send_jitter_seconds)
         )
         account.last_error_message = None
+        await self._record_sent_log(
+            job=job,
+            account=account,
+            sent_at=now,
+        )
+        if self.settings.outbound_mark_read_on_send:
+            try:
+                await self._mark_latest_inbound_read(job, account, peer)
+            except Exception as exc:
+                logger.warning(
+                    "failed to mark inbound as read after send",
+                    extra={"job_id": str(job.id), "error": str(exc)},
+                )
+        await CampaignSequenceService(self.session).mark_outbound_sent(job)
+        logger.info(
+            "outbound job sent",
+            extra={"job_id": str(job.id), "result_type": result.get("_", "unknown")},
+        )
+
+    async def _record_sent_log(self, *, job: OutboundJob, account: Account, sent_at: datetime) -> None:
+        existing = None
+        if job.telegram_random_id:
+            result = await self.session.execute(
+                select(OutboundSendLog).where(OutboundSendLog.telegram_random_id == job.telegram_random_id).limit(1)
+            )
+            existing = result.scalar_one_or_none()
+        if existing is not None:
+            existing.dialog_id = job.dialog_id
+            existing.message_id = job.message_id
+            existing.attempt_number = job.attempt_count
+            existing.status = "sent"
+            existing.rate_limit_bucket = f"account:{account.crmchat_account_id}"
+            existing.scheduled_at = job.scheduled_at
+            existing.sent_at = sent_at
+            existing.error_message = None
+            return
         self.session.add(
             OutboundSendLog(
                 dialog_id=job.dialog_id,
@@ -199,14 +271,59 @@ class OutboundQueueWorker:
                 rate_limit_bucket=f"account:{account.crmchat_account_id}",
                 telegram_random_id=job.telegram_random_id,
                 scheduled_at=job.scheduled_at,
-                sent_at=now,
+                sent_at=sent_at,
                 error_message=None,
             )
         )
-        await CampaignSequenceService(self.session).mark_outbound_sent(job)
-        logger.info(
-            "outbound job sent",
-            extra={"job_id": str(job.id), "result_type": result.get("_", "unknown")},
+
+    async def _simulate_typing(
+        self, job: OutboundJob, account: Account, peer: dict[str, Any]
+    ) -> None:
+        metadata = job.media_metadata or {}
+        if job.job_type == "voice":
+            action = job.typing_action or "sendMessageRecordAudioAction"
+            delay = metadata.get("recording_delay_seconds", self.settings.outbound_voice_recording_delay_seconds)
+        else:
+            action = job.typing_action or "sendMessageTypingAction"
+            delay = self.typing_delay_seconds
+        delay = max(0.0, float(delay or 0.0))
+        if delay <= 0 or not account.crmchat_workspace_id:
+            return
+        try:
+            await self.connector.set_typing(
+                account.crmchat_workspace_id,
+                account.crmchat_account_id,
+                peer,
+                action=action,
+            )
+        except Exception as exc:
+            logger.warning(
+                "failed to set outbound activity before send",
+                extra={"job_id": str(job.id), "error": str(exc)},
+            )
+        await asyncio.sleep(delay)
+
+    async def _send_voice_job(
+        self,
+        job: OutboundJob,
+        account: Account,
+        peer: dict[str, Any],
+        random_id: str,
+    ) -> dict[str, Any]:
+        if not job.media_path:
+            raise RetryableOutboundJobError("Voice outbound job has no media_path")
+        metadata = job.media_metadata or {}
+        media_path = resolve_local_media_path(job.media_path)
+        return dict(
+            await self.connector.send_voice_note(
+                account.crmchat_workspace_id,
+                account.crmchat_account_id,
+                peer,
+                media_path,
+                random_id,
+                caption=str(metadata.get("caption") or ""),
+                duration_seconds=int(metadata.get("duration_seconds") or 0),
+            )
         )
 
     async def _resolve_peer(self, job: OutboundJob, account: Account) -> dict[str, Any]:
@@ -225,6 +342,32 @@ class OutboundQueueWorker:
         peer = dict(build_input_peer_from_resolve_username(resolved))
         job.peer = peer
         return peer
+
+    async def _mark_latest_inbound_read(
+        self, job: OutboundJob, account: Account, peer: dict[str, Any]
+    ) -> None:
+        if not account.crmchat_workspace_id:
+            return
+        result = await self.session.execute(
+            select(Message)
+            .where(Message.dialog_id == job.dialog_id, Message.direction == "inbound")
+            .order_by(Message.sent_at.desc(), Message.created_at.desc())
+            .limit(1)
+        )
+        message = result.scalar_one_or_none()
+        if message is None:
+            return
+        telegram_message_id = telegram_id_from_crmchat_message_id(
+            message.crmchat_message_id
+        )
+        if telegram_message_id is None:
+            return
+        await self.connector.read_history(
+            account.crmchat_workspace_id,
+            account.crmchat_account_id,
+            peer,
+            max_id=telegram_message_id,
+        )
 
     def _mark_flood_wait(
         self, job: OutboundJob, account: Account | None, exc: TelegramFloodWaitError
@@ -248,12 +391,28 @@ class OutboundQueueWorker:
         job.error_message = str(exc)
         job.last_error_type = type(exc).__name__
 
-    def _mark_terminal(self, job: OutboundJob, status: str, exc: Exception) -> None:
+    async def _mark_terminal(self, job: OutboundJob, status: str, exc: Exception) -> None:
         job.status = status
         job.next_attempt_at = None
         job.error_message = str(exc)
         job.last_error_type = type(exc).__name__
         if job.message_id:
+            existing = None
+            if job.telegram_random_id:
+                result = await self.session.execute(
+                    select(OutboundSendLog)
+                    .where(OutboundSendLog.telegram_random_id == job.telegram_random_id)
+                    .limit(1)
+                )
+                existing = result.scalar_one_or_none()
+            if existing is not None:
+                existing.dialog_id = job.dialog_id
+                existing.message_id = job.message_id
+                existing.attempt_number = max(1, job.attempt_count or 0)
+                existing.status = status
+                existing.scheduled_at = job.scheduled_at
+                existing.error_message = str(exc)
+                return
             self.session.add(
                 OutboundSendLog(
                     dialog_id=job.dialog_id,
@@ -273,9 +432,70 @@ class OutboundQueueWorker:
         base_seconds = min(900, 10 * (2 ** max(0, attempt_count - 1)))
         return max(1, int(base_seconds * random.uniform(0.8, 1.2)))
 
+    async def _has_newer_candidate_activity(self, job: OutboundJob) -> bool:
+        threshold = job.created_at or job.scheduled_at
+        metadata = job.media_metadata or {}
+        reply_to_message_id = parse_uuid(metadata.get("reply_to_message_id"))
+        ignored_message_filter = [Message.id != reply_to_message_id] if reply_to_message_id is not None else []
+        result = await self.session.execute(
+            select(Message)
+            .where(
+                Message.dialog_id == job.dialog_id,
+                Message.direction == "inbound",
+                *ignored_message_filter,
+                or_(Message.created_at > threshold, Message.sent_at > threshold),
+            )
+            .limit(1)
+        )
+        if result.scalar_one_or_none() is not None:
+            return True
+        state_result = await self.session.execute(
+            select(LeadBrainState)
+            .where(
+                LeadBrainState.dialog_id == job.dialog_id,
+                or_(
+                    LeadBrainState.last_candidate_activity_at > threshold,
+                    LeadBrainState.last_candidate_typing_at > threshold,
+                ),
+            )
+            .limit(1)
+        )
+        return state_result.scalar_one_or_none() is not None
+
 
 def normalize_username(value: str) -> str:
     username = value.strip().lower()
     if username and not username.startswith("@"):
         username = f"@{username}"
     return username
+
+
+def parse_uuid(value: Any) -> UUID | None:
+    if value is None:
+        return None
+    try:
+        return UUID(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def telegram_id_from_crmchat_message_id(value: str | None) -> int | None:
+    if not value:
+        return None
+    candidate = value.rsplit(":", 1)[-1]
+    if not candidate.isdigit():
+        return None
+    return int(candidate)
+
+
+def resolve_local_media_path(value: str) -> Path:
+    root = Path.cwd().resolve()
+    path = Path(value)
+    resolved = path.resolve() if path.is_absolute() else (root / path).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise RetryableOutboundJobError(f"Media path is outside workspace: {value}") from exc
+    if not resolved.exists() or not resolved.is_file():
+        raise RetryableOutboundJobError(f"Media path does not exist: {value}")
+    return resolved

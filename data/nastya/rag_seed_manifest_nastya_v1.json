@@ -1,0 +1,35 @@
+{
+  "source_name": "template_dialogue_003_nastya",
+  "source_type": "telegram_screenshots",
+  "files": {
+    "dialogue_chunks": "dialogue_chunks_nastya_v1.json",
+    "knowledge_cards": "knowledge_cards_nastya_v1.json",
+    "agenda_additions": "agenda_additions_nastya_v1.json",
+    "replay_tests": "replay_tests_nastya_v1.json"
+  },
+  "notes": [
+    "Реальный номер телефона заменен на [номер телефона].",
+    "Фото кандидата не сохраняется в базу знаний, только факт photo_received.",
+    "Голосовые сообщения не расшифрованы, так как в скринах нет текста.",
+    "Часть первого касания и финального подтверждения закрыта интерфейсом Telegram."
+  ],
+  "recommended_import_order": [
+    "knowledge_cards_nastya_v1.json",
+    "agenda_additions_nastya_v1.json",
+    "dialogue_chunks_nastya_v1.json",
+    "replay_tests_nastya_v1.json"
+  ],
+  "embedding_text_fields": [
+    "card_key",
+    "card_type",
+    "stage",
+    "topic",
+    "priority",
+    "tags",
+    "triggers",
+    "fact_text",
+    "example_answer",
+    "next_goal",
+    "answer_style"
+  ]
+}

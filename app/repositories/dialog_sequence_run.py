@@ -23,6 +23,15 @@ class DialogSequenceRunRepository(BaseRepository[DialogSequenceRun]):
         )
         return result.scalar_one_or_none()
 
+    async def get_latest_by_dialog(self, dialog_id) -> DialogSequenceRun | None:
+        result = await self.session.execute(
+            select(DialogSequenceRun)
+            .where(DialogSequenceRun.dialog_id == dialog_id)
+            .order_by(DialogSequenceRun.created_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
     async def list_stale_waiting_outbound(self, *, older_than_seconds: int = 900) -> list[DialogSequenceRun]:
         threshold = datetime.now(UTC) - timedelta(seconds=older_than_seconds)
         result = await self.session.execute(

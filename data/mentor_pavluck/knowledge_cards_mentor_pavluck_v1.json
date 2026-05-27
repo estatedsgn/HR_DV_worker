@@ -1,0 +1,242 @@
+[
+  {
+    "card_key": "mentor.platforms_streaming_platforms",
+    "card_type": "faq",
+    "stage": "qualification_faq",
+    "topic": "platforms",
+    "priority": 49,
+    "tags": [
+      "platforms",
+      "dacast",
+      "restream",
+      "holla",
+      "nonolive",
+      "streaming"
+    ],
+    "triggers": [
+      "на каких платформах",
+      "какие платформы",
+      "где проходят трансляции",
+      "где стримы",
+      "dacast",
+      "restream",
+      "holla",
+      "nonolive",
+      "decast"
+    ],
+    "fact_text": "Прямые трансляции могут проводиться на платформах Dacast и Restream. В менторских вариантах также упоминаются HOLLA, Nonolive и написание Decast. Кандидату можно коротко назвать площадки без технической детализации.",
+    "example_answer": "прямые трансляции проводятся на платформах Dacast и Restream. также могут использоваться площадки HOLLA и Nonolive.",
+    "next_goal": "answer_remaining_questions_or_continue_funnel",
+    "answer_style": "коротко, уверенно, без технической перегрузки",
+    "metadata": {
+      "source": "mentor_pavluck_messages_v1",
+      "raw_faq_id": "mentor_faq_001_platforms",
+      "note": "Decast сохранен как возможное написание/триггер, основной вариант — Dacast."
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "mentor.stream_activities_hobbies_conversation",
+    "card_type": "faq",
+    "stage": "format_boundaries",
+    "topic": "stream_activities",
+    "priority": 41,
+    "tags": [
+      "stream_activities",
+      "hobbies",
+      "conversation",
+      "audience_engagement",
+      "drawing",
+      "games",
+      "dance"
+    ],
+    "triggers": [
+      "чем заниматься на стримах",
+      "что делать на стриме",
+      "что нужно делать",
+      "какая тематика",
+      "разговорные стримы",
+      "хобби",
+      "общение с аудиторией"
+    ],
+    "fact_text": "В основном это разговорные стримы. Тематика подбирается под увлечения и хобби кандидата. Можно рисовать, играть, танцевать и заниматься другими комфортными активностями, при этом важно поддерживать общение с аудиторией.",
+    "example_answer": "в основном это разговорные стримы, а тематика подбирается под твои увлечения и хобби. можно рисовать, играть, танцевать и заниматься тем, что тебе комфортно, главное — поддерживать общение с аудиторией.",
+    "next_goal": "resume_current_agenda_item",
+    "answer_style": "объяснить формат через хобби и общение, снять ощущение непонятности",
+    "metadata": {
+      "source": "mentor_pavluck_messages_v1",
+      "raw_faq_id": "mentor_faq_002_stream_activities"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "mentor.privacy_no_other_models_contacts",
+    "card_type": "faq",
+    "stage": "trust_source",
+    "topic": "other_models_contacts",
+    "priority": 72,
+    "tags": [
+      "privacy",
+      "confidentiality",
+      "other_models",
+      "contacts",
+      "telegram_channel_examples"
+    ],
+    "triggers": [
+      "профили других девочек",
+      "контакты других моделей",
+      "можно связаться с моделями",
+      "дай контакты",
+      "поговорить с девочками",
+      "данные моделей"
+    ],
+    "fact_text": "Контакты и профили других моделей нельзя передавать без их ведома, потому что это конфиденциальная информация. Вместо этого можно предложить посмотреть примеры работ или прямых эфиров в Telegram-канале компании.",
+    "example_answer": "контакты моделей мы не можем передавать без их ведома, это конфиденциальная информация. но можешь посмотреть примеры работ и прямых эфиров в нашем ТГК.",
+    "next_goal": "provide_company_channel_or_resume_funnel",
+    "answer_style": "мягко отказать, объяснить конфиденциальность и дать безопасную альтернативу",
+    "metadata": {
+      "source": "mentor_pavluck_messages_v1",
+      "raw_faq_id": "mentor_faq_003_other_models_contacts"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "mentor.documents_birth_date_only",
+    "card_type": "faq",
+    "stage": "qualification_faq",
+    "topic": "documents_age_verification",
+    "priority": 88,
+    "tags": [
+      "documents",
+      "passport",
+      "birth_date",
+      "age_verification",
+      "privacy"
+    ],
+    "triggers": [
+      "личные данные",
+      "документы",
+      "паспорт",
+      "показывать паспорт",
+      "какие данные",
+      "подтверждение возраста",
+      "дату рождения"
+    ],
+    "fact_text": "Для подтверждения возраста нужно показать только дату рождения из паспорта. Остальные данные можно скрыть.",
+    "example_answer": "да, нужно будет показать только дату рождения из паспорта для подтверждения возраста, остальные данные можно скрыть.",
+    "next_goal": "resume_current_agenda_item",
+    "answer_style": "спокойно объяснить минимальный объем данных и приватность",
+    "metadata": {
+      "source": "mentor_pavluck_messages_v1",
+      "raw_faq_id": "mentor_faq_004_documents_age",
+      "sensitive": true
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "mentor.stream_breaks_1_to_5_minutes",
+    "card_type": "faq",
+    "stage": "qualification_faq",
+    "topic": "stream_breaks",
+    "priority": 89,
+    "tags": [
+      "stream_breaks",
+      "activity",
+      "monetization",
+      "audience_retention"
+    ],
+    "triggers": [
+      "можно отходить",
+      "отойти во время эфира",
+      "перерыв",
+      "на сколько можно уйти",
+      "неактивна",
+      "монетизация",
+      "стрим без активности"
+    ],
+    "fact_text": "Во время эфира можно отходить ненадолго. Нормально делать короткие перерывы примерно на 1–5 минут. Если стрим долго остается без активности, аудитория может разойтись, а платформа может отключить монетизацию из-за неактивности.",
+    "example_answer": "да, можно отходить ненадолго. перерывы на 1–5 минут — это нормально, главное, чтобы стрим не оставался без активности слишком долго.",
+    "next_goal": "resume_current_agenda_item",
+    "answer_style": "разрешить короткий перерыв, но объяснить ограничение по активности",
+    "metadata": {
+      "source": "mentor_pavluck_messages_v1",
+      "raw_faq_id": "mentor_faq_005_breaks_during_stream"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "mentor.company_profitcast_official_info",
+    "card_type": "company_info",
+    "stage": "company_info",
+    "topic": "company",
+    "priority": 70,
+    "tags": [
+      "company",
+      "profitcast",
+      "british_jurisdiction",
+      "official_channel",
+      "social_proof"
+    ],
+    "triggers": [
+      "как называется компания",
+      "что за компания",
+      "название компании",
+      "profitcast",
+      "где посмотреть",
+      "тгк",
+      "telegram канал"
+    ],
+    "fact_text": "Компания называется Profitcast, зарегистрирована в британской юрисдикции. У компании работает более 1000 контент-моделей. Примеры реализации прямых трансляций можно посмотреть в Telegram-канале https://t.me/official_profitCast.",
+    "example_answer": "компания называется Profitcast, зарегистрирована в британской юрисдикции. у нас работает более 1000 контент-моделей. как реализуются прямые трансляции можешь посмотреть в нашем ТГК — https://t.me/official_profitCast",
+    "next_goal": "ask_remaining_questions_or_personalization",
+    "answer_style": "дать название, социальное доказательство и ссылку",
+    "metadata": {
+      "source": "mentor_pavluck_messages_v1",
+      "raw_faq_id": "mentor_faq_006_company_name",
+      "telegram_channel": "https://t.me/official_profitCast"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  },
+  {
+    "card_key": "mentor.equipment_phone_pc_laptop_webcam",
+    "card_type": "faq",
+    "stage": "qualification_faq",
+    "topic": "equipment",
+    "priority": 50,
+    "tags": [
+      "equipment",
+      "phone",
+      "pc",
+      "laptop",
+      "webcam",
+      "streaming"
+    ],
+    "triggers": [
+      "требуется аппаратура",
+      "нужно оборудование",
+      "какая аппаратура",
+      "что нужно для работы",
+      "телефон",
+      "пк",
+      "ноутбук",
+      "веб камера",
+      "веб-камера"
+    ],
+    "fact_text": "Для начала работы достаточно телефона. Также можно проводить прямые трансляции с ПК или ноутбука, если есть веб-камера.",
+    "example_answer": "для начала достаточно телефона. также можно проводить прямые трансляции с ПК или ноутбука, если есть веб-камера.",
+    "next_goal": "ask_phone_model_or_resume_qualification",
+    "answer_style": "снять барьер входа, объяснить варианты устройств",
+    "metadata": {
+      "source": "mentor_pavluck_messages_v1",
+      "raw_faq_id": "mentor_faq_007_equipment"
+    },
+    "verification_status": "verified",
+    "is_active": true
+  }
+]

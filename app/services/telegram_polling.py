@@ -57,12 +57,18 @@ class TelegramPollingService:
         connector: CRMChatConnector | None = None,
         settings: Settings | None = None,
         only_username: str | None = None,
+        mark_read: bool | None = None,
     ) -> None:
         self.session = session
         self.settings = settings or get_settings()
         self.connector = connector or CRMChatConnector(settings=self.settings)
         self.inbound_pipeline = InboundPipelineService(session)
         self.only_username = normalize_username(only_username) if only_username else None
+        self.mark_read = (
+            self.settings.telegram_mark_read_after_poll
+            if mark_read is None
+            else mark_read
+        )
 
     async def poll_once(self) -> TelegramPollingResult:
         started_at = datetime.now(UTC)
@@ -173,7 +179,32 @@ class TelegramPollingService:
             created += int(
                 await self._persist_message(context, dialog, message_snapshot)
             )
+        if self.mark_read:
+            await self._mark_history_read(context, peer, messages)
         return True, len(messages), created
+
+    async def _mark_history_read(
+        self,
+        context: CRMChatBootstrapContext,
+        peer: dict[str, Any],
+        messages: list[TelegramMessageSnapshot],
+    ) -> None:
+        max_inbound_id = max(
+            (
+                int(message.message_id)
+                for message in messages
+                if not message.outgoing and str(message.message_id).isdigit()
+            ),
+            default=0,
+        )
+        if max_inbound_id <= 0:
+            return
+        await self.connector.read_history(
+            context.workspace.id,
+            context.telegram_account.id,
+            peer,
+            max_id=max_inbound_id,
+        )
 
     async def _get_or_create_account(self, context: CRMChatBootstrapContext) -> Account:
         repository = AccountRepository(self.session)
@@ -212,23 +243,25 @@ class TelegramPollingService:
         crmchat_dialog_id = build_dialog_external_id(
             account.crmchat_account_id, dialog_snapshot
         )
-        dialog = None
-        if dialog_snapshot.peer.username:
-            username_dialog = await repository.get_by_telegram_username(
+        dialog = await repository.get_by_crmchat_dialog_id(crmchat_dialog_id)
+        if not dialog:
+            dialog = await repository.get_by_telegram_peer(
+                dialog_snapshot.peer.peer_type, dialog_snapshot.peer.peer_id
+            )
+        if (
+            not dialog
+            and not self.settings.langgraph_funnel_enabled
+            and dialog_snapshot.peer.username
+        ):
+            username_dialog = await repository.get_latest_active_intake_by_telegram_username(
                 dialog_snapshot.peer.username
             )
-            if username_dialog and username_dialog.crmchat_dialog_id.startswith("intake:"):
+            if username_dialog:
                 dialog = username_dialog
-        if not dialog:
-            dialog = await repository.get_by_crmchat_dialog_id(crmchat_dialog_id)
-        if not dialog:
+        if not dialog and not self.settings.langgraph_funnel_enabled:
             if dialog_snapshot.peer.username:
                 dialog = await repository.get_by_telegram_username(
                     dialog_snapshot.peer.username
-                )
-            if not dialog:
-                dialog = await repository.get_by_telegram_peer(
-                    dialog_snapshot.peer.peer_type, dialog_snapshot.peer.peer_id
                 )
         if dialog:
             update_dialog_from_snapshot(dialog, dialog_snapshot)
@@ -357,9 +390,11 @@ def update_dialog_from_snapshot(
     dialog.telegram_access_hash = dialog_snapshot.peer.access_hash
     dialog.telegram_username = dialog_snapshot.peer.username
     if dialog_snapshot.peer.display_name:
-        dialog.memory_summary = (
-            f"Telegram dialog with {dialog_snapshot.peer.display_name}"
-        )
+        current_summary = dialog.memory_summary or ""
+        if not current_summary or current_summary.startswith("Telegram dialog with "):
+            dialog.memory_summary = (
+                f"Telegram dialog with {dialog_snapshot.peer.display_name}"
+            )
 
 
 def build_dialog_external_id(

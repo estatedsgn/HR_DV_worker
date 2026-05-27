@@ -1,0 +1,20 @@
+[
+  {"name":"source question then resume age","stage":"age_gate","message":"Откуда ты меня нашла?","expected_move":"answer_and_resume_open_loop"},
+  {"name":"greeting only","stage":"trust","message":"Привет","expected_move":"handle_trust_objection"},
+  {"name":"hard refusal","stage":"trust","message":"Не интересно, не пиши","expected_move":"close_lost"},
+  {"name":"suspicious objection","stage":"trust","message":"Это не скам?","expected_move":"handle_trust_objection"},
+  {"name":"age answer","stage":"age_gate","message":"Мне 22","expected_move":"soft_qualify"},
+  {"name":"underage answer","stage":"age_gate","message":"Мне 16","expected_move":"close_lost"},
+  {"name":"english question","stage":"qualification","message":"А английский нужен?","expected_move":"answer_and_resume_open_loop"},
+  {"name":"nudity question","stage":"trust","message":"Нюды нужны?","expected_move":"answer_and_resume_open_loop"},
+  {"name":"equipment question","stage":"qualification","message":"Нужен ноутбук?","expected_move":"answer_and_resume_open_loop"},
+  {"name":"availability answer","stage":"qualification","message":"Могу 4 часа в день","expected_move":"soft_qualify"},
+  {"name":"delay request","stage":"qualification","message":"Можно позже отвечу?","expected_move":"answer_and_resume_open_loop"},
+  {"name":"age plus payment question","stage":"age_gate","message":"Мне 21, а сколько оплата?","expected_move":"answer_and_resume_open_loop"},
+  {"name":"equipment ready","stage":"qualification","message":"Есть айфон и интернет","expected_move":"soft_qualify"},
+  {"name":"hobbies personalization","stage":"personalization","message":"Люблю музыку и спорт","expected_move":"personalize_offer"},
+  {"name":"interview accepted","stage":"interview_close","message":"Да, готова на интервью","expected_move":"move_to_interview"},
+  {"name":"contact provided","stage":"contact_collection","message":"Анна +79999999999","expected_move":"collect_contact"},
+  {"name":"time selected","stage":"scheduling","message":"Удобно завтра вечером","expected_move":"schedule_interview"},
+  {"name":"legal question handoff","stage":"trust","message":"Это легально?","expected_move":"handoff_to_human"}
+]

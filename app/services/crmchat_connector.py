@@ -1,6 +1,9 @@
 import re
+import base64
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -14,8 +17,12 @@ CRMCHAT_TELEGRAM_ALLOWED_METHODS = frozenset(
         "messages.getDialogs",
         "messages.getHistory",
         "messages.readHistory",
+        "messages.setTyping",
+        "messages.sendReaction",
         "messages.sendMessage",
+        "messages.sendMedia",
         "messages.editMessage",
+        "upload.saveFilePart",
     }
 )
 
@@ -405,6 +412,48 @@ class CRMChatConnector:
             {"peer": dict(peer), "maxId": max_id},
         )
 
+    async def send_reaction(
+        self,
+        workspace_id: str,
+        account_id: str,
+        peer: Mapping[str, Any],
+        message_id: int | str,
+        emoticon: str,
+    ) -> Mapping[str, Any]:
+        return await self.call_telegram_method(
+            workspace_id,
+            account_id,
+            "messages.sendReaction",
+            {
+                "peer": dict(peer),
+                "msgId": int(message_id),
+                "reaction": [{"_": "reactionEmoji", "emoticon": emoticon}],
+            },
+        )
+
+    async def set_typing(
+        self,
+        workspace_id: str,
+        account_id: str,
+        peer: Mapping[str, Any],
+        action: str = "sendMessageTypingAction",
+    ) -> Mapping[str, Any]:
+        self._validate_telegram_method("messages.setTyping")
+        payload = await self._request(
+            "POST",
+            f"/v1/workspaces/{workspace_id}/telegram-accounts/{account_id}/call/messages.setTyping",
+            json={
+                "params": {
+                    "peer": dict(peer),
+                    "action": {"_": action},
+                }
+            },
+        )
+        result = payload.get("result", payload)
+        if isinstance(result, Mapping):
+            return result
+        return {"ok": bool(result)}
+
     async def send_message(
         self,
         workspace_id: str,
@@ -418,6 +467,91 @@ class CRMChatConnector:
             account_id,
             "messages.sendMessage",
             {"peer": dict(peer), "message": message, "randomId": str(random_id)},
+        )
+
+    async def set_voice_recording(
+        self,
+        workspace_id: str,
+        account_id: str,
+        peer: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        return await self.set_typing(
+            workspace_id,
+            account_id,
+            peer,
+            action="sendMessageRecordAudioAction",
+        )
+
+    async def upload_file(
+        self,
+        workspace_id: str,
+        account_id: str,
+        path: str | Path,
+        *,
+        part_size: int = 512 * 1024,
+        file_id: int | None = None,
+    ) -> Mapping[str, Any]:
+        file_path = Path(path)
+        data = file_path.read_bytes()
+        effective_file_id = file_id or stable_file_id(file_path, data)
+        parts = max(1, (len(data) + part_size - 1) // part_size)
+        for index in range(parts):
+            chunk = data[index * part_size : (index + 1) * part_size]
+            payload = await self._request(
+                "POST",
+                f"/v1/workspaces/{workspace_id}/telegram-accounts/{account_id}/call/upload.saveFilePart",
+                json={
+                    "params": {
+                        "fileId": str(effective_file_id),
+                        "filePart": index,
+                        "bytes": base64.b64encode(chunk).decode("ascii"),
+                    }
+                },
+            )
+            result = payload.get("result", payload)
+            if result is not True and result != {"ok": True}:
+                raise CRMChatAPIError("Telegram upload.saveFilePart failed", payload=payload)
+        return {
+            "_": "inputFile",
+            "id": str(effective_file_id),
+            "parts": parts,
+            "name": file_path.name,
+            "md5Checksum": hashlib.md5(data).hexdigest(),
+        }
+
+    async def send_voice_note(
+        self,
+        workspace_id: str,
+        account_id: str,
+        peer: Mapping[str, Any],
+        path: str | Path,
+        random_id: int | str,
+        *,
+        caption: str = "",
+        duration_seconds: int = 0,
+    ) -> Mapping[str, Any]:
+        input_file = await self.upload_file(workspace_id, account_id, path)
+        return await self.call_telegram_method(
+            workspace_id,
+            account_id,
+            "messages.sendMedia",
+            {
+                "peer": dict(peer),
+                "media": {
+                    "_": "inputMediaUploadedDocument",
+                    "file": dict(input_file),
+                    "mimeType": "audio/ogg",
+                    "attributes": [
+                        {
+                            "_": "documentAttributeAudio",
+                            "duration": int(duration_seconds or 0),
+                            "voice": True,
+                        }
+                    ],
+                },
+                "message": caption,
+                "randomId": str(random_id),
+            },
         )
 
     async def parse_incoming_message(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -473,6 +607,11 @@ def parse_flood_wait_seconds(message: str | None) -> int | None:
         return None
     match = _FLOOD_WAIT_RE.search(message)
     return int(match.group(1)) if match else None
+
+
+def stable_file_id(path: Path, data: bytes) -> int:
+    digest = hashlib.sha256(path.name.encode("utf-8") + b"\0" + data[:1024]).digest()
+    return int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)
 
 
 def normalize_dialogs_response(

@@ -31,3 +31,8 @@ dist/
 # Local CRMchat diagnostics
 docs/samples/*.local.json
 docs/samples/*.local.*.json
+
+# Runtime and scratch artifacts
+runtime_logs/
+tmp_debug_*.py
+pochemu.py

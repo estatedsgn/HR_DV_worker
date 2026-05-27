@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import pytest
 import httpx
 
@@ -100,6 +103,39 @@ async def test_get_history_includes_required_pagination_params() -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_reaction_uses_telegram_reaction_shape() -> None:
+    captured = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["body"] = request.content.decode()
+        return httpx.Response(200, json={"result": {"ok": True}})
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.crmchat.ai"
+    )
+    connector = CRMChatConnector(settings=Settings(), http_client=client)
+
+    await connector.send_reaction(
+        "workspace-1",
+        "account-1",
+        {"_": "inputPeerUser", "userId": 123, "accessHash": "hash"},
+        77,
+        "👍",
+    )
+
+    assert captured["url"].endswith(
+        "/v1/workspaces/workspace-1/telegram-accounts/account-1/call/messages.sendReaction"
+    )
+    assert captured["body"] == (
+        '{"params":{"peer":{"_":"inputPeerUser","userId":123,"accessHash":"hash"},'
+        '"msgId":77,"reaction":[{"_":"reactionEmoji","emoticon":"👍"}]}}'
+    )
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_call_telegram_method_rejects_disallowed_method() -> None:
     client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda request: httpx.Response(200)),
@@ -144,6 +180,69 @@ async def test_flood_wait_error_is_parsed_from_api_error() -> None:
 def test_parse_flood_wait_seconds() -> None:
     assert parse_flood_wait_seconds("FLOOD_WAIT_42") == 42
     assert parse_flood_wait_seconds("BAD_REQUEST") is None
+
+
+@pytest.mark.asyncio
+async def test_set_voice_recording_uses_record_audio_action() -> None:
+    captured = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["body"] = request.content.decode()
+        return httpx.Response(200, json={"result": True})
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.crmchat.ai"
+    )
+    connector = CRMChatConnector(settings=Settings(), http_client=client)
+
+    await connector.set_voice_recording(
+        "workspace-1",
+        "account-1",
+        {"_": "inputPeerUser", "userId": 123, "accessHash": "hash"},
+    )
+
+    assert captured["url"].endswith("/call/messages.setTyping")
+    assert captured["body"] == (
+        '{"params":{"peer":{"_":"inputPeerUser","userId":123,"accessHash":"hash"},'
+        '"action":{"_":"sendMessageRecordAudioAction"}}}'
+    )
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_send_voice_note_uploads_file_and_sends_media() -> None:
+    calls = []
+    voice_path = Path("data/voice_intro/voice_intro_01_offer_overview.ogg")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((str(request.url), json.loads(request.content.decode())))
+        return httpx.Response(200, json={"result": {"ok": True}})
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.crmchat.ai"
+    )
+    connector = CRMChatConnector(settings=Settings(), http_client=client)
+
+    await connector.send_voice_note(
+        "workspace-1",
+        "account-1",
+        {"_": "inputPeerUser", "userId": 123, "accessHash": "hash"},
+        voice_path,
+        "777",
+        duration_seconds=12,
+    )
+
+    assert calls[0][0].endswith("/call/upload.saveFilePart")
+    assert calls[0][1]["params"]["filePart"] == 0
+    assert calls[0][1]["params"]["bytes"]
+    assert calls[1][0].endswith("/call/messages.sendMedia")
+    media = calls[1][1]["params"]["media"]
+    assert media["_"] == "inputMediaUploadedDocument"
+    assert media["mimeType"] == "audio/ogg"
+    assert media["attributes"][0]["voice"] is True
+    assert calls[1][1]["params"]["randomId"] == "777"
+    await client.aclose()
 
 
 def test_normalize_dialogs_response_joins_peer_data() -> None:

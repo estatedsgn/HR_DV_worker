@@ -35,6 +35,11 @@ def parse_args() -> argparse.Namespace:
         "--only-username",
         help="Only sync one Telegram username, for example @iamnekiy.",
     )
+    parser.add_argument(
+        "--mark-read",
+        action="store_true",
+        help="Mark synced inbound history as read. Use with --only-username for safe targeted tests.",
+    )
     return parser.parse_args()
 
 
@@ -53,6 +58,7 @@ async def run() -> None:
                         connector=connector,
                         settings=settings,
                         only_username=args.only_username,
+                        mark_read=args.mark_read,
                     )
                     result = (
                         await service.poll_all_active_accounts_once()
@@ -69,6 +75,7 @@ async def run() -> None:
                     connector=connector,
                     settings=settings,
                     only_username=args.only_username,
+                    mark_read=args.mark_read,
                 )
                 result = (
                     await service.poll_all_active_accounts_once()

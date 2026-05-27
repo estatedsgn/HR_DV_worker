@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from app.models.agent_action_log import AgentActionLog
 from app.models.campaign import CampaignStep
@@ -18,6 +19,7 @@ from app.repositories.campaign import CampaignStepRepository
 from app.repositories.dialog_sequence_run import DialogSequenceRunRepository
 from app.repositories.lead import LeadRepository
 from app.repositories.outbound_job import OutboundJobRepository
+from app.services.brain_orchestrator import BrainOrchestrator
 from app.services.crmchat_diagnostics import redact_value
 from app.services.llm_adapter import LLMAdapter, LLMDecision
 
@@ -42,13 +44,33 @@ class CampaignSequenceService:
     async def handle_inbound_message(
         self, *, dialog_id: str, message_id: str | None = None
     ) -> DialogSequenceRun | None:
-        run = await DialogSequenceRunRepository(self.session).get_active_by_dialog(dialog_id)
+        repository = DialogSequenceRunRepository(self.session)
+        run = await repository.get_active_by_dialog(dialog_id)
+        if run is None:
+            run = await self._reopen_latest_nonterminal_run(dialog_id)
         if run is None or run.status != "awaiting_reply":
             return run
         run.last_inbound_message_id = message_id
-        run.current_step_position = run.awaiting_reply_after_step or run.current_step_position
+        awaited_position = run.awaiting_reply_after_step
         run.awaiting_reply_after_step = None
         run.status = "active"
+        if awaited_position is not None:
+            steps = await CampaignStepRepository(self.session).list_by_campaign(run.campaign_id)
+            awaited_step = next(
+                (step for step in steps if step.position == awaited_position),
+                None,
+            )
+            if awaited_step is not None and awaited_step.step_type in {"llm_decision", "brain_turn"}:
+                run.current_step_position = awaited_position
+                await self._run_brain_step(run, awaited_step)
+                return run
+            if awaited_step is not None and awaited_step.step_type == "interest_gate":
+                run.current_step_position = awaited_position
+                should_continue = await self._run_interest_gate(run, awaited_step)
+                if should_continue:
+                    await self.process_next_steps(run)
+                return run
+            run.current_step_position = awaited_position
         await self.process_next_steps(run)
         return run
 
@@ -84,6 +106,14 @@ class CampaignSequenceService:
                     run.awaiting_reply_after_step = step.position
                     return
                 continue
+            if step.step_type == "interest_gate":
+                result = await self._run_interest_gate(run, step)
+                if result is False:
+                    return
+                continue
+            if step.step_type == "brain_turn":
+                await self._run_brain_step(run, step)
+                return
             if step.step_type == "llm_decision":
                 await self._run_llm_step(run, step)
                 return
@@ -137,6 +167,7 @@ class CampaignSequenceService:
         )
         self.session.add(job)
         run.current_step_position = step.position
+        await self._apply_step_state(dialog.id, step)
         await self._audit(
             dialog.id,
             "sequence.schedule_fixed_message",
@@ -148,6 +179,56 @@ class CampaignSequenceService:
             },
             status="queued",
         )
+        await self.session.flush()
+
+    async def _run_interest_gate(self, run: DialogSequenceRun, step: CampaignStep) -> bool:
+        dialog = await self.session.get(Dialog, run.dialog_id)
+        if dialog is None:
+            raise ValueError(f"Dialog not found: {run.dialog_id}")
+        result = await BrainOrchestrator(self.session, llm_adapter=self.llm_adapter).handle_interest_gate(
+            dialog=dialog,
+            message_id=str(run.last_inbound_message_id) if run.last_inbound_message_id else None,
+        )
+        run.current_step_position = step.position
+        run.llm_decision_json = result.decision.model_dump()
+        if result.terminal:
+            run.status = "completed"
+            run.completed_at = datetime.now(UTC)
+            return False
+        if result.reply_text:
+            await self._schedule_llm_reply(
+                run,
+                dialog,
+                result.reply_text,
+                campaign_step_id=step.id,
+                await_reply_after_step=step.position,
+            )
+            return False
+        return result.should_continue
+
+    async def _run_brain_step(self, run: DialogSequenceRun, step: CampaignStep) -> None:
+        dialog = await self.session.get(Dialog, run.dialog_id)
+        if dialog is None:
+            raise ValueError(f"Dialog not found: {run.dialog_id}")
+        run.status = "awaiting_llm"
+        run.current_step_position = step.position
+        result = await BrainOrchestrator(self.session, llm_adapter=self.llm_adapter).run_turn(dialog=dialog)
+        decision = result.decision
+        run.llm_decision_json = decision.model_dump()
+        if result.terminal:
+            run.status = "handoff" if decision.action == "handoff" or decision.state_after in {"READY_FOR_HUMAN", "HUMAN_HANDOFF"} else "completed"
+            run.completed_at = datetime.now(UTC)
+        elif result.reply_text:
+            await self._schedule_llm_reply(
+                run,
+                dialog,
+                result.reply_text,
+                campaign_step_id=step.id,
+                await_reply_after_step=step.position,
+            )
+        else:
+            run.status = "awaiting_reply"
+            run.awaiting_reply_after_step = step.position
         await self.session.flush()
 
     async def _run_llm_step(self, run: DialogSequenceRun, step: CampaignStep) -> None:
@@ -186,7 +267,10 @@ class CampaignSequenceService:
         await self._audit(
             dialog.id,
             "sequence.llm_decision",
-            {"decision": redact_value(decision.model_dump())},
+            {
+                "decision": redact_value(decision.model_dump()),
+                "llm": self.llm_adapter.last_metadata if self.llm_adapter else None,
+            },
             status=decision.decision,
         )
         await self.session.flush()
@@ -212,7 +296,13 @@ class CampaignSequenceService:
             )
 
     async def _schedule_llm_reply(
-        self, run: DialogSequenceRun, dialog: Dialog, text: str
+        self,
+        run: DialogSequenceRun,
+        dialog: Dialog,
+        text: str,
+        *,
+        campaign_step_id=None,
+        await_reply_after_step: int | None = None,
     ) -> None:
         now = datetime.now(UTC)
         message = Message(
@@ -231,6 +321,7 @@ class CampaignSequenceService:
                 message_id=message.id,
                 campaign_id=run.campaign_id,
                 sequence_run_id=run.id,
+                campaign_step_id=campaign_step_id,
                 target_username=dialog.telegram_username,
                 peer=build_peer_from_dialog(dialog),
                 text=text,
@@ -239,6 +330,9 @@ class CampaignSequenceService:
                 next_attempt_at=now,
             )
         )
+        if await_reply_after_step is not None:
+            run.status = "waiting_outbound"
+            run.awaiting_reply_after_step = await_reply_after_step
 
     async def recover_stale_runs(self, *, older_than_seconds: int = 900) -> dict[str, int]:
         repository = DialogSequenceRunRepository(self.session)
@@ -250,11 +344,10 @@ class CampaignSequenceService:
         )
         recovered = failed = 0
         for run in waiting_outbound:
-            await self.process_next_steps(run)
-            recovered += 1
+            recovered += int(await self._recover_waiting_outbound_run(run))
         for run in awaiting_llm:
             try:
-                await self.process_next_steps(run)
+                await self._recover_awaiting_llm_run(run)
                 recovered += 1
             except Exception as exc:
                 run.status = "failed"
@@ -262,6 +355,79 @@ class CampaignSequenceService:
                 failed += 1
         await self.session.commit()
         return {"recovered": recovered, "failed": failed}
+
+    async def _reopen_latest_nonterminal_run(self, dialog_id: str) -> DialogSequenceRun | None:
+        lead = await LeadRepository(self.session).get_by_dialog(dialog_id)
+        if lead is None or lead.funnel_state in {"CONVERTED", "LOST", "DO_NOT_CONTACT", "HUMAN_HANDOFF"}:
+            return None
+        run = await DialogSequenceRunRepository(self.session).get_latest_by_dialog(dialog_id)
+        if run is None or run.status not in {"completed", "failed"}:
+            return None
+        step = await self._step_at_position(run, run.current_step_position)
+        if step is None or step.step_type not in {"brain_turn", "llm_decision"}:
+            return None
+        run.status = "awaiting_reply"
+        run.completed_at = None
+        run.error_message = None
+        run.awaiting_reply_after_step = step.position
+        await self._audit(
+            run.dialog_id,
+            "sequence.reopen_nonterminal",
+            {"sequence_run_id": str(run.id), "step_position": step.position},
+            status="awaiting_reply",
+        )
+        await self.session.flush()
+        return run
+
+    async def _recover_waiting_outbound_run(self, run: DialogSequenceRun) -> bool:
+        """Repair a run waiting for a send without advancing past its current step."""
+        if run.awaiting_reply_after_step is None:
+            run.status = "active"
+            await self.process_next_steps(run)
+            return True
+
+        step = await self._step_at_position(run, run.awaiting_reply_after_step)
+        if step is None:
+            run.status = "failed"
+            run.error_message = f"Missing campaign step {run.awaiting_reply_after_step}"
+            return True
+
+        job = await self._latest_job_for_run_step(run, step)
+        if job is None:
+            run.status = "active"
+            run.current_step_position = min(
+                run.current_step_position,
+                run.awaiting_reply_after_step - 1,
+            )
+            await self.process_next_steps(run)
+            return True
+
+        if job.status == "sent":
+            run.status = "awaiting_reply"
+            return True
+        if job.status in {"queued", "retry", "processing"}:
+            return False
+
+        run.status = "failed"
+        run.error_message = job.error_message or f"Outbound job ended with {job.status}"
+        return True
+
+    async def _recover_awaiting_llm_run(self, run: DialogSequenceRun) -> None:
+        steps = await CampaignStepRepository(self.session).list_by_campaign(run.campaign_id)
+        current_step = next(
+            (step for step in steps if step.position == run.current_step_position),
+            None,
+        )
+        if current_step is None:
+            await self.process_next_steps(run)
+            return
+        if current_step.step_type == "brain_turn":
+            await self._run_brain_step(run, current_step)
+            return
+        if current_step.step_type == "llm_decision":
+            await self._run_llm_step(run, current_step)
+            return
+        await self.process_next_steps(run)
 
     async def _audit(self, dialog_id, action_type: str, payload: dict[str, Any], *, status: str) -> None:
         self.session.add(
@@ -272,6 +438,41 @@ class CampaignSequenceService:
                 status=status,
             )
         )
+        await self.session.flush()
+
+    async def _step_at_position(
+        self, run: DialogSequenceRun, position: int
+    ) -> CampaignStep | None:
+        steps = await CampaignStepRepository(self.session).list_by_campaign(run.campaign_id)
+        return next((step for step in steps if step.position == position), None)
+
+    async def _latest_job_for_run_step(
+        self, run: DialogSequenceRun, step: CampaignStep
+    ) -> OutboundJob | None:
+        result = await self.session.execute(
+            select(OutboundJob)
+            .where(
+                OutboundJob.sequence_run_id == run.id,
+                OutboundJob.campaign_step_id == step.id,
+            )
+            .order_by(OutboundJob.created_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    async def _apply_step_state(self, dialog_id, step: CampaignStep) -> None:
+        state_after = (getattr(step, "metadata_json", None) or {}).get("state_after")
+        if not state_after:
+            return
+        lead = await LeadRepository(self.session).get_by_dialog(dialog_id)
+        if lead is None:
+            lead = Lead(dialog_id=dialog_id, qualification_status="new", funnel_state=state_after)
+            self.session.add(lead)
+        else:
+            lead.funnel_state = state_after
+            if state_after == "INFO_SENT":
+                lead.qualification_status = "interested"
+                lead.interest_status = lead.interest_status or "positive"
         await self.session.flush()
 
 

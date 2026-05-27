@@ -7,11 +7,16 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
+from app.models.dialog import Dialog
+from app.models.funnel_graph import LeadFunnelRuntime
 from app.models.inbound_event import InboundEvent
+from app.models.lead import Lead
 from app.repositories.inbound_event import InboundEventRepository
-from app.services.campaign_sequence import CampaignSequenceService
+from app.services.funnel_graph.turn_buffer import FunnelTurnBufferService, is_candidate_typing_event
 
 logger = logging.getLogger(__name__)
+LangGraphFunnelGateway = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -25,6 +30,13 @@ class InboundQueueBatchResult:
 
 class RetryableInboundEventError(Exception):
     pass
+
+
+class DeferredInboundEvent(Exception):
+    def __init__(self, retry_at: datetime, reason: str) -> None:
+        super().__init__(reason)
+        self.retry_at = retry_at
+        self.reason = reason
 
 
 class InboundQueueWorker:
@@ -59,6 +71,12 @@ class InboundQueueWorker:
 
             try:
                 await self._process_event(event)
+            except DeferredInboundEvent as exc:
+                event.status = "retry"
+                event.error_message = exc.reason
+                event.last_error_type = type(exc).__name__
+                event.next_attempt_at = exc.retry_at
+                retry += 1
             except RetryableInboundEventError as exc:
                 event.error_message = str(exc)
                 event.last_error_type = type(exc).__name__
@@ -115,7 +133,56 @@ class InboundQueueWorker:
             return
         dialog_id = getattr(event, "dialog_id", None) or payload.get("dialog_id")
         if dialog_id:
-            await CampaignSequenceService(self.session).handle_inbound_message(
-                dialog_id=str(dialog_id),
-                message_id=payload.get("db_message_id"),
-            )
+            settings = get_settings()
+            if settings.langgraph_funnel_enabled:
+                dialog = await self.session.get(Dialog, dialog_id)
+                lead = await self._lead_for_dialog(dialog_id) if dialog is not None else None
+                runtime = await self._runtime_for_lead(lead) if lead is not None else None
+                turn_buffer = FunnelTurnBufferService(
+                    self.session,
+                    debounce_seconds=settings.brain_inbound_debounce_seconds,
+                )
+                if dialog is not None and is_candidate_typing_event(payload):
+                    await turn_buffer.record_typing_activity(dialog=dialog, runtime=runtime, payload=payload)
+                    return
+                if dialog is not None:
+                    buffer_result = await turn_buffer.prepare_inbound_turn(
+                        dialog=dialog,
+                        lead=lead,
+                        runtime=runtime,
+                        message_id=payload.get("db_message_id"),
+                    )
+                    if not buffer_result.ready:
+                        if buffer_result.retry_at is not None:
+                            raise DeferredInboundEvent(
+                                buffer_result.retry_at,
+                                buffer_result.reason or "waiting for candidate quiet window",
+                            )
+                        return
+                try:
+                    gateway_cls = LangGraphFunnelGateway
+                    if gateway_cls is None:
+                        from app.services.funnel_graph.gateway import LangGraphFunnelGateway as gateway_cls
+
+                    await gateway_cls(self.session, settings=settings).decide_for_dialog_message(
+                        dialog_id=str(dialog_id),
+                        message_id=payload.get("db_message_id"),
+                    )
+                except Exception:
+                    logger.exception("langgraph funnel gateway failed", extra={"dialog_id": str(dialog_id)})
+                    raise
+                return
+
+    async def _lead_for_dialog(self, dialog_id) -> Lead | None:
+        from sqlalchemy import select
+
+        result = await self.session.execute(select(Lead).where(Lead.dialog_id == dialog_id).limit(1))
+        return result.scalar_one_or_none()
+
+    async def _runtime_for_lead(self, lead: Lead) -> LeadFunnelRuntime | None:
+        from sqlalchemy import select
+
+        result = await self.session.execute(
+            select(LeadFunnelRuntime).where(LeadFunnelRuntime.lead_id == lead.id).limit(1)
+        )
+        return result.scalar_one_or_none()
