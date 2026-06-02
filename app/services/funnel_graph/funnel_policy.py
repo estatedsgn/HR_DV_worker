@@ -61,7 +61,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "age_check": StagePolicy(
         name="age_check",
         goal="Узнать полный возраст кандидатки.",
-        current_question="Сколько тебе лет?",
+        current_question="Для начала скажи, сколько тебе лет?",
         required_fields=("age_confirmed",),
         next_stage_if_completed="work_intro_delivery",
         allowed_transitions=("age_check", "work_intro_delivery", "lost", "do_not_contact", "human_handoff"),

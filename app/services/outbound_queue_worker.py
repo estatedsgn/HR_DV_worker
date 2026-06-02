@@ -10,7 +10,7 @@ from typing import Any
 from uuid import UUID
 
 import httpx
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
@@ -64,7 +64,7 @@ class OutboundQueueWorker:
         connector: CRMChatConnector | None = None,
         settings: Settings | None = None,
         lease_owner: str = "outbound-worker",
-        lease_seconds: int = 60,
+        lease_seconds: int = 300,
         allow_real_send: bool | None = None,
         typing_delay_seconds: float | None = None,
     ) -> None:
@@ -285,10 +285,53 @@ class OutboundQueueWorker:
             delay = metadata.get("recording_delay_seconds", self.settings.outbound_voice_recording_delay_seconds)
         else:
             action = job.typing_action or "sendMessageTypingAction"
-            delay = self.typing_delay_seconds
+            delay = metadata.get("typing_delay_seconds", self._text_typing_delay_seconds(metadata))
         delay = max(0.0, float(delay or 0.0))
         if delay <= 0 or not account.crmchat_workspace_id:
             return
+        await self._send_activity_until_send(account, peer, action=action, delay=delay)
+
+    def _text_typing_delay_seconds(self, metadata: dict[str, Any] | None = None) -> float:
+        metadata = metadata or {}
+        max_delay = max(0.0, float(metadata.get("typing_delay_max_seconds", self.typing_delay_seconds) or 0.0))
+        min_delay = max(
+            0.0,
+            float(metadata.get("typing_delay_min_seconds", self.settings.outbound_typing_min_delay_seconds) or 0.0),
+        )
+        if max_delay <= 0:
+            return 0.0
+        if max_delay <= min_delay:
+            return max_delay
+        return random.uniform(min_delay, max_delay)
+
+    async def _send_activity_until_send(
+        self,
+        account: Account,
+        peer: dict[str, Any],
+        *,
+        action: str,
+        delay: float,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + delay
+        refresh_interval_seconds = 4.0
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            await self._set_outbound_activity(account, peer, action=action)
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(refresh_interval_seconds, remaining))
+
+    async def _set_outbound_activity(
+        self,
+        account: Account,
+        peer: dict[str, Any],
+        *,
+        action: str,
+    ) -> None:
         try:
             await self.connector.set_typing(
                 account.crmchat_workspace_id,
@@ -299,9 +342,8 @@ class OutboundQueueWorker:
         except Exception as exc:
             logger.warning(
                 "failed to set outbound activity before send",
-                extra={"job_id": str(job.id), "error": str(exc)},
+                extra={"action": action, "error": str(exc)},
             )
-        await asyncio.sleep(delay)
 
     async def _send_voice_job(
         self,
@@ -443,7 +485,7 @@ class OutboundQueueWorker:
                 Message.dialog_id == job.dialog_id,
                 Message.direction == "inbound",
                 *ignored_message_filter,
-                or_(Message.created_at > threshold, Message.sent_at > threshold),
+                func.coalesce(Message.sent_at, Message.created_at) > threshold,
             )
             .limit(1)
         )

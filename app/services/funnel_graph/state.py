@@ -20,11 +20,17 @@ class FunnelAction(BaseModel):
 
     type: Literal["send_text", "send_voice", "handoff", "close_lost", "do_not_contact"] = "send_text"
     idempotency_key: str | None = None
+    reply_group_id: str | None = None
+    reply_group_index: int | None = None
+    reply_group_size: int | None = None
     text: str | None = None
     delay_seconds: int | None = None
     media_path: str | None = None
     caption: str | None = None
     recording_delay_seconds: float | None = None
+    duration_seconds: int | None = None
+    typing_delay_min_seconds: float | None = None
+    typing_delay_max_seconds: float | None = None
     reason: str | None = None
 
 
@@ -158,21 +164,37 @@ def normalize_graph_state(state: FunnelGraphState) -> FunnelGraphState:
     }
 
 
-def latest_inbound_text(state: FunnelGraphState) -> str:
+def inbound_message_batch(state: FunnelGraphState) -> list[dict[str, Any]]:
     if state.get("timeout_event") and not str(state.get("incoming_message") or "").strip():
-        return ""
+        return []
+    batch = [
+        dict(item)
+        for item in list(state.get("message_batch") or [])
+        if item.get("direction") == "inbound" and str(item.get("body") or "").strip()
+    ]
+    if batch:
+        return batch
     incoming = str(state.get("incoming_message") or "").strip()
     if incoming:
-        return incoming
-    batch = list(state.get("message_batch") or [])
-    for item in reversed(batch):
-        if item.get("direction") == "inbound" and str(item.get("body") or "").strip():
-            return str(item["body"]).strip()
+        return [{"direction": "inbound", "sender_type": "lead", "body": incoming}]
+    return []
+
+
+def combined_inbound_text(state: FunnelGraphState) -> str:
+    if state.get("timeout_event") and not str(state.get("incoming_message") or "").strip():
+        return ""
+    batch = inbound_message_batch(state)
+    if batch:
+        return "\n".join(str(item.get("body") or "").strip() for item in batch if str(item.get("body") or "").strip())
     recent = list(state.get("recent_messages") or [])
     for item in reversed(recent):
         if item.get("direction") == "inbound" and str(item.get("body") or "").strip():
             return str(item["body"]).strip()
     return ""
+
+
+def latest_inbound_text(state: FunnelGraphState) -> str:
+    return combined_inbound_text(state)
 
 
 def normalize_stage_name(stage: object) -> str:

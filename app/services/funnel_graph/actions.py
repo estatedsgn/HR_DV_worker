@@ -13,6 +13,7 @@ from app.models.human_handoff import HumanHandoff
 from app.models.lead import Lead
 from app.models.message import Message
 from app.models.outbound_job import OutboundJob
+from app.services.funnel_graph.knowledge import repair_mojibake
 from app.services.funnel_graph.state import FunnelAction
 
 
@@ -37,6 +38,7 @@ class FunnelActionExecutor:
     async def _send_text(self, *, dialog: Dialog, action: FunnelAction) -> None:
         if not action.text:
             return
+        text = repair_mojibake(action.text)
         if action.idempotency_key and await self._existing_job(dialog.id, action.idempotency_key):
             return
         scheduled_at = datetime.now(UTC) + timedelta(seconds=max(0, int(action.delay_seconds or 0)))
@@ -44,7 +46,7 @@ class FunnelActionExecutor:
             dialog_id=dialog.id,
             direction="outbound",
             sender_type="agent",
-            body=action.text,
+            body=text,
             status="scheduled",
         )
         self.session.add(message)
@@ -56,7 +58,7 @@ class FunnelActionExecutor:
                 message_id=message.id,
                 target_username=dialog.telegram_username,
                 peer=build_peer_from_dialog(dialog),
-                text=action.text,
+                text=text,
                 status="queued",
                 scheduled_at=scheduled_at,
                 next_attempt_at=scheduled_at,
@@ -71,7 +73,7 @@ class FunnelActionExecutor:
         if action.idempotency_key and await self._existing_job(dialog.id, action.idempotency_key):
             return
         media_path = str(Path(action.media_path))
-        body = action.caption or f"[voice] {Path(media_path).name}"
+        body = repair_mojibake(action.caption or f"[voice] {Path(media_path).name}")
         scheduled_at = datetime.now(UTC) + timedelta(seconds=max(0, int(action.delay_seconds or 0)))
         message = Message(
             dialog_id=dialog.id,
@@ -145,8 +147,20 @@ def metadata_for_action(action: FunnelAction) -> dict[str, Any]:
     metadata: dict[str, Any] = {"source": "langgraph_funnel"}
     if action.idempotency_key:
         metadata["funnel_idempotency_key"] = action.idempotency_key
+    if action.reply_group_id:
+        metadata["reply_group_id"] = action.reply_group_id
+    if action.reply_group_index is not None:
+        metadata["reply_group_index"] = action.reply_group_index
+    if action.reply_group_size is not None:
+        metadata["reply_group_size"] = action.reply_group_size
     if action.recording_delay_seconds is not None:
         metadata["recording_delay_seconds"] = action.recording_delay_seconds
+    if action.duration_seconds is not None:
+        metadata["duration_seconds"] = action.duration_seconds
+    if action.typing_delay_min_seconds is not None:
+        metadata["typing_delay_min_seconds"] = action.typing_delay_min_seconds
+    if action.typing_delay_max_seconds is not None:
+        metadata["typing_delay_max_seconds"] = action.typing_delay_max_seconds
     if action.caption:
         metadata["caption"] = action.caption
     return metadata

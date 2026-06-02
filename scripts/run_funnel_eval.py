@@ -40,6 +40,14 @@ def parse_args() -> argparse.Namespace:
         help="Fail if the candidate simulator LLM path cannot be used.",
     )
     parser.add_argument(
+        "--candidate-provider",
+        help="Override provider only for the LLM candidate simulator.",
+    )
+    parser.add_argument(
+        "--candidate-model",
+        help="Override model only for the LLM candidate simulator.",
+    )
+    parser.add_argument(
         "--skip-llm-preflight",
         action="store_true",
         help="Do not run a fail-fast LLM connectivity check before the conversations.",
@@ -70,6 +78,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Fail if the quality evaluator LLM cannot be used.",
     )
+    parser.add_argument(
+        "--quality-evaluator-provider",
+        help="Override provider only for the quality evaluator.",
+    )
+    parser.add_argument(
+        "--quality-evaluator-model",
+        help="Override model only for the quality evaluator.",
+    )
     return parser.parse_args()
 
 
@@ -84,6 +100,8 @@ async def main() -> None:
         candidate_llm=not args.no_candidate_llm,
         require_agent_llm=args.require_agent_llm,
         require_candidate_llm=args.require_candidate_llm,
+        candidate_llm_provider=args.candidate_provider,
+        candidate_llm_model=args.candidate_model,
         llm_preflight=not args.skip_llm_preflight,
         llm_timeout_seconds=args.llm_timeout_seconds,
         llm_max_retries=args.llm_max_retries,
@@ -91,6 +109,8 @@ async def main() -> None:
         quality_evaluator=args.with_quality_evaluator,
         quality_evaluator_llm=not args.no_quality_evaluator_llm,
         require_quality_evaluator_llm=args.require_quality_evaluator_llm,
+        quality_evaluator_provider=args.quality_evaluator_provider,
+        quality_evaluator_model=args.quality_evaluator_model,
     )
     try:
         result = await FunnelEvalRunner(config=config).run()
@@ -108,11 +128,15 @@ async def main() -> None:
                 "candidate_llm": config.candidate_llm,
                 "require_agent_llm": config.require_agent_llm,
                 "require_candidate_llm": config.require_candidate_llm,
+                "candidate_llm_provider": config.candidate_llm_provider,
+                "candidate_llm_model": config.candidate_llm_model,
                 "llm_timeout_seconds": config.llm_timeout_seconds,
                 "llm_max_retries": config.llm_max_retries,
                 "quality_evaluator": config.quality_evaluator,
                 "quality_evaluator_llm": config.quality_evaluator_llm,
                 "require_quality_evaluator_llm": config.require_quality_evaluator_llm,
+                "quality_evaluator_provider": config.quality_evaluator_provider,
+                "quality_evaluator_model": config.quality_evaluator_model,
             },
         }
         (config.output_dir / "api_error.json").write_text(

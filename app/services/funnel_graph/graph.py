@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
@@ -20,7 +21,12 @@ from app.services.funnel_graph.funnel_policy import (
 from app.services.funnel_graph.knowledge import StaticFunnelKnowledgeBase
 from app.services.funnel_graph.reply import ReplyOrchestrator, ReplyResult, natural_timeout_followup
 from app.services.funnel_graph.semantic import SemanticAnalyzer, SemanticResult
-from app.services.funnel_graph.state import FunnelGraphState, latest_inbound_text, normalize_graph_state
+from app.services.funnel_graph.state import (
+    FunnelGraphState,
+    combined_inbound_text,
+    inbound_message_batch,
+    normalize_graph_state,
+)
 
 
 def build_funnel_graph(
@@ -65,15 +71,24 @@ async def load_state(state: FunnelGraphState) -> FunnelGraphState:
     normalized = normalize_graph_state(state)
     profile = normalize_candidate_profile(normalized.get("candidate_profile"))
     stage = str(normalized.get("stage") or "interest_check")
-    incoming = latest_inbound_text(normalized)
+    incoming = combined_inbound_text(normalized)
+    inbound_batch = inbound_message_batch(normalized)
     metadata = dict(normalized.get("metadata") or {})
     timeout_event = normalized.get("timeout_event") or metadata.get("timeout_event")
     metadata.pop("timeout_event", None)
     metadata["graph_foundation_version"] = "semantic_funnel_v1"
+    metadata["graph_started_at"] = datetime.now(UTC).isoformat()
     previous_state = normalized.get("previous_state") or metadata.get("previous_state")
     conversation_history = list(normalized.get("conversation_history") or metadata.get("conversation_history") or [])
-    if incoming:
-        conversation_history.append({"direction": "inbound", "body": incoming, "at": datetime.now(UTC).isoformat()})
+    if inbound_batch:
+        for item in inbound_batch:
+            conversation_history.append(
+                {
+                    "direction": "inbound",
+                    "body": str(item.get("body") or "").strip(),
+                    "at": item.get("sent_at") or datetime.now(UTC).isoformat(),
+                }
+            )
     state_before = {
         "stage": stage,
         "current_state": stage,
@@ -93,6 +108,7 @@ async def load_state(state: FunnelGraphState) -> FunnelGraphState:
         "stage_before": stage,
         "state_before": state_before,
         "incoming_message": incoming,
+        "message_batch": inbound_batch,
         "timeout_event": timeout_event,
         "last_user_message": incoming or normalized.get("last_user_message"),
         "candidate_profile": profile,
@@ -127,7 +143,12 @@ def _semantic_analyzer_node(analyzer: SemanticAnalyzer):
                 retrieval_query=str(state.get("incoming_message") or ""),
                 confidence=0.0,
             )
-        return {"semantic_result": result.model_dump(), "parse_errors": parse_errors}
+        metadata = dict(state.get("metadata") or {})
+        run_metadata = dict(getattr(analyzer, "last_run_metadata", {}) or {})
+        if run_metadata:
+            metadata["semantic_metrics"] = run_metadata
+            metadata["model_test_profile"] = run_metadata.get("profile")
+        return {"semantic_result": result.model_dump(), "parse_errors": parse_errors, "metadata": metadata}
 
     return semantic_analyzer
 
@@ -135,7 +156,7 @@ def _semantic_analyzer_node(analyzer: SemanticAnalyzer):
 def _retrieve_knowledge_node(knowledge_source: Any, static_store: StaticFunnelKnowledgeBase):
     async def retrieve_knowledge(state: FunnelGraphState) -> FunnelGraphState:
         semantic = SemanticResult.model_validate(state.get("semantic_result") or {})
-        query = semantic.retrieval_query or str(state.get("incoming_message") or "")
+        query = semantic.retrieval_query if semantic.retrieval_topics else ""
         topics = list(semantic.retrieval_topics or [])
         static_payload = static_store.retrieve(
             incoming_message=str(state.get("incoming_message") or ""),
@@ -196,11 +217,17 @@ def _reply_orchestrator_node(replier: ReplyOrchestrator):
                 summary="reply orchestrator failed",
                 confidence=0.0,
             )
+        metadata = dict(state.get("metadata") or {})
+        run_metadata = dict(getattr(replier, "last_run_metadata", {}) or {})
+        if run_metadata:
+            metadata["reply_metrics"] = run_metadata
+            metadata["model_test_profile"] = run_metadata.get("profile") or metadata.get("model_test_profile")
         return {
             "reply_result": result.model_dump(),
             # Compatibility with older reports.
             "orchestrator_result": {"understanding": state.get("semantic_result") or {}, "reply": result.model_dump()},
             "parse_errors": parse_errors,
+            "metadata": metadata,
         }
 
     return reply_orchestrator
@@ -245,7 +272,10 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
         else:
             target_stage = current_stage
 
-    if not can_transition(current_stage, target_stage):
+    if target_stage != current_stage and not semantic.has_unresolved_interrupt:
+        target_stage = advance_through_completed_waiting_stages(target_stage, profile)
+
+    if not can_transition_via_completed_stages(current_stage, target_stage, profile):
         invalid_reason = f"transition_not_allowed:{current_stage}->{target_stage}"
         target_stage = current_stage
     elif target_stage != current_stage and target_stage not in TERMINAL_STAGES and not stage_requirement_met(current_stage, profile):
@@ -270,7 +300,7 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
         next_question = get_stage_policy(target_stage).current_question
         if next_question and not outgoing_contains(outgoing, next_question):
             outgoing.append({"type": "text", "text": next_question, "voice_pack_id": None})
-    elif not outgoing and policy.current_question and semantic.message_type != "empty":
+    elif send_reply and not outgoing and policy.current_question and semantic.message_type != "empty":
         outgoing.append({"type": "text", "text": policy.current_question, "voice_pack_id": None})
 
     metadata = dict(state.get("metadata") or {})
@@ -283,6 +313,7 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
         metadata["last_interrupt_topic"] = semantic.interrupt_topic
         metadata["resume_state"] = current_stage
         if semantic.interrupt_type in {"question", "objection"} and policy.current_question:
+            update_interrupt_streak(metadata, current_stage)
             metadata["awaiting_interrupt_followup"] = True
             metadata["interrupt_followup_stage"] = current_stage
             metadata["interrupt_followup_question"] = policy.current_question
@@ -293,12 +324,16 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
         metadata["last_interrupt_topic"] = None
         metadata["resume_state"] = None
         clear_interrupt_followup(metadata)
+        clear_interrupt_streak(metadata)
     elif state.get("timeout_event") == "interrupt_followup":
         if metadata.get("awaiting_interrupt_followup"):
             metadata["interrupt_followup_count"] = int(metadata.get("interrupt_followup_count") or 0) + 1
         clear_interrupt_followup(metadata, keep_count=True)
+        clear_interrupt_streak(metadata)
     elif not semantic.has_unresolved_interrupt and semantic.message_type != "empty":
-        clear_interrupt_followup(metadata)
+        if send_reply or not metadata.get("awaiting_interrupt_followup"):
+            clear_interrupt_followup(metadata)
+            clear_interrupt_streak(metadata)
     metadata["handoff_required"] = handoff_required or target_stage == "human_handoff"
 
     if profile.get("interest_status"):
@@ -336,6 +371,39 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
     }
 
 
+def advance_through_completed_waiting_stages(stage: str, profile: dict[str, Any]) -> str:
+    """Skip newly-entered waiting stages whose required fields were collected in this turn."""
+    seen: set[str] = set()
+    while stage not in seen and stage not in TERMINAL_STAGES:
+        seen.add(stage)
+        policy = get_stage_policy(stage)
+        if policy.stage_type != "waiting" or not stage_requirement_met(stage, profile):
+            break
+        next_stage = next_stage_if_requirement_met(stage, profile)
+        if next_stage == stage:
+            break
+        stage = next_stage
+    return stage
+
+
+def can_transition_via_completed_stages(current_stage: str, target_stage: str, profile: dict[str, Any]) -> bool:
+    if can_transition(current_stage, target_stage):
+        return True
+    stage = current_stage
+    seen: set[str] = set()
+    while stage not in seen and stage not in TERMINAL_STAGES:
+        seen.add(stage)
+        if not stage_requirement_met(stage, profile):
+            return False
+        next_stage = next_stage_if_requirement_met(stage, profile)
+        if next_stage == stage or not can_transition(stage, next_stage):
+            return False
+        stage = next_stage
+        if can_transition(stage, target_stage):
+            return True
+    return stage == target_stage
+
+
 def clear_interrupt_followup(metadata: dict[str, Any], *, keep_count: bool = False) -> None:
     count = metadata.get("interrupt_followup_count") if keep_count else None
     for key in (
@@ -351,6 +419,18 @@ def clear_interrupt_followup(metadata: dict[str, Any], *, keep_count: bool = Fal
         metadata["interrupt_followup_count"] = count
     elif not keep_count:
         metadata.pop("interrupt_followup_count", None)
+
+
+def update_interrupt_streak(metadata: dict[str, Any], stage: str) -> None:
+    previous_stage = metadata.get("interrupt_streak_stage")
+    previous_count = int(metadata.get("interrupt_streak_count") or 0)
+    metadata["interrupt_streak_stage"] = stage
+    metadata["interrupt_streak_count"] = previous_count + 1 if previous_stage == stage else 1
+
+
+def clear_interrupt_streak(metadata: dict[str, Any]) -> None:
+    metadata.pop("interrupt_streak_stage", None)
+    metadata.pop("interrupt_streak_count", None)
 
 
 def _action_executor_node(knowledge: StaticFunnelKnowledgeBase):
@@ -393,6 +473,9 @@ def _action_executor_node(knowledge: StaticFunnelKnowledgeBase):
         metadata = dict(state.get("metadata") or {})
         last_bot_message = "\n\n".join(str(message.get("text")) for message in outgoing if message.get("type") == "text" and message.get("text")) or state.get("last_bot_message")
         metadata["last_bot_message"] = last_bot_message
+        reply_group_ids = [action.get("reply_group_id") for action in pending_actions if action.get("reply_group_id")]
+        if reply_group_ids:
+            metadata["last_reply_group_id"] = reply_group_ids[0]
         return {
             "stage": stage,
             "current_state": stage,
@@ -416,6 +499,7 @@ def _action_executor_node(knowledge: StaticFunnelKnowledgeBase):
 async def save_state(state: FunnelGraphState) -> FunnelGraphState:
     metadata: dict[str, Any] = dict(state.get("metadata") or {})
     metadata["last_graph_node"] = "save_state"
+    metadata["graph_total_latency_ms"] = graph_total_latency_ms(metadata.get("graph_started_at"))
     history = list(state.get("conversation_history") or [])
     for message in state.get("outgoing_messages") or []:
         if message.get("type") == "text" and message.get("text"):
@@ -435,6 +519,7 @@ async def save_state(state: FunnelGraphState) -> FunnelGraphState:
         "orchestrator_result": state.get("orchestrator_result") or {},
         "outgoing_messages": state.get("outgoing_messages") or [],
         "pending_actions": state.get("pending_actions") or [],
+        "reply_group_id": metadata.get("last_reply_group_id"),
         "stage_after": state.get("stage"),
         "state_after": {
             "stage": state.get("stage"),
@@ -461,6 +546,18 @@ def non_null_facts(semantic: SemanticResult) -> dict[str, Any]:
     return {key: value for key, value in semantic.facts.model_dump().items() if value is not None}
 
 
+def graph_total_latency_ms(started_at: Any) -> int | None:
+    if not started_at:
+        return None
+    try:
+        started = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    return max(0, int((datetime.now(UTC) - started).total_seconds() * 1000))
+
+
 def normalize_outgoing_message(message: Any) -> dict[str, Any]:
     if hasattr(message, "model_dump"):
         message = message.model_dump()
@@ -470,6 +567,10 @@ def normalize_outgoing_message(message: Any) -> dict[str, Any]:
         "text": raw.get("text"),
         "voice_pack_id": raw.get("voice_pack_id"),
         "template_id": raw.get("template_id"),
+        "delay_seconds": raw.get("delay_seconds"),
+        "reply_group_id": raw.get("reply_group_id"),
+        "reply_group_index": raw.get("reply_group_index"),
+        "reply_group_size": raw.get("reply_group_size"),
     }
 
 
@@ -521,24 +622,57 @@ def pending_actions_from_outgoing(state: FunnelGraphState, outgoing: list[dict[s
             return [{"type": "do_not_contact", "reason": "candidate_asked_not_to_contact"}]
         return []
     actions = []
-    thread_id = state.get("thread_id") or state.get("candidate_id") or "local"
-    for index, message in enumerate(outgoing):
+    normalized_outgoing = [normalize_outgoing_message(message) for message in outgoing]
+    reply_group_id = build_reply_group_id(state, normalized_outgoing)
+    group_size = outgoing_action_count(state, normalized_outgoing)
+    group_index = 0
+    cumulative_delay_seconds = 0
+    for index, message in enumerate(normalized_outgoing):
         if message.get("type") == "voice_pack":
-            actions.append(
-                {
-                    "type": "send_voice",
-                    "caption": f"[voice_pack: {message.get('voice_pack_id')}]",
-                    "idempotency_key": f"{thread_id}:{state.get('stage')}:{index}:{message.get('voice_pack_id')}",
-                }
-            )
+            for voice_index, item in enumerate(voice_pack_action_items(state, str(message.get("voice_pack_id") or ""))):
+                group_index += 1
+                delay_seconds = int(item.get("delay_seconds") if item.get("delay_seconds") is not None else cumulative_delay_seconds)
+                recording_delay_seconds = item.get("recording_delay_seconds")
+                actions.append(
+                    {
+                        "type": "send_voice",
+                        "media_path": item.get("media_path"),
+                        "caption": item.get("caption") or f"[voice_pack: {message.get('voice_pack_id')}]",
+                        "recording_delay_seconds": recording_delay_seconds,
+                        "duration_seconds": item.get("duration_seconds"),
+                        "delay_seconds": delay_seconds,
+                        "reply_group_id": reply_group_id,
+                        "reply_group_index": group_index,
+                        "reply_group_size": group_size,
+                        "idempotency_key": (
+                            f"{reply_group_id}:{index}:{message.get('voice_pack_id')}:"
+                            f"{voice_index}:{item.get('id') or stable_digest(item)}"
+                        ),
+                    }
+                )
+                cumulative_delay_seconds = max(
+                    cumulative_delay_seconds,
+                    delay_seconds + int(float(recording_delay_seconds or 0)),
+                )
             continue
         if message.get("type") != "text" or not message.get("text"):
             continue
+        group_index += 1
+        delay_seconds = message.get("delay_seconds")
+        if delay_seconds is None:
+            delay_seconds = cumulative_delay_seconds
+        typing_min, typing_max = text_typing_delay_range(state)
         actions.append(
             {
                 "type": "send_text",
                 "text": message["text"],
-                "idempotency_key": f"{thread_id}:{state.get('stage')}:{index}:{hash(str(message.get('text')))}",
+                "delay_seconds": delay_seconds,
+                "typing_delay_min_seconds": typing_min,
+                "typing_delay_max_seconds": typing_max,
+                "reply_group_id": reply_group_id,
+                "reply_group_index": group_index,
+                "reply_group_size": group_size,
+                "idempotency_key": f"{reply_group_id}:{index}:{stable_digest(str(message.get('text')))}",
             }
         )
     if state.get("stage") == "lost":
@@ -549,6 +683,78 @@ def pending_actions_from_outgoing(state: FunnelGraphState, outgoing: list[dict[s
     if followup_action:
         actions.append(followup_action)
     return actions
+
+
+def outgoing_action_count(state: FunnelGraphState, outgoing: list[dict[str, Any]]) -> int:
+    total = 0
+    for message in outgoing:
+        if message.get("type") == "voice_pack":
+            total += len(voice_pack_action_items(state, str(message.get("voice_pack_id") or "")))
+        elif message.get("type") == "text" and message.get("text"):
+            total += 1
+    return total
+
+
+def voice_pack_action_items(state: FunnelGraphState, voice_pack_id: str) -> list[dict[str, Any]]:
+    raw_pack = (state.get("voice_packs") or {}).get(voice_pack_id) or []
+    items: list[dict[str, Any]] = []
+    if isinstance(raw_pack, list):
+        for raw_item in raw_pack:
+            if isinstance(raw_item, dict):
+                item = dict(raw_item)
+            else:
+                item = {"id": str(raw_item), "caption": f"[voice] {raw_item}"}
+            if item.get("media_path"):
+                item.setdefault("recording_delay_seconds", 40)
+            items.append(item)
+    if items:
+        return items
+    return [{"id": voice_pack_id, "caption": f"[voice_pack: {voice_pack_id}]"}]
+
+
+def text_typing_delay_range(state: FunnelGraphState) -> tuple[float, float]:
+    semantic = dict(state.get("semantic_result") or {})
+    if semantic.get("has_unresolved_interrupt") or semantic.get("message_type") in {"interrupt_question", "objection", "mixed"}:
+        return (6.0, 10.0)
+    if semantic.get("current_goal_satisfied") or semantic.get("message_type") in {"stage_answer", "partial_answer"}:
+        return (2.0, 4.0)
+    return (4.0, 7.0)
+
+
+def build_reply_group_id(state: FunnelGraphState, outgoing: list[dict[str, Any]]) -> str:
+    thread_id = state.get("thread_id") or state.get("candidate_id") or "local"
+    stage = state.get("stage") or "unknown"
+    payload = {
+        "stage": stage,
+        "incoming": state.get("incoming_message") or "",
+        "message_batch": [
+            {
+                "id": item.get("id"),
+                "body": item.get("body"),
+                "sent_at": item.get("sent_at"),
+            }
+            for item in list(state.get("message_batch") or [])
+        ],
+        "outgoing": [
+            {
+                "type": message.get("type"),
+                "text": message.get("text"),
+                "voice_pack_id": message.get("voice_pack_id"),
+                "template_id": message.get("template_id"),
+            }
+            for message in outgoing
+            if message.get("type") == "voice_pack" or (message.get("type") == "text" and message.get("text"))
+        ],
+    }
+    return f"{thread_id}:{stage}:reply:{stable_digest(payload)}"
+
+
+def stable_digest(value: Any) -> str:
+    if isinstance(value, str):
+        raw = value
+    else:
+        raw = repr(value)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def interrupt_followup_action(state: FunnelGraphState) -> dict[str, Any] | None:
@@ -572,9 +778,13 @@ def interrupt_followup_action(state: FunnelGraphState) -> dict[str, Any] | None:
     delay_seconds = int(metadata.get("interrupt_followup_timeout_seconds") or 60)
     started_at = str(metadata.get("interrupt_followup_started_at") or "unknown").replace(":", "-")
     thread_id = state.get("thread_id") or state.get("candidate_id") or "local"
+    reply_group_id = f"{thread_id}:{state.get('stage')}:interrupt_followup:{stable_digest(started_at + question)}"
     return {
         "type": "send_text",
         "text": natural_timeout_followup(question, metadata),
         "delay_seconds": max(1, delay_seconds),
-        "idempotency_key": f"{thread_id}:{state.get('stage')}:interrupt_followup:{started_at}",
+        "reply_group_id": reply_group_id,
+        "reply_group_index": 1,
+        "reply_group_size": 1,
+        "idempotency_key": f"{reply_group_id}:0",
     }

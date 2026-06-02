@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dialog import Dialog
@@ -43,6 +43,8 @@ class FunnelTurnBufferService:
             return FunnelTurnBufferResult(False, None, "covered_by_newer_inbound", latest, [])
         if runtime is not None and runtime.last_processed_message_id and str(runtime.last_processed_message_id) == str(latest.id):
             return FunnelTurnBufferResult(False, None, "already_processed_latest_inbound", latest, [])
+        if runtime is not None and is_before_reset_baseline(runtime, latest):
+            return FunnelTurnBufferResult(False, None, "inbound_before_reset_baseline", latest, [])
 
         await self.cancel_pending_outbound(dialog.id, reason="new inbound before langgraph reply", message_id=str(latest.id))
         if runtime is not None:
@@ -76,7 +78,7 @@ class FunnelTurnBufferService:
         query = select(Message).where(Message.dialog_id == dialog_id, Message.direction == "inbound")
         if last_outbound is not None:
             threshold = message_activity_at(last_outbound)
-            query = query.where(or_(Message.sent_at > threshold, Message.created_at > threshold))
+            query = query.where(func.coalesce(Message.sent_at, Message.created_at) > threshold)
         result = await self.session.execute(
             query.order_by(Message.sent_at.asc(), Message.created_at.asc()).limit(20)
         )
@@ -163,6 +165,27 @@ def ensure_aware(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value
+
+
+def is_before_reset_baseline(runtime: LeadFunnelRuntime, message: Message) -> bool:
+    baseline = reset_baseline_at(runtime)
+    if baseline is None or message.sent_at is None:
+        return False
+    return ensure_aware(message.sent_at) <= baseline
+
+
+def reset_baseline_at(runtime: LeadFunnelRuntime) -> datetime | None:
+    metadata = runtime.metadata_json or {}
+    for key in ("restart_at", "reset_at"):
+        value = metadata.get(key)
+        if isinstance(value, datetime):
+            return ensure_aware(value)
+        if isinstance(value, str) and value:
+            try:
+                return ensure_aware(datetime.fromisoformat(value.replace("Z", "+00:00")))
+            except ValueError:
+                continue
+    return None
 
 
 def is_candidate_typing_event(payload: dict[str, Any]) -> bool:

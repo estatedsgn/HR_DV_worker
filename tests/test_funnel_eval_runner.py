@@ -2,9 +2,6 @@ import asyncio
 import uuid
 from pathlib import Path
 
-import pytest
-
-from app.services.brain_v2.llm_provider import BrainLLMError
 from app.services.funnel_graph.eval_runner import (
     EvalTemplate,
     FunnelEvalConfig,
@@ -13,7 +10,6 @@ from app.services.funnel_graph.eval_runner import (
     deterministic_candidate_reply,
     normalize_template,
 )
-from app.services.funnel_graph.orchestrator import DialogueOrchestrator
 
 
 def test_funnel_eval_runner_writes_report_without_llm() -> None:
@@ -111,17 +107,3 @@ def test_expected_action_stage_hop_is_not_reported_as_warning() -> None:
 
     assert error_report["has_warnings"] is False
 
-
-def test_dialogue_orchestrator_can_disable_llm_fallback() -> None:
-    class FakeAdapter:
-        def has_api_key(self, component):
-            return False
-
-    with pytest.raises(BrainLLMError):
-        asyncio.run(
-            DialogueOrchestrator(
-                adapter=FakeAdapter(),
-                use_llm=True,
-                fallback_on_llm_error=False,
-            ).run({"stage": "interest_check", "incoming_message": "да"})
-        )

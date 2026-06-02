@@ -1,7 +1,7 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
 
-from app.services.inbound_queue_worker import InboundQueueWorker
+from app.services.inbound_queue_worker import InboundQueueWorker, is_restart_command
 
 
 class Event:
@@ -117,3 +117,11 @@ def test_backoff_is_exponential_with_jitter_bounds() -> None:
     assert 4 <= b1 <= 6
     assert 8 <= b2 <= 12
     assert 16 <= b3 <= 24
+
+
+def test_restart_command_detection_is_exact() -> None:
+    assert is_restart_command("restart")
+    assert is_restart_command(" /restart ")
+    assert is_restart_command("ReStaRt")
+    assert not is_restart_command("restart please")
+    assert not is_restart_command("")

@@ -52,10 +52,22 @@ class TerminalFunnelRepository:
         if path.exists():
             path.unlink()
 
-    def save_turn(self, candidate_id: str, state: FunnelGraphState, *, incoming_message: str | None) -> None:
+    def save_turn(
+        self,
+        candidate_id: str,
+        state: FunnelGraphState,
+        *,
+        incoming_message: str | list[str] | None,
+    ) -> None:
         recent_messages = list(state.get("recent_messages") or [])
-        if incoming_message:
-            recent_messages.append({"direction": "inbound", "sender_type": "lead", "body": incoming_message})
+        incoming_messages = (
+            incoming_message
+            if isinstance(incoming_message, list)
+            else ([incoming_message] if incoming_message else [])
+        )
+        for text in incoming_messages:
+            if text:
+                recent_messages.append({"direction": "inbound", "sender_type": "lead", "body": text})
         for message in state.get("outgoing_messages") or []:
             if message.get("type") == "text" and message.get("text"):
                 recent_messages.append({"direction": "outbound", "sender_type": "agent", "body": message["text"]})

@@ -3,12 +3,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import sys
 from datetime import UTC, datetime
 
-from sqlalchemy import update
+from sqlalchemy import func, select, update
 
 from app.db.session import AsyncSessionLocal
 from app.models.account import Account
+from app.models.dialog import Dialog
+from app.models.funnel_graph import LeadFunnelRuntime
 from app.services.account_sync import AccountSyncService
 from app.services.campaign_sequence import CampaignSequenceService
 from app.services.crmchat_connector import CRMChatAPIError, CRMChatConnector
@@ -38,9 +41,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inbound-limit", type=int, default=200)
     parser.add_argument("--outbound-limit", type=int, default=50)
     parser.add_argument("--recover-older-than-seconds", type=int, default=10)
+    parser.add_argument(
+        "--error-backoff-seconds",
+        type=int,
+        default=20,
+        help="Sleep this long after a cycle-level CRM/network error before retrying.",
+    )
     parser.add_argument("--sync-accounts-every", type=int, default=60)
     parser.add_argument("--test-fast-pacing-seconds", type=int, default=None)
     parser.add_argument("--typing-delay-seconds", type=float, default=None)
+    parser.add_argument("--model-test-profile", default=None)
     parser.add_argument(
         "--min-inbound-before-handoff",
         type=int,
@@ -57,16 +67,19 @@ async def main() -> None:
         os.environ["BRAIN_MIN_INBOUND_BEFORE_HANDOFF"] = str(
             max(0, args.min_inbound_before_handoff)
         )
+    if args.model_test_profile:
+        os.environ["MODEL_TEST_PROFILE"] = str(args.model_test_profile)
     if not args.allow_real_send:
         print("autopilot refused to start: pass --allow-real-send to send Telegram messages")
         raise SystemExit(2)
 
     cycle = 0
-    async with CRMChatConnector() as connector:
-        while True:
-            cycle += 1
-            started = datetime.now(UTC)
-            try:
+    while True:
+        cycle += 1
+        started = datetime.now(UTC)
+        sleep_seconds = args.poll_interval_seconds
+        try:
+            async with CRMChatConnector() as connector:
                 async with AsyncSessionLocal() as session:
                     if cycle == 1 or cycle % max(1, args.sync_accounts_every) == 0:
                         sync = await AccountSyncService(session, connector=connector).sync_active_accounts()
@@ -101,6 +114,7 @@ async def main() -> None:
                         allow_real_send=True,
                         typing_delay_seconds=args.typing_delay_seconds,
                     ).process_queued_batch(limit=args.outbound_limit)
+                    metrics = await latest_model_metrics(session, args.only_username)
 
                 elapsed = (datetime.now(UTC) - started).total_seconds()
                 print(
@@ -110,14 +124,18 @@ async def main() -> None:
                     f"recovery={recovery_result} "
                     f"outbound=s:{outbound_result.sent},res:{outbound_result.rescheduled},f:{outbound_result.failed}"
                 )
-            except CRMChatAPIError as exc:
-                print(f"[{cycle}] crmchat_error={exc}")
-            except Exception as exc:
-                print(f"[{cycle}] autopilot_error={type(exc).__name__}: {exc}")
+                if metrics:
+                    print(f"[{cycle}] model_metrics {metrics}")
+        except CRMChatAPIError as exc:
+            sleep_seconds = max(args.poll_interval_seconds, args.error_backoff_seconds)
+            print(f"[{cycle}] crmchat_error={exc}; retry_in={sleep_seconds}s")
+        except Exception as exc:
+            sleep_seconds = max(args.poll_interval_seconds, args.error_backoff_seconds)
+            print(f"[{cycle}] autopilot_error={type(exc).__name__}: {exc}; retry_in={sleep_seconds}s")
 
-            if args.stop_after_cycles is not None and cycle >= args.stop_after_cycles:
-                return
-            await asyncio.sleep(args.poll_interval_seconds)
+        if args.stop_after_cycles is not None and cycle >= args.stop_after_cycles:
+            return
+        await asyncio.sleep(sleep_seconds)
 
 
 async def set_fast_pacing(session, seconds: int) -> None:
@@ -131,5 +149,58 @@ async def set_fast_pacing(session, seconds: int) -> None:
     await session.commit()
 
 
+async def latest_model_metrics(session, username: str | None) -> str:
+    query = select(LeadFunnelRuntime).order_by(LeadFunnelRuntime.updated_at.desc()).limit(1)
+    if username:
+        normalized = username.strip().lower().lstrip("@")
+        dialog_result = await session.execute(
+            select(Dialog.id)
+            .where(
+                func.lower(func.replace(Dialog.telegram_username, "@", "")) == normalized,
+                Dialog.crmchat_dialog_id.like("telegram:%"),
+            )
+            .order_by(Dialog.updated_at.desc())
+            .limit(1)
+        )
+        dialog_id = dialog_result.scalar_one_or_none()
+        if dialog_id is None:
+            return ""
+        query = (
+            select(LeadFunnelRuntime)
+            .where(LeadFunnelRuntime.dialog_id == dialog_id)
+            .order_by(LeadFunnelRuntime.updated_at.desc())
+            .limit(1)
+        )
+    runtime = (await session.execute(query)).scalar_one_or_none()
+    if runtime is None:
+        return ""
+    metadata = runtime.metadata_json or {}
+    semantic = metadata.get("semantic_metrics") or {}
+    reply = metadata.get("reply_metrics") or {}
+    parts = [
+        f"profile={metadata.get('model_test_profile') or semantic.get('profile') or reply.get('profile') or 'unknown'}",
+        f"stage={runtime.stage}",
+    ]
+    if semantic:
+        parts.append(
+            "semantic="
+            f"{semantic.get('component') or 'none'}/{semantic.get('model') or 'rules'}"
+            f"/{semantic.get('latency_ms')}ms"
+            f"/fast={semantic.get('fast_path')}"
+        )
+    if reply:
+        parts.append(
+            "reply="
+            f"{reply.get('component') or 'none'}/{reply.get('model') or 'rules'}"
+            f"/{reply.get('latency_ms')}ms"
+            f"/fast={reply.get('fast_path')}"
+        )
+    if metadata.get("graph_total_latency_ms") is not None:
+        parts.append(f"graph={metadata.get('graph_total_latency_ms')}ms")
+    return " ".join(parts)
+
+
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())

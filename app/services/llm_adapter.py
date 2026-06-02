@@ -338,9 +338,19 @@ def build_llm_metadata(
     }
 
 
+LEGACY_LEAD_DECISION_PROMPT = """You are the legacy HR lead decision assistant.
+
+Return only a structured decision as JSON. Use the provided dialog messages and lead context to choose whether to reply, wait, stop, or hand off. Keep replies short and do not invent missing facts.
+"""
+
+
 def load_prompt_template(name: str = "lead_decision") -> str:
     if name == "lead_decision":
         path = Path(__file__).resolve().parents[1] / "prompts" / "lead_decision.md"
     else:
         path = Path(__file__).resolve().parents[1] / "prompts" / "brain" / f"{name}.md"
+    if path.exists():
+        return path.read_text(encoding="utf-8")
+    if name == "lead_decision":
+        return LEGACY_LEAD_DECISION_PROMPT
     return path.read_text(encoding="utf-8")

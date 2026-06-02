@@ -42,7 +42,7 @@ Use `idempotency_key` for every scripted send that can be retried or replayed.
 
 Do not add new funnel logic to:
 
-- `scripts/run_controlled_funnel.py`
+- `archive/legacy_funnel_20260528/scripts/run_controlled_funnel.py`
 - `app/services/brain_v2/*`
 - `app/services/campaign_sequence.py`
 

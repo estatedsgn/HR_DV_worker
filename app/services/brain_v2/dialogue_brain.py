@@ -101,11 +101,11 @@ def local_dialogue_decision(
             interpretation="Candidate asked a legal/risky question.",
             slot_patch=router_result.slot_patch,
             dialogue_decision={"dialogue_move": "handoff_to_human"},
-            response="Хороший вопрос, не хочу ответить неточно. Передам его менеджеру, чтобы тебе объяснили корректно.",
+            response="Хороший вопрос, не хочу ответить неточно. Зафиксирую его отдельно, а сейчас лучше не буду придумывать ответ наугад.",
             state_patch=StatePatch(stage="handoff", current_goal="Legal question requires human"),
             executor_action=ExecutorAction(
                 type="handoff",
-                text="Хороший вопрос, не хочу ответить неточно. Передам его менеджеру, чтобы тебе объяснили корректно.",
+                text="Хороший вопрос, не хочу ответить неточно. Зафиксирую его отдельно, а сейчас лучше не буду придумывать ответ наугад.",
                 handoff_reason="legal_question",
             ),
             confidence=0.95,

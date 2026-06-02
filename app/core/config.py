@@ -31,7 +31,7 @@ class Settings(BaseSettings):
         default=None, alias="CRMCHAT_DEFAULT_TELEGRAM_ACCOUNT_ID"
     )
     crmchat_timeout_seconds: float = Field(
-        default=10.0, alias="CRMCHAT_TIMEOUT_SECONDS"
+        default=60.0, alias="CRMCHAT_TIMEOUT_SECONDS"
     )
     telegram_poll_interval_seconds: int = Field(
         default=60, alias="TELEGRAM_POLL_INTERVAL_SECONDS"
@@ -58,6 +58,12 @@ class Settings(BaseSettings):
     llm_temperature: float = Field(default=0.4, alias="LLM_TEMPERATURE")
     llm_prompt_name: str = Field(default="brain_main", alias="LLM_PROMPT_NAME")
     llm_prompt_version: str = Field(default="v1", alias="LLM_PROMPT_VERSION")
+    model_test_profile: str = Field(
+        default="plus_max_router", alias="MODEL_TEST_PROFILE"
+    )
+    qwen_max_model: str = Field(default="qwen3.7-max", alias="QWEN_MAX_MODEL")
+    qwen_plus_model: str = Field(default="qwen-plus", alias="QWEN_PLUS_MODEL")
+    qwen_flash_model: str = Field(default="qwen-flash", alias="QWEN_FLASH_MODEL")
     llm_mock_decision_json: str = Field(
         default='{"decision":"reply","lead_status":"interested","reply_text":"Спасибо, передам детали менеджеру.","handoff_reason":null,"confidence":0.7}',
         alias="LLM_MOCK_DECISION_JSON",
@@ -66,7 +72,7 @@ class Settings(BaseSettings):
         default=0, alias="BRAIN_MIN_INBOUND_BEFORE_HANDOFF"
     )
     brain_inbound_debounce_seconds: int = Field(
-        default=10, alias="BRAIN_INBOUND_DEBOUNCE_SECONDS"
+        default=3, alias="BRAIN_INBOUND_DEBOUNCE_SECONDS"
     )
     brain_cancel_outbound_on_inbound: bool = Field(
         default=True, alias="BRAIN_CANCEL_OUTBOUND_ON_INBOUND"
@@ -99,6 +105,14 @@ class Settings(BaseSettings):
         default=None, alias="BRAIN_DIALOGUE_PROVIDER"
     )
     brain_dialogue_model: str | None = Field(default=None, alias="BRAIN_DIALOGUE_MODEL")
+    brain_semantic_provider: str | None = Field(default=None, alias="BRAIN_SEMANTIC_PROVIDER")
+    brain_semantic_model: str | None = Field(default=None, alias="BRAIN_SEMANTIC_MODEL")
+    brain_complex_semantic_provider: str | None = Field(default=None, alias="BRAIN_COMPLEX_SEMANTIC_PROVIDER")
+    brain_complex_semantic_model: str | None = Field(default=None, alias="BRAIN_COMPLEX_SEMANTIC_MODEL")
+    brain_reply_provider: str | None = Field(default=None, alias="BRAIN_REPLY_PROVIDER")
+    brain_reply_model: str | None = Field(default=None, alias="BRAIN_REPLY_MODEL")
+    brain_complex_reply_provider: str | None = Field(default=None, alias="BRAIN_COMPLEX_REPLY_PROVIDER")
+    brain_complex_reply_model: str | None = Field(default=None, alias="BRAIN_COMPLEX_REPLY_MODEL")
     brain_validator_provider: str | None = Field(
         default=None, alias="BRAIN_VALIDATOR_PROVIDER"
     )
@@ -126,10 +140,13 @@ class Settings(BaseSettings):
         default=True, alias="OUTBOUND_MARK_READ_ON_SEND"
     )
     outbound_typing_delay_seconds: float = Field(
-        default=0.0, alias="OUTBOUND_TYPING_DELAY_SECONDS"
+        default=10.0, alias="OUTBOUND_TYPING_DELAY_SECONDS"
+    )
+    outbound_typing_min_delay_seconds: float = Field(
+        default=5.0, alias="OUTBOUND_TYPING_MIN_DELAY_SECONDS"
     )
     outbound_voice_recording_delay_seconds: float = Field(
-        default=50.0, alias="OUTBOUND_VOICE_RECORDING_DELAY_SECONDS"
+        default=40.0, alias="OUTBOUND_VOICE_RECORDING_DELAY_SECONDS"
     )
 
 

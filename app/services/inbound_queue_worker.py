@@ -142,6 +142,17 @@ class InboundQueueWorker:
                     self.session,
                     debounce_seconds=settings.brain_inbound_debounce_seconds,
                 )
+                if dialog is not None and is_restart_command(payload.get("text")):
+                    gateway_cls = LangGraphFunnelGateway
+                    if gateway_cls is None:
+                        from app.services.funnel_graph.gateway import LangGraphFunnelGateway as gateway_cls
+
+                    await gateway_cls(self.session, settings=settings).restart_for_dialog(
+                        dialog_id=str(dialog_id),
+                        triggering_message_id=payload.get("db_message_id"),
+                        current_event_id=str(event.id),
+                    )
+                    return
                 if dialog is not None and is_candidate_typing_event(payload):
                     await turn_buffer.record_typing_activity(dialog=dialog, runtime=runtime, payload=payload)
                     return
@@ -186,3 +197,8 @@ class InboundQueueWorker:
             select(LeadFunnelRuntime).where(LeadFunnelRuntime.lead_id == lead.id).limit(1)
         )
         return result.scalar_one_or_none()
+
+
+def is_restart_command(text: object) -> bool:
+    normalized = str(text or "").strip().lower()
+    return normalized in {"restart", "/restart"}

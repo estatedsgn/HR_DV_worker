@@ -115,6 +115,29 @@ def test_normalize_username() -> None:
     assert normalize_username("@IamNekiy") == "@iamnekiy"
 
 
+def test_text_typing_delay_is_random_between_min_and_max(monkeypatch) -> None:
+    calls = []
+
+    def fake_uniform(low, high):
+        calls.append((low, high))
+        return 7.5
+
+    monkeypatch.setattr("app.services.outbound_queue_worker.random.uniform", fake_uniform)
+    worker = OutboundQueueWorker(
+        FakeSession(make_account()),
+        connector=FakeConnector(),
+        settings=Settings(
+            OUTBOUND_ALLOWED_USERNAMES="@iamnekiy",
+            OUTBOUND_TYPING_MIN_DELAY_SECONDS=5,
+        ),
+        allow_real_send=True,
+        typing_delay_seconds=10,
+    )
+
+    assert worker._text_typing_delay_seconds() == 7.5
+    assert calls == [(5.0, 10.0)]
+
+
 def test_send_guard_blocks_non_allowlisted_username() -> None:
     worker = OutboundQueueWorker(
         FakeSession(make_account()),
@@ -164,11 +187,16 @@ def test_worker_sends_allowlisted_job_and_updates_message() -> None:
         max_attempts=3,
     )
     session = FakeSession(account, message)
+    connector = FakeConnector()
     worker = OutboundQueueWorker(
         session,
-        connector=FakeConnector(),
-        settings=Settings(OUTBOUND_ALLOWED_USERNAMES="@iamnekiy"),
+        connector=connector,
+        settings=Settings(
+            OUTBOUND_ALLOWED_USERNAMES="@iamnekiy",
+            OUTBOUND_TYPING_MIN_DELAY_SECONDS=0,
+        ),
         allow_real_send=True,
+        typing_delay_seconds=0.001,
     )
     worker.repository = FakeOutboundRepository([job])
 
@@ -177,6 +205,7 @@ def test_worker_sends_allowlisted_job_and_updates_message() -> None:
     assert result.sent == 1
     assert job.status == "sent"
     assert message.status == "sent"
+    assert connector.typing_actions == ["sendMessageTypingAction"]
     assert account.next_available_at is not None
     assert session.committed is True
 

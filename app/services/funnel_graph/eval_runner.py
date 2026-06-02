@@ -82,6 +82,8 @@ class FunnelEvalConfig:
     candidate_llm: bool = True
     require_agent_llm: bool = False
     require_candidate_llm: bool = False
+    candidate_llm_provider: str | None = None
+    candidate_llm_model: str | None = None
     llm_preflight: bool = True
     llm_timeout_seconds: float | None = None
     llm_max_retries: int | None = None
@@ -89,6 +91,8 @@ class FunnelEvalConfig:
     quality_evaluator: bool = False
     quality_evaluator_llm: bool = True
     require_quality_evaluator_llm: bool = False
+    quality_evaluator_provider: str | None = None
+    quality_evaluator_model: str | None = None
 
 
 class CandidateSimulator:
@@ -151,6 +155,34 @@ class CandidateSimulator:
         )
 
 
+def settings_with_component_override(
+    settings: Settings,
+    *,
+    component: str,
+    provider: str | None = None,
+    model: str | None = None,
+) -> Settings:
+    provider = str(provider or "").strip() or None
+    model = str(model or "").strip() or None
+    if provider is None and model is None:
+        return settings
+
+    field_by_component = {
+        "dialogue_brain": ("brain_dialogue_provider", "brain_dialogue_model"),
+        "validator": ("brain_validator_provider", "brain_validator_model"),
+    }
+    fields = field_by_component.get(component)
+    if fields is None:
+        return settings
+    provider_field, model_field = fields
+    updates: dict[str, str] = {}
+    if provider is not None:
+        updates[provider_field] = provider
+    if model is not None:
+        updates[model_field] = model
+    return settings.model_copy(update=updates)
+
+
 class FunnelEvalRunner:
     def __init__(
         self,
@@ -165,14 +197,26 @@ class FunnelEvalRunner:
             self.settings.brain_llm_timeout_seconds = config.llm_timeout_seconds
         if config.llm_max_retries is not None:
             self.settings.brain_llm_max_retries = config.llm_max_retries
+        self.candidate_settings = settings_with_component_override(
+            self.settings,
+            component="dialogue_brain",
+            provider=config.candidate_llm_provider,
+            model=config.candidate_llm_model,
+        )
+        self.quality_evaluator_settings = settings_with_component_override(
+            self.settings,
+            component="validator",
+            provider=config.quality_evaluator_provider,
+            model=config.quality_evaluator_model,
+        )
         self.candidate_simulator = candidate_simulator or CandidateSimulator(
-            settings=self.settings,
+            settings=self.candidate_settings,
             use_llm=config.candidate_llm,
             require_llm=config.require_candidate_llm,
         )
         self.quality_evaluator = (
             DialogueQualityEvaluator(
-                settings=self.settings,
+                settings=self.quality_evaluator_settings,
                 use_llm=config.quality_evaluator_llm,
                 require_llm=config.require_quality_evaluator_llm,
             )
@@ -206,8 +250,12 @@ class FunnelEvalRunner:
                 "max_turns": self.config.max_turns,
                 "agent_llm": self.config.agent_llm,
                 "candidate_llm": self.config.candidate_llm,
+                "candidate_llm_provider": self.config.candidate_llm_provider,
+                "candidate_llm_model": self.config.candidate_llm_model,
                 "quality_evaluator": self.config.quality_evaluator,
                 "quality_evaluator_llm": self.config.quality_evaluator_llm,
+                "quality_evaluator_provider": self.config.quality_evaluator_provider,
+                "quality_evaluator_model": self.config.quality_evaluator_model,
                 "templates_path": str(self.config.templates_path) if self.config.templates_path else None,
             },
             "summary": build_eval_summary(runs),
@@ -232,28 +280,43 @@ class FunnelEvalRunner:
     async def preflight_llm_if_required(self) -> None:
         if not self.config.llm_preflight:
             return
-        if not (
-            (self.config.agent_llm and self.config.require_agent_llm)
-            or (self.config.candidate_llm and self.config.require_candidate_llm)
+        checks: list[tuple[str, Settings, str]] = []
+        if self.config.agent_llm and self.config.require_agent_llm:
+            checks.append(("agent", self.settings, "dialogue_brain"))
+        if self.config.candidate_llm and self.config.require_candidate_llm:
+            checks.append(("candidate", self.candidate_settings, "dialogue_brain"))
+        if (
+            self.config.quality_evaluator
+            and self.config.quality_evaluator_llm
+            and self.config.require_quality_evaluator_llm
         ):
-            return
-        adapter = BrainLLMAdapter(settings=self.settings)
-        llm_config = adapter.config_for("dialogue_brain", LLMPreflightReply)
-        if not adapter.has_api_key("dialogue_brain"):
-            raise BrainLLMError(f"LLM preflight failed: missing API key for provider {llm_config.provider}")
-        try:
-            await adapter.complete_json(
-                component="dialogue_brain",
-                system_prompt='Return exactly JSON matching the schema: {"ok": true}.',
-                user_payload={"ping": "ok"},
-                response_model=LLMPreflightReply,
-            )
-        except Exception as exc:
-            raise BrainLLMError(
-                "LLM preflight failed for "
-                f"provider={llm_config.provider} model={llm_config.model} "
-                f"timeout={llm_config.timeout_seconds}s retries={llm_config.retry_policy.max_retries}: {exc}"
-            ) from exc
+            checks.append(("quality_evaluator", self.quality_evaluator_settings, "validator"))
+
+        seen: set[tuple[str, str, str]] = set()
+        for label, settings, component in checks:
+            adapter = BrainLLMAdapter(settings=settings)
+            llm_config = adapter.config_for(component, LLMPreflightReply)
+            fingerprint = (component, llm_config.provider, llm_config.model)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            if not adapter.has_api_key(component):
+                raise BrainLLMError(
+                    f"LLM preflight failed for {label}: missing API key for provider {llm_config.provider}"
+                )
+            try:
+                await adapter.complete_json(
+                    component=component,
+                    system_prompt='Return exactly JSON matching the schema: {"ok": true}.',
+                    user_payload={"ping": "ok"},
+                    response_model=LLMPreflightReply,
+                )
+            except Exception as exc:
+                raise BrainLLMError(
+                    "LLM preflight failed for "
+                    f"{label} provider={llm_config.provider} model={llm_config.model} "
+                    f"timeout={llm_config.timeout_seconds}s retries={llm_config.retry_policy.max_retries}: {exc}"
+                ) from exc
 
     async def run_one(self, *, template: EvalTemplate, run_index: int) -> dict[str, Any]:
         candidate_id = f"eval_{run_index:03d}_{slug(template.name)}"

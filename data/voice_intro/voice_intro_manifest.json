@@ -15,7 +15,7 @@
         "dialogue_chunk.nastya_001_first_touch_interest"
       ],
       "caption": "",
-      "recording_delay_seconds": 6
+      "recording_delay_seconds": 40
     },
     {
       "order": 2,
@@ -29,7 +29,7 @@
         "mentor.stream_activities_hobbies_conversation"
       ],
       "caption": "",
-      "recording_delay_seconds": 7
+      "recording_delay_seconds": 40
     },
     {
       "order": 3,
@@ -43,7 +43,7 @@
         "qualification.foreign_audience_english_moderator"
       ],
       "caption": "",
-      "recording_delay_seconds": 8
+      "recording_delay_seconds": 40
     },
     {
       "order": 4,
@@ -57,7 +57,7 @@
         "schedule.offer_available_time_window"
       ],
       "caption": "",
-      "recording_delay_seconds": 8
+      "recording_delay_seconds": 40
     }
   ]
 }

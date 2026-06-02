@@ -97,9 +97,9 @@ class StaticFunnelKnowledgeBase:
     def template(self, template_id: str) -> str:
         return str(self.templates.get(template_id) or "")
 
-    def voice_pack(self, voice_pack_id: str) -> list[str]:
+    def voice_pack(self, voice_pack_id: str) -> list[Any]:
         raw = self.voice_packs.get(voice_pack_id) or []
-        return [str(item) for item in raw]
+        return list(raw) if isinstance(raw, list) else []
 
 
 def answerable_cards(cards):
@@ -143,7 +143,7 @@ def match_knowledge_items(
 ) -> list[dict[str, Any]]:
     if not text:
         return []
-    topic_set = {str(topic).lower() for topic in topics or [] if topic}
+    topic_set = expanded_topic_set(topics or [])
     query_tokens = set(tokenize_for_match(text))
     scored: list[tuple[float, dict[str, Any]]] = []
     for item in items:
@@ -163,6 +163,69 @@ def match_knowledge_items(
             scored.append((score, item))
     scored.sort(key=lambda pair: pair[0], reverse=True)
     return [dict(item) for _, item in scored[:limit]]
+
+
+def expanded_topic_set(topics: list[str]) -> set[str]:
+    result: set[str] = set()
+    for raw_topic in topics:
+        topic = normalize_topic_name(raw_topic)
+        if not topic:
+            continue
+        result.add(topic)
+        result.update(TOPIC_ALIASES.get(topic, ()))
+    return result
+
+
+def normalize_topic_name(value: str) -> str:
+    topic = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return TOPIC_CANONICAL.get(topic, topic)
+
+
+TOPIC_CANONICAL = {
+    "adult_platform": "nudity_onlyfans",
+    "adult_platforms": "nudity_onlyfans",
+    "adult_content": "nudity_onlyfans",
+    "nsfw": "nudity_onlyfans",
+    "sexual_content": "nudity_onlyfans",
+    "nudity": "nudity_onlyfans",
+    "onlyfans": "nudity_onlyfans",
+    "webcam": "nudity_onlyfans",
+    "webcam_adult": "nudity_onlyfans",
+    "webcam_nudity": "nudity_onlyfans",
+    "nudity_concern": "nudity_onlyfans",
+    "socials": "company_channels",
+    "company_socials": "company_channels",
+    "company_links": "company_channels",
+    "telegram_channel": "company_channels",
+    "platform": "platform_info",
+    "platforms": "platform_info",
+    "training": "training_process",
+    "internship": "training_process",
+    "trainee_days": "training_process",
+    "friend": "friend_streaming",
+    "friend_referral": "friend_streaming",
+    "joint_streaming": "friend_streaming",
+    "themes": "theme_selection",
+    "topic_selection": "theme_selection",
+    "time_zone": "timezone",
+    "timezones": "timezone",
+    "privacy": "privacy_anonymity",
+    "anonymity": "privacy_anonymity",
+    "personal_data": "documents_privacy",
+    "passport": "documents_privacy",
+    "documents": "documents_privacy",
+    "no_lock_in": "exit_policy",
+    "quit_policy": "exit_policy",
+    "work_commitment": "exit_policy",
+}
+
+
+TOPIC_ALIASES = {
+    "nudity_onlyfans": ("nudity_concern",),
+    "privacy_anonymity": ("privacy", "anonymity"),
+    "documents_privacy": ("personal_data", "passport", "documents"),
+    "exit_policy": ("no_lock_in", "quit_policy", "work_commitment"),
+}
 
 
 def tokenize_for_match(text: str) -> list[str]:

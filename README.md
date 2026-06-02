@@ -444,35 +444,13 @@ For production, remove `--only-username` only after the allowlist, account pacin
 
 Brain V2 is an additive, shadow-first decision layer. When enabled with `BRAIN_SHADOW_MODE=true`, inbound messages create `brain_runs`, telemetry, state patches, and executor actions, but do not send through CRMchat until a run is approved.
 
-Prepare the database and seed cards:
+Prepare the database:
 
 ```powershell
 .\.venv\Scripts\alembic upgrade head
-.\.venv\Scripts\python scripts\seed_knowledge_cards_v2.py
 ```
 
-Import the Profitcast JSON bundle as V2 knowledge cards:
-
-```powershell
-.\.venv\Scripts\python scripts\seed_knowledge_cards_v2.py --profitcast-dir data\profitcast
-```
-
-Import any RAG bundle that has `rag_seed_manifest_*.json`, including the Nastya dialogue bundle:
-
-```powershell
-.\.venv\Scripts\python scripts\seed_knowledge_cards_v2.py --bundle-dir data\nastya
-.\.venv\Scripts\python scripts\seed_knowledge_cards_v2.py --bundle-dir data\rina
-.\.venv\Scripts\python scripts\seed_knowledge_cards_v2.py --bundle-dir data\mentor_pavluck
-```
-
-Add `--embed` when provider keys are configured and the cards should be embedded into pgvector:
-
-```powershell
-.\.venv\Scripts\python scripts\seed_knowledge_cards_v2.py --profitcast-dir data\profitcast --embed
-.\.venv\Scripts\python scripts\seed_knowledge_cards_v2.py --bundle-dir data\nastya --embed
-.\.venv\Scripts\python scripts\seed_knowledge_cards_v2.py --bundle-dir data\rina --embed
-.\.venv\Scripts\python scripts\seed_knowledge_cards_v2.py --bundle-dir data\mentor_pavluck --embed
-```
+Legacy RAG seed bundles were removed from the active tree. The current controlled funnel uses `knowledge/*.json` plus the LangGraph semantic/reply prompts.
 
 Inbound turns are debounced before the brain replies. `BRAIN_INBOUND_DEBOUNCE_SECONDS=10` waits for a quiet window after the latest candidate message/typing activity. If another inbound message or typing event arrives before send, queued Brain V2 outbound jobs are cancelled and the next run is recomputed from the latest inbound batch.
 

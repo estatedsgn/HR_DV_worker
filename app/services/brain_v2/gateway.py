@@ -297,7 +297,7 @@ def should_create_agenda(router_result: RouterResult, state_snapshot: dict[str, 
 
 
 def force_handoff(decision: DialogueBrainDecision, validator: ValidatorResult) -> DialogueBrainDecision:
-    text = validator.approved_text or decision.response or "Передам вопрос менеджеру, чтобы тебе ответили точнее."
+    text = validator.approved_text or decision.response or "Не хочу придумывать ответ наугад. Зафиксирую вопрос отдельно."
     return decision.model_copy(
         update={
             "response": text,

@@ -12,16 +12,12 @@ The project is currently testing the "brain" layer: the decision-making componen
 
 ## Current Focus
 
-- Stabilize Brain V1 behavior before broad rollout.
+- Stabilize the current LangGraph funnel before broad rollout.
 - Keep live sending constrained to allowlisted usernames while testing.
 - Verify prompt quality, funnel transitions, fact extraction, and handoff readiness.
 - Make sure account pacing, outbound safety, and monitoring are ready before expanding beyond controlled tests.
 - Current live-test goal: make the agent hold an autonomous controlled dialog with the tester for at least 20 inbound messages before handing off.
-- Brain V2 is implemented as an additive, shadow-first layer. `lead_brain_state.stage` is the canonical V2 funnel state; legacy `Lead.funnel_state` is not the V2 source of truth.
-- Profitcast V1 sales-dialogue JSON bundle is now stored under `data/profitcast/` and feeds Brain V2 agenda/knowledge-card seeding.
-- Nastya V1 dialogue bundle is stored under `data/nastya/`; its knowledge cards and dialogue chunks feed Brain V2 RAG, and its agenda additions merge into the Brain V2 agenda.
-- Rina V1 dialogue bundle is stored under `data/rina/`; its knowledge cards feed Brain V2 RAG and its agenda additions merge into the Brain V2 agenda.
-- Mentor Pavluck V1 answers are stored under `data/mentor_pavluck/`; they are treated as verified reference knowledge cards and receive a small retrieval boost for fact/wording alignment.
+- Legacy Brain V2/RAG seed bundles were removed from the active tree. Current funnel knowledge lives in `knowledge/*.json`; new dialogue examples should be generated from transcripts through the semantic layer before being added.
 - Four initial Telegram voice notes are stored under `data/voice_intro/`; they are queued by `scripts/enqueue_voice_intro.py` and sent with `sendMessageRecordAudioAction` before raw media upload/send.
 - Candidate turns are buffered: the brain waits for a quiet window after the latest inbound or typing event, then decides from the recent history plus a batch of inbound messages since the last actually sent agent message.
 

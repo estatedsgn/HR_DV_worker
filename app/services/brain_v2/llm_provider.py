@@ -219,10 +219,16 @@ class BrainLLMAdapter:
 
 
 def component_provider(settings: Settings, component: str) -> str:
+    from app.services.funnel_graph.model_profiles import component_provider_for_profile
+
     provider_by_component = {
         "interest_classifier": settings.brain_interest_classifier_provider,
         "router": settings.brain_router_provider,
         "dialogue_brain": settings.brain_dialogue_provider,
+        "semantic_analyzer": component_provider_for_profile(settings, "semantic_analyzer"),
+        "semantic_analyzer_complex": component_provider_for_profile(settings, "semantic_analyzer_complex"),
+        "reply_orchestrator": component_provider_for_profile(settings, "reply_orchestrator"),
+        "reply_orchestrator_complex": component_provider_for_profile(settings, "reply_orchestrator_complex"),
         "validator": settings.brain_validator_provider,
         "handoff_summary": settings.brain_handoff_summary_provider,
     }
@@ -235,10 +241,16 @@ def component_provider(settings: Settings, component: str) -> str:
 
 
 def component_model(settings: Settings, component: str) -> str:
+    from app.services.funnel_graph.model_profiles import component_model_for_profile
+
     model_by_component = {
         "interest_classifier": settings.brain_interest_classifier_model,
         "router": settings.brain_router_model,
         "dialogue_brain": settings.brain_dialogue_model,
+        "semantic_analyzer": component_model_for_profile(settings, "semantic_analyzer"),
+        "semantic_analyzer_complex": component_model_for_profile(settings, "semantic_analyzer_complex"),
+        "reply_orchestrator": component_model_for_profile(settings, "reply_orchestrator"),
+        "reply_orchestrator_complex": component_model_for_profile(settings, "reply_orchestrator_complex"),
         "validator": settings.brain_validator_model,
         "handoff_summary": settings.brain_handoff_summary_model,
     }
