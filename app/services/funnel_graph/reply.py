@@ -13,6 +13,8 @@ from app.services.brain_v2.llm_provider import BrainLLMAdapter, BrainLLMError
 from app.services.funnel_graph.funnel_policy import STAGE_POLICIES, TERMINAL_STAGES, get_stage_policy, stage_requirement_met
 from app.services.funnel_graph.knowledge import PROJECT_ROOT
 from app.services.funnel_graph.model_profiles import active_model_profile, is_complex_turn
+from app.services.funnel_graph.persona import with_persona
+from app.services.funnel_graph.style_examples import select_style_examples
 from app.services.funnel_graph.semantic import (
     GENERIC_TOPICS,
     SemanticResult,
@@ -33,15 +35,15 @@ MAX_TEXT_MESSAGES = 3
 MAX_TOTAL_REPLY_SENTENCES = 3
 MAX_SENTENCES_PER_TEXT_MESSAGE = 2
 ENGLISH_LEVEL_REPLY = (
-    "Английский не обязателен, работаем с переводчиком. "
-    "Если уровень слабый, это нормально, детали объяснят до старта."
+    "английский не обязателен, работаем с переводчиком, плюс оператор подсказывает. "
+    "если уровень слабый, это норм, всё объяснят до старта"
 )
 SOFT_RETURN_REPLIES = {
-    "interest_check": "Поняла. Чтобы не грузить всем сразу: тебе в целом интересно продолжить и узнать условия?",
-    "post_equipment_questions_check": "Поняла. Чтобы не грузить всем сразу: если по условиям в целом понятно, можем двигаться дальше?",
-    "profile_theme_check": "Поняла. Чтобы не грузить всем сразу: расскажешь пару слов о себе?",
-    "equipment_phone_check": "Поняла. Чтобы не грузить всем сразу: вернемся к телефону, какая у тебя модель?",
-    "interview_offer": "Поняла. Чтобы не грузить всем сразу: в целом готова записаться на собеседование?",
+    "interest_check": "поняла) чтобы не грузить всем сразу — тебе в целом интересно продолжить и узнать условия?",
+    "post_equipment_questions_check": "поняла) чтобы не грузить всем сразу — если по условиям в целом понятно, можем двигаться дальше?",
+    "profile_theme_check": "поняла) чтобы не грузить всем сразу — расскажешь пару слов о себе?",
+    "equipment_phone_check": "поняла) чтобы не грузить всем сразу — вернёмся к телефончику, какая у тебя моделька?",
+    "interview_offer": "поняла) чтобы не грузить всем сразу — в целом готова записаться на собеседование?",
 }
 
 
@@ -118,7 +120,7 @@ class ReplyOrchestrator:
             try:
                 payload = await self.adapter.complete_json(
                     component=component,
-                    system_prompt=self.prompt_path.read_text(encoding="utf-8"),
+                    system_prompt=with_persona(self.prompt_path.read_text(encoding="utf-8")),
                     user_payload=reply_llm_payload(state, semantic),
                     response_model=ReplyResult,
                 )
@@ -178,7 +180,7 @@ class ReplyOrchestrator:
         try:
             payload = await self.adapter.complete_json(
                 component=fallback_component,
-                system_prompt=self.prompt_path.read_text(encoding="utf-8"),
+                system_prompt=with_persona(self.prompt_path.read_text(encoding="utf-8")),
                 user_payload=reply_llm_payload(state, semantic),
                 response_model=ReplyResult,
             )
@@ -212,8 +214,10 @@ def reply_fast_path_allowed(state: FunnelGraphState, semantic: SemanticResult) -
     if semantic.message_type in {"pause", "do_not_contact", "hard_refusal"} and semantic.confidence >= 0.85:
         return True
     if semantic.message_type == "unclear" and not semantic.has_unresolved_interrupt:
-        incoming = str(state.get("incoming_message") or "").strip()
-        return len(incoming.split()) <= 3
+        # Neutral acks during an interrupt-followup wait stay deterministic (we just wait).
+        # Other short/unclear turns go to the LLM so it can re-anchor naturally instead of
+        # repeating the canned stage question word-for-word.
+        return should_wait_after_neutral_ack(state, semantic)
     return False
 
 
@@ -278,6 +282,11 @@ def reply_llm_payload(state: FunnelGraphState, semantic: SemanticResult | None =
             "last_user_message": state.get("last_user_message") or metadata.get("last_user_message"),
         },
         "semantic_result": semantic.model_dump(),
+        "style_examples": select_style_examples(
+            stage,
+            [*(semantic.retrieval_topics or []), *([semantic.interrupt_topic] if semantic.interrupt_topic else [])],
+            k=3,
+        ),
         "knowledge_options": knowledge_options(state),
         "retrieval_debug": state.get("retrieved_knowledge") or {},
         "response_rules": state.get("response_rules") or {},
@@ -507,8 +516,6 @@ def guard_reply_with_policy(state: FunnelGraphState, parsed: ReplyResult) -> Rep
     current_question = str(state.get("pending_question_text") or state.get("current_question") or "")
     outgoing_text = "\n\n".join(str(message.text or "") for message in parsed.outgoing_messages if message.type == "text")
 
-    if is_generic_unclear_interrupt(semantic):
-        return deterministic_reply(state)
     if current_question and current_question in outgoing_text:
         return deterministic_reply(state)
     if contains_other_stage_question(outgoing_text, current_question, stage):
@@ -597,9 +604,9 @@ def deterministic_reply(state: FunnelGraphState) -> ReplyResult:
     if semantic.message_type == "do_not_contact":
         return ReplyResult(send_reply=False, reply_mode="no_reply", summary="do not contact", confidence=1.0)
     if semantic.message_type == "hard_refusal":
-        return text_reply(str(templates.get("lost_message") or "Поняла, не буду отвлекать. Хорошего дня!"), "hard refusal")
+        return text_reply(str(templates.get("lost_message") or "поняла, не буду отвлекать) хорошего дня"), "hard refusal")
     if semantic.message_type == "pause":
-        return text_reply("Хорошо, буду ждать.", "pause")
+        return text_reply("хорошо, буду ждать", "pause")
 
     if should_wait_after_neutral_ack(state, semantic):
         return ReplyResult(send_reply=False, reply_mode="no_reply", summary="neutral acknowledgement after answer, wait", confidence=0.9)
@@ -612,10 +619,11 @@ def deterministic_reply(state: FunnelGraphState) -> ReplyResult:
                 return text_reply(current_question, "social acknowledgement, continue current question")
             if stage == "post_equipment_questions_check":
                 return text_reply(
-                    "Поняла. Тогда уточню: остались ли у тебя ещё вопросы по условиям, оплате или формату?",
+                    "поняла) тогда уточню: остались ли у тебя ещё вопросики по условиям, оплате или формату?",
                     "natural questions followup",
                 )
-            return text_reply(join_text("Не совсем поняла, уточни, пожалуйста.", current_question), "unclear")
+            clarify = "не совсем поняла, уточни, пожалуйста"
+            return text_reply(f"{clarify}) {current_question}" if current_question else clarify, "unclear")
         if has_topic(semantic, "english_level") and (not answer or wanted_knowledge_topics(state) <= {"english_level"}):
             answer = ENGLISH_LEVEL_REPLY
         if not answer:
@@ -653,30 +661,30 @@ def natural_timeout_followup(question: str, metadata: dict[str, Any]) -> str:
 
 def question_variants(question: str) -> list[str]:
     variants_by_question = {
-        "Остались ли у тебя какие-нибудь ещё вопросы?": [
-            "Что-то ещё осталось непонятным?",
-            "Если вопросов больше нет, можем двигаться дальше.",
-            "Ещё что-то хочешь уточнить по условиям или формату?",
+        "остались ли у тебя какие-нибудь ещё вопросики?": [
+            "что-то ещё осталось непонятным?",
+            "если вопросиков больше нет, можем двигаться дальше",
+            "ещё что-то хочешь уточнить по условиям или формату?",
         ],
-        "Рассказать подробнее?": [
-            "Хочешь, расскажу подробнее?",
-            "Интересно узнать детали?",
-            "Могу рассказать подробнее, если актуально.",
+        "рассказать подробнее?": [
+            "хочешь, расскажу подробнее?",
+            "интересно узнать детали?",
+            "могу рассказать подробнее, если актуально",
         ],
-        "Какая у тебя модель телефона?": [
-            "Классно, что с оборудованием уже есть база. Для старта всё равно нужна модель телефона — какая у тебя?",
-            "Поняла про оборудование. А модель телефона какая?",
-            "Супер, это плюс. Подскажи тогда модель телефона.",
+        "какая у тебя моделька телефончика?": [
+            "классно, что с оборудованием уже есть база) для старта всё равно нужна моделька телефончика — какая у тебя?",
+            "поняла про оборудование) а моделька телефончика какая?",
+            "супер, это плюс) подскажи тогда модельку телефончика",
         ],
-        "Расскажи немного о себе: учишься/работаешь? Чем любишь заниматься в свободное время?": [
-            "Расскажешь немного о себе: учишься или работаешь, чем любишь заниматься?",
-            "А по себе подскажи, пожалуйста: учёба/работа и что нравится в свободное время?",
-            "Чтобы подобрать тематику, расскажи пару слов о себе: учишься/работаешь, чем увлекаешься?",
+        "расскажи немного о себе, учишься/работаешь? чем любишь заниматься в свободное время? помогу подобрать тематику для стримов 🐬": [
+            "расскажешь немного о себе: учишься или работаешь, чем любишь заниматься?",
+            "а по себе подскажи, пожалуйста: учёба/работа и что нравится в свободное время?",
+            "чтобы подобрать тематику, расскажи пару слов о себе: учишься/работаешь, чем увлекаешься?",
         ],
-        "Если интересна наша сфера, давай расскажу про зп и график": [
-            "Если по формату стало понятнее, рассказать про зп и график?",
-            "Могу дальше рассказать про зарплату и график, интересно?",
-            "Хочешь, перейду к зп и графику?",
+        "если интересна наша сфера, давай расскажу про зп и график 🐬": [
+            "если по формату стало понятнее, рассказать про зп и график?",
+            "могу дальше рассказать про зарплату и график, интересно?",
+            "хочешь, перейду к зп и графику?",
         ],
     }
     return variants_by_question.get(question, [question])
@@ -726,7 +734,7 @@ def should_soft_return_to_goal(state: FunnelGraphState, semantic: SemanticResult
 def soft_return_reply(stage: str) -> str:
     return SOFT_RETURN_REPLIES.get(
         stage,
-        "Поняла. Чтобы не грузить всем сразу: давай вернемся к текущему шагу, хорошо?",
+        "поняла) чтобы не грузить всем сразу — давай вернёмся к текущему шагу, хорошо?",
     )
 
 
@@ -737,10 +745,10 @@ def has_topic(semantic: SemanticResult, topic: str) -> bool:
 
 def unknown_interrupt_reply(stage: str, current_question: str) -> str:
     if stage in {"contact_collection", "interview_day_check", "interview_time_check", "interview_custom_time"}:
-        return "Не хочу придумывать ответ наугад. Давай пока зафиксируем запись, а детали можно будет спокойно разобрать дальше."
+        return "не хочу придумывать наугад) давай пока зафиксируем запись, а детали спокойно разберём дальше"
     if current_question:
-        return "Точных данных по этому пункту у меня нет. Лучше разобрать это на собеседовании, чтобы не сказать лишнего."
-    return "Точных данных по этому пункту у меня нет. Лучше уточнить это на собеседовании, чтобы не сказать лишнего."
+        return "точных данных по этому пункту у меня нет) лучше разобрать это на собеседовании, чтобы не сказать лишнего"
+    return "точных данных по этому пункту у меня нет) лучше уточнить это на собеседовании, чтобы не сказать лишнего"
 
 
 def text_reply(
@@ -798,32 +806,32 @@ def partial_followup(stage: str, state: FunnelGraphState, semantic: SemanticResu
     profile = {**dict(state.get("candidate_profile") or {}), **non_null_facts(semantic)}
     if stage == "contact_collection":
         if profile.get("phone_number") and not profile.get("candidate_name"):
-            return "Спасибо, номер получила. Напиши, пожалуйста, имя."
+            return "спасибо, номер получила) напиши, пожалуйста, имя"
         if profile.get("candidate_name") and not profile.get("phone_number"):
-            return "Спасибо. Теперь пришли, пожалуйста, номер телефона для записи."
+            return "спасибо) теперь пришли, пожалуйста, номер телефончика для записи"
         if profile.get("interview_interest"):
-            return "Супер, тогда для записи пришли, пожалуйста, имя и номер телефона."
+            return "супер) тогда для записи пришли, пожалуйста, имя и номер телефончика"
     if stage == "equipment_phone_check" and profile.get("equipment_available") and not profile.get("phone_model"):
-        return "О, круто! А чтобы мы точно всё настроили — какая у тебя модель телефона?"
+        return "о, круто! а чтобы мы точно всё настроили, какая у тебя моделька телефончика?"
     if stage == "interview_custom_time":
         if profile.get("interview_day") and not profile.get("interview_time"):
-            return "Хорошо, а по времени когда удобно?"
+            return "хорошо, а по времени когда удобно?"
         if profile.get("interview_time") and not profile.get("interview_day"):
-            return "По времени поняла. На какой день записать?"
+            return "по времени поняла) на какой день записать?"
     if stage == "interview_time_check":
         if profile.get("interview_interest"):
-            return "Супер, тогда выберем время: с 11:00 по 18:00 в какое время будет удобнее?"
-        return "На это время может не быть слота. Подскажи, пожалуйста, время с 11:00 по 18:00."
+            return "супер) тогда выберем время: с 11:00 по 18:00 по мск, в какое время будет удобнее?"
+        return "на это время может не быть слота( подскажи, пожалуйста, время с 11:00 по 18:00"
     if stage == "room_available_check":
         if profile.get("interview_interest"):
-            return "Супер, тогда быстро уточню пару моментов для записи. Получится организовать место, где во время эфира тебе никто не будет мешать?"
-        return "Поняла. А получится организовать место, где во время эфира тебе никто не будет мешать?"
+            return "супер) тогда быстро уточню пару рабочих вопросиков. получится организовать место, где во время эфира тебе никто не помешает?"
+        return "поняла) а получится организовать место, где во время эфира тебе никто не помешает?"
     if profile.get("interview_interest"):
         current_question = str(state.get("pending_question_text") or state.get("current_question") or "").strip()
         if stage == "interview_day_check" and current_question:
-            return f"Супер, тогда уточню день: {current_question}"
+            return f"супер) тогда уточню день: {current_question}"
         if current_question:
-            return f"Супер, тогда быстро уточню пару моментов для записи. {current_question}"
+            return f"супер) тогда быстро уточню пару рабочих вопросиков. {current_question}"
     return None
 
 

@@ -13,6 +13,7 @@ from app.services.brain_v2.llm_provider import BrainLLMAdapter, BrainLLMError
 from app.services.funnel_graph.funnel_policy import stage_requirement_met
 from app.services.funnel_graph.knowledge import PROJECT_ROOT
 from app.services.funnel_graph.model_profiles import active_model_profile, is_complex_turn
+from app.services.funnel_graph.persona import with_persona
 from app.services.funnel_graph.state import FunnelGraphState, latest_inbound_text
 
 
@@ -229,7 +230,7 @@ class SemanticAnalyzer:
             return None
 
     def _render_prompt(self, state: FunnelGraphState) -> str:
-        return self.prompt_path.read_text(encoding="utf-8")
+        return with_persona(self.prompt_path.read_text(encoding="utf-8"))
 
     def _user_payload(self, state: FunnelGraphState) -> dict[str, Any]:
         return {

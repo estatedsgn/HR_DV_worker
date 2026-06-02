@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -96,6 +97,24 @@ class StaticFunnelKnowledgeBase:
 
     def template(self, template_id: str) -> str:
         return str(self.templates.get(template_id) or "")
+
+    def first_touch_variants(self) -> list[str]:
+        variants = self.templates.get("first_touch_variants")
+        if isinstance(variants, list):
+            cleaned = [str(item).strip() for item in variants if str(item).strip()]
+            if cleaned:
+                return cleaned
+        single = str(self.templates.get("first_touch_message") or "").strip()
+        return [single] if single else []
+
+    def first_touch(self, candidate_id: str | None = None) -> str:
+        variants = self.first_touch_variants()
+        if not variants:
+            return ""
+        if not candidate_id:
+            return variants[0]
+        digest = hashlib.sha1(str(candidate_id).encode("utf-8")).hexdigest()
+        return variants[int(digest, 16) % len(variants)]
 
     def voice_pack(self, voice_pack_id: str) -> list[Any]:
         raw = self.voice_packs.get(voice_pack_id) or []

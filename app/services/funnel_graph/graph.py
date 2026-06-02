@@ -189,7 +189,7 @@ def _retrieve_knowledge_node(knowledge_source: Any, static_store: StaticFunnelKn
             retrieved["cards"] = card_context
 
         retrieved["knowledge_found"] = bool(faq_context or objection_context)
-        retrieved["first_touch_message"] = static_store.template("first_touch_message")
+        retrieved["first_touch_message"] = static_store.first_touch(state.get("candidate_id"))
         return {
             "faq_context": faq_context[:6],
             "objection_context": objection_context[:6],
@@ -286,7 +286,7 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
         outgoing = [{"type": "text", "text": policy.current_question, "voice_pack_id": None}] if policy.current_question else []
         send_reply = True
     elif target_stage == "lost" and not outgoing:
-        outgoing = [{"type": "text", "text": template_from_state(state, "lost_message") or "Поняла, не буду отвлекать.", "voice_pack_id": None}]
+        outgoing = [{"type": "text", "text": template_from_state(state, "lost_message") or "поняла, не буду отвлекать) хорошего дня", "voice_pack_id": None}]
     elif target_stage == "human_handoff":
         if not outgoing:
             outgoing = [{"type": "text", "text": handoff_text(profile), "voice_pack_id": None}]
@@ -586,24 +586,25 @@ def template_from_state(state: FunnelGraphState, template_id: str) -> str:
 def smalltalk_text(profile: dict[str, Any]) -> str:
     hobbies = str(profile.get("hobbies") or profile.get("profile_info") or "").lower()
     if any(marker in hobbies for marker in ("рис", "карти", "макияж", "крас")):
-        return "Классно, под такие увлечения обычно легко подобрать тему для эфиров."
+        return "классно, под такие увлечения обычно легко подобрать тему для эфиров)"
     if any(marker in hobbies for marker in ("учусь", "работ", "практик")):
-        return "Поняла, у нас как раз гибкий формат, его можно совмещать с учёбой или работой."
-    return "Поняла, спасибо, это поможет подобрать подходящую тематику."
+        return "поняла) у нас как раз гибкий график, отлично совмещается с учёбой или работой"
+    return "поняла, спасибо) это поможет подобрать подходящую тематику"
 
 
 def combine_text_and_question(text: str, question: str) -> str:
     cleaned = text.strip()
     if not cleaned:
         return question
-    separator = " " if cleaned.endswith((".", "!", "?")) else ". "
+    # Letters/digits need a sentence break; punctuation or an emoji/")" already ends the thought.
+    separator = ". " if cleaned[-1:].isalnum() else " "
     return f"{cleaned}{separator}{question}"
 
 
 def handoff_text(profile: dict[str, Any]) -> str:
     day = normalize_interview_day(profile.get("interview_day") or ("завтра" if profile.get("interview_day_confirmed") else None))
     time = profile.get("interview_time") or profile.get("custom_interview_datetime") or "удобное время"
-    return f"Записала, передам данные менеджеру. Собеседование: {day}, {time}."
+    return f"записала тебя на {day} в {time}) передам данные менеджеру, дальше с тобой свяжутся 🥰"
 
 
 def normalize_interview_day(day: Any) -> str:

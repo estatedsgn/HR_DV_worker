@@ -52,7 +52,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "interest_check": StagePolicy(
         name="interest_check",
         goal="Понять, есть ли у кандидатки интерес узнать подробности.",
-        current_question="Рассказать подробнее?",
+        current_question="рассказать подробнее?",
         required_fields=("interest_confirmed",),
         next_stage_if_completed="age_check",
         allowed_transitions=("interest_check", "age_check", "lost", "do_not_contact", "human_handoff"),
@@ -61,7 +61,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "age_check": StagePolicy(
         name="age_check",
         goal="Узнать полный возраст кандидатки.",
-        current_question="Для начала скажи, сколько тебе лет?",
+        current_question="давай для начала уточним небольшую формальность, сколько тебе лет?",
         required_fields=("age_confirmed",),
         next_stage_if_completed="work_intro_delivery",
         allowed_transitions=("age_check", "work_intro_delivery", "lost", "do_not_contact", "human_handoff"),
@@ -80,7 +80,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "salary_schedule_offer": StagePolicy(
         name="salary_schedule_offer",
         goal="Получить согласие кандидатки узнать про зарплату и график.",
-        current_question="Если интересна наша сфера, давай расскажу про зп и график",
+        current_question="если интересна наша сфера, давай расскажу про зп и график 🐬",
         required_fields=("salary_schedule_interest",),
         next_stage_if_completed="salary_schedule_delivery",
         allowed_transitions=("salary_schedule_offer", "salary_schedule_delivery", "lost", "do_not_contact", "human_handoff"),
@@ -99,7 +99,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "post_equipment_questions_check": StagePolicy(
         name="post_equipment_questions_check",
         goal="Понять, остались ли у кандидатки вопросы после вводных материалов.",
-        current_question="Остались ли у тебя какие-нибудь ещё вопросы?",
+        current_question="остались ли у тебя какие-нибудь ещё вопросики?",
         required_fields=("questions_resolved",),
         next_stage_if_completed="profile_theme_check",
         allowed_transitions=("post_equipment_questions_check", "profile_theme_check", "lost", "do_not_contact", "human_handoff"),
@@ -108,7 +108,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "profile_theme_check": StagePolicy(
         name="profile_theme_check",
         goal="Собрать базовую информацию: учёба, работа, интересы.",
-        current_question="Расскажи немного о себе: учишься/работаешь? Чем любишь заниматься в свободное время?",
+        current_question="расскажи немного о себе, учишься/работаешь? чем любишь заниматься в свободное время? помогу подобрать тематику для стримов 🐬",
         required_fields=("profile_info",),
         next_stage_if_completed="support_smalltalk",
         allowed_transitions=("profile_theme_check", "support_smalltalk", "lost", "do_not_contact", "human_handoff"),
@@ -126,7 +126,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "room_available_check": StagePolicy(
         name="room_available_check",
         goal="Уточнить, есть ли место/комната, где кандидатке никто не помешает.",
-        current_question="Есть ли у тебя комната или место, где никто не будет мешать во время стримов?",
+        current_question="есть ли у тебя комната, в которой тебе никто не помешает во время стримов?",
         required_fields=("room_available",),
         next_stage_if_completed="equipment_phone_check",
         allowed_transitions=("room_available_check", "equipment_phone_check", "lost", "do_not_contact", "human_handoff"),
@@ -135,7 +135,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "equipment_phone_check": StagePolicy(
         name="equipment_phone_check",
         goal="Уточнить модель телефона кандидатки.",
-        current_question="Какая у тебя модель телефона?",
+        current_question="какая у тебя моделька телефончика?",
         required_fields=("phone_model",),
         next_stage_if_completed="interview_offer",
         allowed_transitions=("equipment_phone_check", "interview_offer", "lost", "do_not_contact", "human_handoff"),
@@ -144,7 +144,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "interview_offer": StagePolicy(
         name="interview_offer",
         goal="Предложить записаться на собеседование.",
-        current_question="Можем записаться на собеседование?",
+        current_question="мы можем с тобой записаться на собеседование?",
         required_fields=("interview_interest",),
         next_stage_if_completed="contact_collection",
         allowed_transitions=("interview_offer", "contact_collection", "lost", "do_not_contact", "human_handoff"),
@@ -153,7 +153,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "contact_collection": StagePolicy(
         name="contact_collection",
         goal="Собрать имя и номер телефона для записи.",
-        current_question="Для записи мне нужен твой номер телефона и имя",
+        current_question="для записи мне нужно твоё имя и номер телефончика",
         required_fields=("candidate_name", "phone_number"),
         next_stage_if_completed="interview_day_check",
         allowed_transitions=("contact_collection", "interview_day_check", "lost", "do_not_contact", "human_handoff"),
@@ -162,7 +162,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "interview_day_check": StagePolicy(
         name="interview_day_check",
         goal="Уточнить, удобно ли провести собеседование завтра.",
-        current_question="Завтра будет удобно провести собеседование?",
+        current_question="завтра будет удобно провести собеседование?",
         required_fields=("interview_day_confirmed",),
         next_stage_if_completed="interview_time_check",
         allowed_transitions=("interview_day_check", "interview_time_check", "interview_custom_time", "lost", "do_not_contact", "human_handoff"),
@@ -171,7 +171,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "interview_time_check": StagePolicy(
         name="interview_time_check",
         goal="Выбрать время собеседования завтра в диапазоне 11:00-18:00.",
-        current_question="С 11:00 по 18:00 в какое время будет удобнее?",
+        current_question="с 11:00 по 18:00 по мск, в какое время будет удобнее?",
         required_fields=("interview_time",),
         next_stage_if_completed="human_handoff",
         allowed_transitions=("interview_time_check", "human_handoff", "lost", "do_not_contact"),
@@ -180,7 +180,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "interview_custom_time": StagePolicy(
         name="interview_custom_time",
         goal="Уточнить удобные дату и время, если завтра неудобно.",
-        current_question="Хорошо, когда тебе будет удобно пройти собеседование?",
+        current_question="хорошо, когда тебе будет удобно пройти собеседование?",
         required_fields=("custom_interview_datetime",),
         next_stage_if_completed="human_handoff",
         allowed_transitions=("interview_custom_time", "human_handoff", "lost", "do_not_contact"),
@@ -227,7 +227,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "try_interest_check": StagePolicy(
         name="try_interest_check",
         goal="Совместимый waiting-state старой воронки.",
-        current_question="Желаешь попробовать нашу сферу?",
+        current_question="желаешь попробовать нашу сферу?",
         required_fields=("interest_confirmed",),
         next_stage_if_completed="profile_theme_check",
         allowed_transitions=("try_interest_check", "profile_theme_check", "lost", "do_not_contact", "human_handoff"),
