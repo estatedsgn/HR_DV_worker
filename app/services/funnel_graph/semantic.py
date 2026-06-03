@@ -585,7 +585,8 @@ def deterministic_semantic(state: FunnelGraphState) -> SemanticResult:
                 facts["interview_interest"] = True
             return stage_answer(text, facts, "interest confirmed")
     elif stage == "age_check":
-        age = extract_age(normalized)
+        # Guard: "14 про макс" / "11 айфон" are phone models, not the candidate's age.
+        age = None if looks_like_phone_context(normalized) else extract_age(normalized)
         if age is not None:
             facts["age"] = age
             facts["age_confirmed"] = age >= 18
@@ -989,9 +990,26 @@ def is_objection_like(text: str, topics: list[str]) -> bool:
     return contains_any(text, ("боюсь", "стесняюсь", "не уверена", "сомневаюсь", "не понятно", "непонятно", "проблем"))
 
 
+PHONE_MODEL_AGE_FALSE_SUFFIXES = {
+    "про", "pro", "макс", "max", "плюс", "plus", "ultra", "ультра",
+    "мини", "mini", "se", "промакс", "прошка", "прошку", "айфон", "iphone",
+}
+
+
 def extract_age(text: str) -> int | None:
-    for match in re.finditer(r"\b(1[4-9]|[2-6]\d)\b", text):
-        return int(match.group(1))
+    tokens = text.split()
+    for index, token in enumerate(tokens):
+        cleaned = token.strip(".,!?:;()")
+        if not re.fullmatch(r"1[4-9]|[2-6]\d", cleaned):
+            continue
+        prev_token = tokens[index - 1].strip(".,!?:;()") if index > 0 else ""
+        next_token = tokens[index + 1].strip(".,!?:;()") if index + 1 < len(tokens) else ""
+        # Skip numbers that are part of a phone model, e.g. "14 про макс", "айфон 13", "11 pro".
+        if any(marker in prev_token for marker in PHONE_MODEL_MARKERS):
+            continue
+        if next_token in PHONE_MODEL_AGE_FALSE_SUFFIXES:
+            continue
+        return int(cleaned)
     if text in {"18+", "есть 18", "совершеннолетняя"}:
         return 18
     return None
@@ -1181,6 +1199,16 @@ PHONE_MODEL_MARKERS = (
 
 def mentions_phone_brand(text: str) -> bool:
     return contains_any(text, PHONE_MODEL_MARKERS)
+
+
+def looks_like_phone_context(text: str) -> bool:
+    """True when a number in the message belongs to a phone model, not the age."""
+    if mentions_phone_brand(text):
+        return True
+    return contains_any(
+        text,
+        ("про макс", "промакс", "pro max", "прошк", "прошка", "ultra", "ультра", "plus", "плюс", "модель", "телефон"),
+    )
 
 
 def extract_phone_model(text: str) -> str | None:

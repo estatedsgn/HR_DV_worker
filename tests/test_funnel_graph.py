@@ -101,6 +101,18 @@ def test_interest_agreement_moves_to_age_check() -> None:
     assert text_messages(state) == ["давай для начала уточним небольшую формальность, сколько тебе лет?"]
 
 
+def test_phone_model_number_at_age_check_is_not_read_as_underage() -> None:
+    state = run_graph(
+        initial_state(stage="age_check", profile={"interest_confirmed": True}),
+        "щас 14 про макс, но скоро поменяю на последний прошку",
+    )
+
+    assert state["stage"] == "age_check"
+    assert state["status"] != "closed"
+    assert state["candidate_profile"]["age"] is None
+    assert state["candidate_profile"]["qualification_status"] != "underage"
+
+
 def test_age_answer_sends_work_intro_pack_and_salary_offer() -> None:
     state = run_graph(initial_state(stage="age_check", profile={"interest_confirmed": True}), "18")
 
