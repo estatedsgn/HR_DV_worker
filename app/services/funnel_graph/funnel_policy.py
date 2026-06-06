@@ -126,7 +126,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "room_available_check": StagePolicy(
         name="room_available_check",
         goal="Уточнить, есть ли место/комната, где кандидатке никто не помешает.",
-        current_question="есть ли у тебя комната, в которой тебе никто не помешает во время стримов?",
+        current_question="скажи, у тебя есть комната, в которой тебе никто не будет мешать?",
         required_fields=("room_available",),
         next_stage_if_completed="equipment_phone_check",
         allowed_transitions=("room_available_check", "equipment_phone_check", "lost", "do_not_contact", "human_handoff"),
@@ -144,7 +144,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "interview_offer": StagePolicy(
         name="interview_offer",
         goal="Предложить записаться на собеседование.",
-        current_question="мы можем с тобой записаться на собеседование?",
+        current_question="тогда можем записаться на собеседование?",
         required_fields=("interview_interest",),
         next_stage_if_completed="contact_collection",
         allowed_transitions=("interview_offer", "contact_collection", "lost", "do_not_contact", "human_handoff"),

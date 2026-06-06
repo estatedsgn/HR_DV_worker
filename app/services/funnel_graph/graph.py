@@ -29,6 +29,15 @@ from app.services.funnel_graph.state import (
 )
 
 
+# Short acknowledgement/bridge lines sent as their own message right before the
+# next stage question, so a stage transition feels human instead of abrupt.
+TRANSITION_BRIDGES: dict[tuple[str, str], str] = {
+    ("post_equipment_questions_check", "profile_theme_check"): "давай я уточню у тебя несколько деталей, и далее мы с тобой запишемся на собеседование",
+    ("room_available_check", "equipment_phone_check"): "супер",
+    ("equipment_phone_check", "interview_offer"): "нам подходит",
+}
+
+
 def build_funnel_graph(
     *,
     knowledge: Any | None = None,
@@ -54,7 +63,7 @@ def build_funnel_graph(
     graph.add_node("retrieve_knowledge", _retrieve_knowledge_node(knowledge_source, static_store))
     graph.add_node("reply_orchestrator", _reply_orchestrator_node(replier))
     graph.add_node("state_controller", state_controller)
-    graph.add_node("action_executor", _action_executor_node(static_store))
+    graph.add_node("action_executor", _action_executor_node(static_store, replier))
     graph.add_node("save_state", save_state)
     graph.add_edge(START, "load_state")
     graph.add_edge("load_state", "semantic_analyzer")
@@ -253,6 +262,16 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
         and not semantic.has_unresolved_interrupt
         and stage_requirement_met(current_stage, profile)
     )
+    # A plain question (not an objection/refusal) at the salary/schedule offer means
+    # she is engaged: answer it and deliver the materials in the same turn instead of
+    # stalling on an explicit "yes". The voice pack's recording simulation gives the
+    # natural pause before the audio lands.
+    offer_question_voice_advance = (
+        current_stage == "salary_schedule_offer"
+        and semantic.has_unresolved_interrupt
+        and semantic.interrupt_type == "question"
+        and semantic.message_type not in {"do_not_contact", "hard_refusal", "objection"}
+    )
 
     if semantic.message_type == "do_not_contact":
         target_stage = "do_not_contact"
@@ -271,6 +290,10 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
             target_stage = next_stage_if_requirement_met(current_stage, profile)
         else:
             target_stage = current_stage
+
+    if offer_question_voice_advance and not handoff_required:
+        profile["salary_schedule_interest"] = True
+        target_stage = next_stage_if_requirement_met(current_stage, profile)
 
     if target_stage != current_stage and not semantic.has_unresolved_interrupt:
         target_stage = advance_through_completed_waiting_stages(target_stage, profile)
@@ -291,12 +314,18 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
         if not outgoing:
             outgoing = [{"type": "text", "text": handoff_text(profile), "voice_pack_id": None}]
     elif get_stage_policy(target_stage).stage_type == "action":
-        # Action executor owns voice/template/smalltalk sends.
-        outgoing = []
+        # Action executor owns voice/template/smalltalk sends. Keep the interrupt
+        # answer when we advance the offer off a question, so she gets the reply
+        # first and the voices follow in the same turn.
+        if not offer_question_voice_advance:
+            outgoing = []
         send_reply = True
     elif target_stage != current_stage:
         if completed_by_fields:
             outgoing = []
+        bridge = TRANSITION_BRIDGES.get((current_stage, target_stage))
+        if bridge and not outgoing_contains(outgoing, bridge):
+            outgoing.append({"type": "text", "text": bridge, "voice_pack_id": None})
         next_question = get_stage_policy(target_stage).current_question
         if next_question and not outgoing_contains(outgoing, next_question):
             outgoing.append({"type": "text", "text": next_question, "voice_pack_id": None})
@@ -308,7 +337,7 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
         metadata["controller_invalid_transition"] = invalid_reason
     metadata["previous_state"] = current_stage if target_stage != current_stage else state.get("previous_state")
     metadata["last_user_message"] = state.get("last_user_message")
-    if semantic.has_unresolved_interrupt:
+    if semantic.has_unresolved_interrupt and not offer_question_voice_advance:
         metadata["last_interrupt_type"] = semantic.interrupt_type
         metadata["last_interrupt_topic"] = semantic.interrupt_topic
         metadata["resume_state"] = current_stage
@@ -318,7 +347,7 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
             metadata["interrupt_followup_stage"] = current_stage
             metadata["interrupt_followup_question"] = policy.current_question
             metadata["interrupt_followup_started_at"] = datetime.now(UTC).isoformat()
-            metadata["interrupt_followup_timeout_seconds"] = 60
+            metadata["interrupt_followup_timeout_seconds"] = 120
     elif target_stage != current_stage:
         metadata["last_interrupt_type"] = None
         metadata["last_interrupt_topic"] = None
@@ -433,7 +462,7 @@ def clear_interrupt_streak(metadata: dict[str, Any]) -> None:
     metadata.pop("interrupt_streak_count", None)
 
 
-def _action_executor_node(knowledge: StaticFunnelKnowledgeBase):
+def _action_executor_node(knowledge: StaticFunnelKnowledgeBase, replier: ReplyOrchestrator | None = None):
     async def action_executor(state: FunnelGraphState) -> FunnelGraphState:
         stage = str(state.get("stage") or "interest_check")
         policy = get_stage_policy(stage)
@@ -443,9 +472,11 @@ def _action_executor_node(knowledge: StaticFunnelKnowledgeBase):
         profile = normalize_candidate_profile(state.get("candidate_profile"))
 
         if policy.stage_type == "action":
-            action_stage = stage
             if stage == "support_smalltalk":
-                outgoing.append({"type": "text", "text": smalltalk_text(profile), "voice_pack_id": None})
+                reaction = None
+                if replier is not None:
+                    reaction = await replier.generate_smalltalk_reaction(state)
+                outgoing.append({"type": "text", "text": reaction or smalltalk_text(profile), "voice_pack_id": None})
                 profile["smalltalk_done"] = True
             if policy.voice_pack_id and policy.voice_pack_id not in sent_voice_packs:
                 outgoing.append({"type": "voice_pack", "text": None, "voice_pack_id": policy.voice_pack_id})
@@ -463,10 +494,9 @@ def _action_executor_node(knowledge: StaticFunnelKnowledgeBase):
             next_stage = ACTION_STAGE_TO_WAITING_STAGE[stage]
             next_question = get_stage_policy(next_stage).current_question
             if next_question:
-                if action_stage == "support_smalltalk" and outgoing and outgoing[-1].get("type") == "text":
-                    outgoing[-1]["text"] = combine_text_and_question(str(outgoing[-1].get("text") or ""), next_question)
-                else:
-                    outgoing.append({"type": "text", "text": next_question, "voice_pack_id": None})
+                # Always keep the live reaction and the next stage question as
+                # separate messages so the bot reads like a human texting.
+                outgoing.append({"type": "text", "text": next_question, "voice_pack_id": None})
             stage = next_stage
 
         pending_actions = pending_actions_from_outgoing(state, outgoing)
@@ -587,18 +617,25 @@ def smalltalk_text(profile: dict[str, Any]) -> str:
     hobbies = str(profile.get("hobbies") or profile.get("profile_info") or "").lower()
     if any(marker in hobbies for marker in ("рис", "карти", "макияж", "крас")):
         return "классно, под такие увлечения обычно легко подобрать тему для эфиров)"
-    if any(marker in hobbies for marker in ("учусь", "работ", "практик")):
+    if any(marker in hobbies for marker in ("тикток", "tiktok", "видео", "блог", "ютуб", "youtube", "реелс", "reels")):
+        return "о, это прям в тему) короткие форматы сейчас на хайпе, под такое легко подобрать стиль эфиров"
+    if any(marker in hobbies for marker in ("игр", "гейм", "game", "комп")):
+        return "круто, по играм как раз заходят живые эфиры с общением)"
+    if any(marker in hobbies for marker in ("музык", "пою", "пение", "гитар", "танц")):
+        return "вау, творческим ребятам у нас обычно особенно заходит)"
+    if any(marker in hobbies for marker in ("спорт", "трен", "фитнес", "бег", "йог")):
+        return "класс, энергия и движ — это прям то, что хорошо смотрится в эфирах)"
+    if any(marker in hobbies for marker in ("учусь", "работ", "практик", "студент", "учеб")):
         return "поняла) у нас как раз гибкий график, отлично совмещается с учёбой или работой"
-    return "поняла, спасибо) это поможет подобрать подходящую тематику"
-
-
-def combine_text_and_question(text: str, question: str) -> str:
-    cleaned = text.strip()
-    if not cleaned:
-        return question
-    # Letters/digits need a sentence break; punctuation or an emoji/")" already ends the thought.
-    separator = ". " if cleaned[-1:].isalnum() else " "
-    return f"{cleaned}{separator}{question}"
+    if any(marker in hobbies for marker in ("ничего", "ничем", "не знаю", "не интерес", "скучн")):
+        return "это нормально, многие так начинают) как раз вместе и подберём, что тебе зайдёт"
+    variants = (
+        "о, здорово, что поделилась) это поможет подобрать тему по тебе",
+        "поняла тебя) подберём формат, который реально твой",
+        "класс, спасибо, что рассказала) уже примерно вижу, что тебе может зайти",
+    )
+    key = str(profile.get("profile_info") or profile.get("hobbies") or "")
+    return variants[int(hashlib.sha1(key.encode("utf-8")).hexdigest(), 16) % len(variants)]
 
 
 def handoff_text(profile: dict[str, Any]) -> str:

@@ -79,8 +79,8 @@ def test_interest_question_is_interrupt_and_repeats_current_question() -> None:
     assert state["metadata"]["interrupt_followup_question"] == "рассказать подробнее?"
     delayed = delayed_followup_actions(state)
     assert len(delayed) == 1
-    assert delayed[0]["delay_seconds"] == 60
-    assert delayed[0]["text"] == "хочешь, расскажу подробнее?"
+    assert delayed[0]["delay_seconds"] == 120
+    assert delayed[0]["text"] == "рассказать?"
 
 
 def test_interest_job_question_does_not_move_to_age() -> None:
@@ -205,6 +205,35 @@ def test_salary_agreement_sends_salary_pack_and_asks_any_questions() -> None:
     assert text_messages(state) == ["остались ли у тебя какие-нибудь ещё вопросики?"]
 
 
+def test_salary_offer_question_answers_then_sends_pack_same_turn() -> None:
+    state = run_graph(
+        initial_state(stage="salary_schedule_offer", profile={"interest_confirmed": True, "age_confirmed": True}),
+        "а сколько по деньгам платят?",
+    )
+
+    assert state["stage"] == "post_equipment_questions_check"
+    assert state["candidate_profile"]["salary_schedule_interest"] is True
+    assert voice_packs(state) == ["salary_schedule"]
+    messages = text_messages(state)
+    # The interrupt answer comes first, then the next stage question after the voices.
+    assert len(messages) >= 2
+    assert messages[-1] == "остались ли у тебя какие-нибудь ещё вопросики?"
+    # We moved on instead of stalling on a re-ask of the offer.
+    assert not state["metadata"].get("awaiting_interrupt_followup")
+    assert delayed_followup_actions(state) == []
+
+
+def test_salary_offer_objection_does_not_auto_send_pack() -> None:
+    state = run_graph(
+        initial_state(stage="salary_schedule_offer", profile={"interest_confirmed": True, "age_confirmed": True}),
+        "честно, звучит как развод какой-то",
+    )
+
+    assert state["stage"] == "salary_schedule_offer"
+    assert state["candidate_profile"]["salary_schedule_interest"] is None
+    assert voice_packs(state) == []
+
+
 def test_action_stage_sends_voice_even_when_llm_reply_send_is_false() -> None:
     state = run_graph(
         initial_state(stage="salary_schedule_offer", profile={"interest_confirmed": True, "age_confirmed": True}),
@@ -313,7 +342,7 @@ def test_phone_model_moves_to_interview_offer() -> None:
 
     assert state["stage"] == "interview_offer"
     assert state["candidate_profile"]["phone_model"] == "Samsung S25 Ultra"
-    assert text_messages(state) == ["мы можем с тобой записаться на собеседование?"]
+    assert text_messages(state) == ["нам подходит", "тогда можем записаться на собеседование?"]
 
 
 def test_interview_offer_accepts_go_zapishimsya_and_asks_contact() -> None:
@@ -330,7 +359,8 @@ def test_no_questions_moves_to_profile_context() -> None:
     assert state["stage"] == "profile_theme_check"
     assert state["candidate_profile"]["questions_resolved"] is True
     assert text_messages(state) == [
-        "расскажи немного о себе, учишься/работаешь? чем любишь заниматься в свободное время? помогу подобрать тематику для стримов 🐬"
+        "давай я уточню у тебя несколько деталей, и далее мы с тобой запишемся на собеседование",
+        "расскажи немного о себе, учишься/работаешь? чем любишь заниматься в свободное время? помогу подобрать тематику для стримов 🐬",
     ]
 
 
@@ -352,7 +382,8 @@ def test_booking_intent_after_materials_moves_to_next_required_question() -> Non
     assert state["candidate_profile"]["questions_resolved"] is True
     assert state["candidate_profile"]["interview_interest"] is True
     assert text_messages(state) == [
-        "расскажи немного о себе, учишься/работаешь? чем любишь заниматься в свободное время? помогу подобрать тематику для стримов 🐬"
+        "давай я уточню у тебя несколько деталей, и далее мы с тобой запишемся на собеседование",
+        "расскажи немного о себе, учишься/работаешь? чем любишь заниматься в свободное время? помогу подобрать тематику для стримов 🐬",
     ]
 
 
@@ -366,7 +397,7 @@ def test_no_questions_and_sobes_booking_skips_completed_profile_question() -> No
     assert state["candidate_profile"]["questions_resolved"] is True
     assert state["candidate_profile"]["interview_interest"] is True
     assert "учишься/работаешь" not in state["reply_text"]
-    assert "есть ли у тебя комната" in state["reply_text"]
+    assert "у тебя есть комната" in state["reply_text"]
 
 
 def test_neutral_ack_after_faq_waits_without_reply() -> None:
@@ -486,7 +517,11 @@ def test_friend_and_platform_batch_is_question_not_objection() -> None:
 
     state = run_graph(state)
 
-    assert state["stage"] == "salary_schedule_offer"
+    # A question at the offer is engagement: answer it, then deliver the materials
+    # and move on in the same turn instead of stalling on the offer.
+    assert state["stage"] == "post_equipment_questions_check"
+    assert state["candidate_profile"]["salary_schedule_interest"] is True
+    assert voice_packs(state) == ["salary_schedule"]
     assert state["semantic_result"]["message_type"] == "interrupt_question"
     assert state["semantic_result"]["interrupt_type"] == "question"
     assert {"friend_streaming", "platform_info"} <= set(state["semantic_result"]["retrieval_topics"])
@@ -849,8 +884,8 @@ def test_profile_extracts_not_working_without_marking_as_working() -> None:
     assert state["stage"] == "room_available_check"
     assert state["candidate_profile"]["profile_info"]
     assert "не работаю" in state["candidate_profile"]["work_or_study"]
-    assert len(text_messages(state)) == 1
-    assert "есть ли у тебя комната" in text_messages(state)[0]
+    assert len(text_messages(state)) == 2
+    assert "у тебя есть комната" in text_messages(state)[1]
 
 
 def test_contextual_negative_profile_answer_advances_to_next_question() -> None:
@@ -860,7 +895,7 @@ def test_contextual_negative_profile_answer_advances_to_next_question() -> None:
     assert state["candidate_profile"]["profile_info"] == "я же говорил что нет"
     assert state["candidate_profile"]["work_or_study"] == "не учится и не работает"
     assert "учишься/работаешь" not in state["reply_text"]
-    assert "есть ли у тебя комната" in state["reply_text"]
+    assert "у тебя есть комната" in state["reply_text"]
 
 
 def test_no_current_activity_profile_answer_does_not_require_hobbies() -> None:
@@ -871,7 +906,7 @@ def test_no_current_activity_profile_answer_does_not_require_hobbies() -> None:
     assert state["candidate_profile"]["work_or_study"] == "сейчас ничем не занимается"
     assert state["candidate_profile"]["hobbies"] is None
     assert "учишься/работаешь" not in state["reply_text"]
-    assert "есть ли у тебя комната" in state["reply_text"]
+    assert "у тебя есть комната" in state["reply_text"]
 
 
 def test_free_time_activity_profile_answers_advance_without_explicit_work_or_hobbies() -> None:
@@ -882,7 +917,7 @@ def test_free_time_activity_profile_answers_advance_without_explicit_work_or_hob
         assert state["candidate_profile"]["profile_info"] == message
         assert state["candidate_profile"]["hobbies"] is None
         assert "учишься/работаешь" not in state["reply_text"]
-        assert "есть ли у тебя комната" in state["reply_text"]
+        assert "у тебя есть комната" in state["reply_text"]
 
 
 def test_contact_collection_accepts_partial_then_missing_field() -> None:
@@ -1308,7 +1343,7 @@ def delayed_followup_actions(state):
     return [
         action
         for action in state.get("pending_actions") or []
-        if action.get("type") == "send_text" and action.get("delay_seconds") == 60
+        if action.get("type") == "send_text" and action.get("delay_seconds") == 120
     ]
 
 

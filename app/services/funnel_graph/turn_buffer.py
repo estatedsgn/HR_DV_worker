@@ -98,6 +98,9 @@ class FunnelTurnBufferService:
             select(OutboundJob).where(
                 OutboundJob.dialog_id == dialog_id,
                 OutboundJob.status.in_(["queued", "retry"]),
+                # Never break an in-flight voice pack: let the current pack finish,
+                # we react to the candidate's message on the next turn.
+                OutboundJob.job_type != "voice",
             )
         )
         cancelled = 0

@@ -195,13 +195,13 @@ class OutboundQueueWorker:
     async def _send_job(self, job: OutboundJob, account: Account) -> None:
         if not account.crmchat_workspace_id:
             raise RetryableOutboundJobError("Account has no CRMchat workspace id")
-        if self.settings.brain_cancel_outbound_on_inbound and await self._has_newer_candidate_activity(job):
+        if job.job_type != "voice" and self.settings.brain_cancel_outbound_on_inbound and await self._has_newer_candidate_activity(job):
             raise StaleOutboundJobError("New candidate activity arrived before outbound send")
         peer = job.peer or await self._resolve_peer(job, account)
         random_id = str(job.telegram_random_id or random.getrandbits(63))
         job.telegram_random_id = random_id
         await self._simulate_typing(job, account, peer)
-        if self.settings.brain_cancel_outbound_on_inbound and await self._has_newer_candidate_activity(job):
+        if job.job_type != "voice" and self.settings.brain_cancel_outbound_on_inbound and await self._has_newer_candidate_activity(job):
             raise StaleOutboundJobError("New candidate activity arrived during outbound typing delay")
         if job.job_type == "voice":
             result = await self._send_voice_job(job, account, peer, random_id)

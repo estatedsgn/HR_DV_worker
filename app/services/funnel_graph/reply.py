@@ -12,7 +12,7 @@ from app.core.config import Settings, get_settings
 from app.services.brain_v2.llm_provider import BrainLLMAdapter, BrainLLMError
 from app.services.funnel_graph.funnel_policy import STAGE_POLICIES, TERMINAL_STAGES, get_stage_policy, stage_requirement_met
 from app.services.funnel_graph.knowledge import PROJECT_ROOT
-from app.services.funnel_graph.model_profiles import active_model_profile, is_complex_turn
+from app.services.funnel_graph.model_profiles import active_model_profile
 from app.services.funnel_graph.persona import with_persona
 from app.services.funnel_graph.style_examples import select_style_examples
 from app.services.funnel_graph.semantic import (
@@ -79,6 +79,24 @@ class ReplyResult(BaseModel):
         return normalized if normalized in allowed else "answer_only"
 
 
+class ReactionResult(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    text: str = ""
+
+
+SMALLTALK_REACTION_PROMPT = """Кандидатка только что в ответ на просьбу рассказать о себе написала пару слов про учёбу/работу/чем занимается в свободное время.
+Твоя задача: коротко и ЖИВО отреагировать именно на то, что она написала — по-человечески, тепло, с интересом.
+
+Правила:
+- Ровно 1 короткое предложение. Без вопроса в конце (следующий вопрос добавят отдельно).
+- Реагируй на конкретику её сообщения. Например: «смотрю тиктоки» — оживись про короткие форматы/тренды и что под это легко подобрать тему стримов; «ничего не интересно/ничем не занимаюсь» — поддержи без осуждения и мягко свяжи со стримами.
+- Голос живой, на «ты», без канцелярита. НЕЛЬЗЯ отвечать сухими «поняла, спасибо» / «это поможет подобрать тематику».
+- Без обещаний дохода, без давления, без Markdown.
+- Верни только валидный JSON: {"text": "..."}.
+"""
+
+
 class ReplyOrchestrator:
     def __init__(
         self,
@@ -115,7 +133,10 @@ class ReplyOrchestrator:
                 "completed_by_policy",
             )
             return result
-        component = "reply_orchestrator_complex" if profile.route_complex_to_max and is_complex_turn(state) else "reply_orchestrator"
+        # Always prefer the best (max) model for live reactions when the profile exposes a max
+        # route. Quality of the reaction matters more than latency for this recruiter funnel.
+        prefer_complex = profile.route_complex_to_max and self.adapter.has_api_key("reply_orchestrator_complex")
+        component = "reply_orchestrator_complex" if prefer_complex else "reply_orchestrator"
         if self.use_llm and self.adapter.has_api_key(component):
             try:
                 payload = await self.adapter.complete_json(
@@ -205,11 +226,43 @@ class ReplyOrchestrator:
         except Exception:
             return None
 
+    async def generate_smalltalk_reaction(self, state: FunnelGraphState) -> str | None:
+        """Live, LLM-generated reaction to what the candidate shared about herself.
+
+        Returns None if the LLM is unavailable or fails, so the caller can fall back to a
+        deterministic ack. Always uses the best (max) model when the profile exposes one.
+        """
+        if not self.use_llm:
+            return None
+        profile = active_model_profile(self.settings)
+        prefer_complex = profile.route_complex_to_max and self.adapter.has_api_key("reply_orchestrator_complex")
+        component = "reply_orchestrator_complex" if prefer_complex else "reply_orchestrator"
+        if not self.adapter.has_api_key(component):
+            return None
+        candidate_profile = dict(state.get("candidate_profile") or {})
+        user_payload = {
+            "candidate_message": state.get("incoming_message"),
+            "profile_info": candidate_profile.get("profile_info"),
+            "work_or_study": candidate_profile.get("work_or_study"),
+            "hobbies": candidate_profile.get("hobbies"),
+            "recent_messages": compact_messages(state.get("recent_messages") or [], limit=10),
+            "style_examples": select_style_examples("support_smalltalk", [], k=3),
+        }
+        try:
+            payload = await self.adapter.complete_json(
+                component=component,
+                system_prompt=with_persona(SMALLTALK_REACTION_PROMPT),
+                user_payload=user_payload,
+                response_model=ReactionResult,
+            )
+            text = normalize_reply_message_text(ReactionResult.model_validate(payload).text)
+            return text or None
+        except Exception:
+            return None
+
 
 def reply_fast_path_allowed(state: FunnelGraphState, semantic: SemanticResult) -> bool:
     if semantic.current_goal_satisfied and not semantic.has_unresolved_interrupt:
-        return True
-    if semantic.message_type == "partial_answer" and not semantic.has_unresolved_interrupt:
         return True
     if semantic.message_type in {"pause", "do_not_contact", "hard_refusal"} and semantic.confidence >= 0.85:
         return True
@@ -667,9 +720,9 @@ def question_variants(question: str) -> list[str]:
             "ещё что-то хочешь уточнить по условиям или формату?",
         ],
         "рассказать подробнее?": [
-            "хочешь, расскажу подробнее?",
-            "интересно узнать детали?",
-            "могу рассказать подробнее, если актуально",
+            "рассказать?",
+            "хочешь, запишу тебе голосовое с условиями?",
+            "могу рассказать про условия и график, интересно?",
         ],
         "какая у тебя моделька телефончика?": [
             "классно, что с оборудованием уже есть база) для старта всё равно нужна моделька телефончика — какая у тебя?",
@@ -685,6 +738,21 @@ def question_variants(question: str) -> list[str]:
             "если по формату стало понятнее, рассказать про зп и график?",
             "могу дальше рассказать про зарплату и график, интересно?",
             "хочешь, перейду к зп и графику?",
+        ],
+        "тогда можем записаться на собеседование?": [
+            "давай назначим короткий созвон-собеседование?",
+            "получится созвониться на собеседование?",
+            "как смотришь на то, чтобы созвониться с куратором и всё обсудить?",
+        ],
+        "завтра будет удобно провести собеседование?": [
+            "получится завтра созвониться на собеседование?",
+            "как тебе вариант провести собеседование завтра?",
+            "завтра сможем выделить время на созвон?",
+        ],
+        "с 11:00 по 18:00 по мск, в какое время будет удобнее?": [
+            "подскажи удобное время в промежутке с 11:00 до 18:00 мск?",
+            "во сколько тебе комфортнее в окне 11:00–18:00 по мск?",
+            "какое время с 11 до 18 по мск тебе подойдёт?",
         ],
     }
     return variants_by_question.get(question, [question])
