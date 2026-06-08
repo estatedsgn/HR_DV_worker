@@ -107,7 +107,13 @@ async def main() -> None:
             print(f"autopilot: account not found: {args.account!r}")
             raise SystemExit(2)
         account_id = str(account.id)
-        print(f"autopilot scoped to account={account.telegram_username or account.crmchat_account_id} id={account_id}")
+        from app.services.funnel_graph.model_profiles import active_model_profile
+
+        _profile = active_model_profile(get_settings()).name
+        print(
+            f"autopilot scoped to account={account.telegram_username or account.crmchat_account_id} "
+            f"id={account_id} model_profile={_profile}"
+        )
 
     cycle = 0
     only_dialog_ids: list[str] | None = None
