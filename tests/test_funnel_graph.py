@@ -47,6 +47,35 @@ def test_funnel_starts_with_first_touch_message() -> None:
     assert state["metadata"]["last_graph_node"] == "save_state"
 
 
+def test_inbound_first_question_enters_warmup_not_opener() -> None:
+    # Девочка написала ПЕРВОЙ и спрашивает — не вываливаем опенер-предложение,
+    # а заходим в тёплый разговор (inbound_warmup).
+    state = initial_state(stage="interest_check")
+    state["recent_messages"] = []  # мы ещё ни разу не писали
+    result = run_graph(state, "привет, а как вы меня нашли?")
+
+    assert result["stage"] == "inbound_warmup"
+    opener_variants = {
+        normalize_reply_message_text(v) for v in StaticFunnelKnowledgeBase().first_touch_variants()
+    }
+    assert not (set(text_messages(result)) & opener_variants)
+
+
+def test_inbound_warmup_pitches_when_chat_lulls() -> None:
+    # После нескольких ходов тёплой беседы (кап = 4 хода) роняем питч про стриминг
+    # и переходим в interest_check; канонный вопрос стадии при этом подавлен.
+    state = initial_state(stage="inbound_warmup")
+    state["recent_messages"] = [{"direction": "outbound", "sender_type": "agent", "body": "привет)"}]
+    state["metadata"] = {"warmup_turns": 3}
+    result = run_graph(state, "ага, поняла")
+
+    assert result["stage"] == "interest_check"
+    assert result["candidate_profile"]["warmup_pitched"] is True
+    joined = " ".join(text_messages(result))
+    assert "стриминге" in joined
+    assert "давай расскажу поподробнее?" not in joined
+
+
 def test_annotation_parser_supports_candidate_multiline_batches() -> None:
     parsed = parse_dialogues(
         """

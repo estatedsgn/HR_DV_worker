@@ -300,7 +300,7 @@ def reply_llm_payload(state: FunnelGraphState, semantic: SemanticResult | None =
     policy = get_stage_policy(stage)
     pending_question = str(state.get("pending_question_text") or state.get("current_question") or "")
     metadata = dict(state.get("metadata") or {})
-    return {
+    payload: dict[str, Any] = {
         "role_contract": {
             "layer": "final_reply_generator",
             "semantic_is_classifier_only": True,
@@ -351,6 +351,26 @@ def reply_llm_payload(state: FunnelGraphState, semantic: SemanticResult | None =
             "streak_count": metadata.get("interrupt_streak_count") or 0,
         },
     }
+    if stage == "inbound_warmup":
+        # Она написала ПЕРВОЙ. Сейчас только тёплый разговор: поздороваться, ответить
+        # по-человечески, поддержать беседу. Про работу/стриминг — НЕ в этом сообщении:
+        # предложение мы добавим сами позже, когда беседа затихнет.
+        payload["warmup_directive"] = {
+            "active": True,
+            "situation": "Кандидатка написала тебе первой и о чём-то спрашивает или просто болтает.",
+            "do": (
+                "Поздоровайся тепло и по-человечески, ответь по смыслу на её сообщение/вопросы. "
+                "Личные детали о себе можно придумать правдоподобно (см. персону: родом из небольшой деревни "
+                "примерно в 100 км, та ещё дыра), недавно переехала; просто будь живой девочкой). "
+                "Поддержи лёгкую беседу, не допрашивай."
+            ),
+            "must_not": (
+                "НЕ предлагай работу, НЕ упоминай стриминг/вакансию/предложение в этом сообщении — "
+                "это произойдёт чуть позже само. Факты про условия работы (оплата, график, платформы) "
+                "по-прежнему не выдумывай."
+            ),
+        }
+    return payload
 
 
 def compact_messages(messages: list[Any], *, limit: int) -> list[dict[str, Any]]:
@@ -657,6 +677,14 @@ def deterministic_reply(state: FunnelGraphState) -> ReplyResult:
     stage = str(state.get("stage") or "interest_check")
     current_question = str(state.get("pending_question_text") or state.get("current_question") or "")
     templates = dict((state.get("metadata") or {}).get("templates") or {})
+
+    # Inbound-first warmup без LLM: просто поздороваться и мягко ответить, если есть
+    # что. Питч добавит контроллер при переходе warmup→interest_check.
+    if stage == "inbound_warmup":
+        greet = "привет)" if not has_prior_agent_message(state) else ""
+        answer = knowledge_answer(state)
+        text = join_text(greet, answer) or greet or "привет) рада, что написала"
+        return text_reply(text, "inbound warmup (deterministic)")
 
     # Первый контакт (мы ещё ни разу не писали в диалог): кто бы ни написал первым
     # — «привет», вопрос, что угодно — открываем тем же first-touch опенером, что и

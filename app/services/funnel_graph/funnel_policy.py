@@ -21,6 +21,7 @@ class StagePolicy:
 
 
 CANDIDATE_PROFILE_FIELDS: tuple[str, ...] = (
+    "warmup_pitched",
     "interest_confirmed",
     "interest_status",
     "age",
@@ -51,6 +52,19 @@ CANDIDATE_PROFILE_FIELDS: tuple[str, ...] = (
 
 
 STAGE_POLICIES: dict[str, StagePolicy] = {
+    # Девочка написала ПЕРВОЙ (мэтч с Дайвинчика / сама постучалась) и о чём-то
+    # спрашивает. Не вываливаем сразу опенер-предложение: сначала тёплый разговор —
+    # поздороваться, ответить по-человечески, поддержать беседу. Питч про стриминг
+    # роняем позже (контроллер), когда беседа затихнет. См. [[inbound-first-warmup]].
+    "inbound_warmup": StagePolicy(
+        name="inbound_warmup",
+        goal="Тёплый разговор с написавшей первой: поздороваться, ответить на вопросы, поддержать беседу. Про работу/стриминг пока НЕ упоминать.",
+        current_question=None,
+        required_fields=("warmup_pitched",),
+        next_stage_if_completed="interest_check",
+        allowed_transitions=("inbound_warmup", "interest_check", "lost", "do_not_contact", "human_handoff"),
+        stage_type="waiting",
+    ),
     "interest_check": StagePolicy(
         name="interest_check",
         goal="Понять, есть ли у кандидатки интерес узнать подробности.",
@@ -317,6 +331,8 @@ def can_transition(current_stage: str, target_stage: str) -> bool:
 
 
 def stage_requirement_met(stage: str, profile: dict[str, Any]) -> bool:
+    if stage == "inbound_warmup":
+        return profile.get("warmup_pitched") is True
     if stage == "interest_check":
         return profile.get("interest_confirmed") is True
     if stage == "age_check":

@@ -220,3 +220,13 @@ def test_unknown_is_flagged_for_review() -> None:
     decision = classify(message, rng=random.Random(0))
     assert decision.intent == "unknown"
     assert decision.review is True
+
+
+def test_daily_like_limit_premium_upsell_pauses() -> None:
+    # Captured live: when out of likes Дайвинчик shows a premium upsell instead of
+    # a profile card. Must be recognised as the daily limit -> pause, not spam.
+    message = parse_bot_message(
+        _msg(502, "Слишком много ❤️ за сегодня. Перейди на Premium и получи больше ❤️!")
+    )
+    decision = classify(message, rng=random.Random(0))
+    assert decision.intent == "limit"

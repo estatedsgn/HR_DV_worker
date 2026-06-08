@@ -32,7 +32,13 @@ from app.services.funnel_graph.state import (
 
 # Short acknowledgement/bridge lines sent as their own message right before the
 # next stage question, so a stage transition feels human instead of abrupt.
+# Питч про стриминг для написавших ПЕРВЫМИ: роняем его не сразу, а когда беседа
+# затихнет (см. inbound_warmup в funnel_policy + state_controller). Фраза заодно
+# служит вопросом интереса — дальше идёт обычный interest_check на её «да/нет».
+INBOUND_WARMUP_PITCH = "кстати ты очень фотогеничная) есть предложение по работе в стриминге, если интересно — расскажу"
+
 TRANSITION_BRIDGES: dict[tuple[str, str], str] = {
+    ("inbound_warmup", "interest_check"): INBOUND_WARMUP_PITCH,
     ("post_equipment_questions_check", "profile_theme_check"): "давай я уточню у тебя несколько деталей, и далее мы с тобой запишемся на собеседование",
     ("room_available_check", "equipment_phone_check"): "супер",
     ("equipment_phone_check", "interview_offer"): "нам подходит",
@@ -201,9 +207,38 @@ def _semantic_analyzer_node(analyzer: SemanticAnalyzer):
         if run_metadata:
             metadata["semantic_metrics"] = run_metadata
             metadata["model_test_profile"] = run_metadata.get("profile")
-        return {"semantic_result": result.model_dump(), "parse_errors": parse_errors, "metadata": metadata}
+        warmup_patch = warmup_entry_patch(state, result)
+        return {"semantic_result": result.model_dump(), "parse_errors": parse_errors, "metadata": metadata, **warmup_patch}
 
     return semantic_analyzer
+
+
+# message_type, при которых первое входящее НЕ переводим в warmup (отказы/пусто):
+# их обрабатывает обычная логика отказа.
+_WARMUP_SKIP_MESSAGE_TYPES = {"empty", "do_not_contact", "hard_refusal", "soft_refusal", "pause"}
+
+
+def warmup_entry_patch(state: FunnelGraphState, semantic: SemanticResult) -> dict[str, Any]:
+    """Если девочка написала ПЕРВОЙ и о чём-то спрашивает/болтает — заходим в стадию
+    inbound_warmup (тёплый разговор) вместо мгновенного опенера-предложения.
+
+    Срабатывает только на самом первом входящем (мы ещё ни разу не писали) и только
+    из interest_check; дальше стадия живёт сама. Отказы/пустые обходим стороной.
+    """
+    if str(state.get("stage") or "interest_check") != "interest_check":
+        return {}
+    if semantic.message_type in _WARMUP_SKIP_MESSAGE_TYPES:
+        return {}
+    profile = normalize_candidate_profile(state.get("candidate_profile"))
+    if profile.get("warmup_pitched"):
+        return {}
+    if dialog_has_prior_agent_message(state):
+        return {}
+    return {
+        **policy_state_patch("inbound_warmup"),
+        "stage": "inbound_warmup",
+        "current_state": "inbound_warmup",
+    }
 
 
 def _retrieve_knowledge_node(knowledge_source: Any, static_store: StaticFunnelKnowledgeBase):
@@ -364,6 +399,24 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
         profile["salary_schedule_interest"] = True
         target_stage = next_stage_if_requirement_met(current_stage, profile)
 
+    # --- Inbound-first warmup: тёплый разговор, питч на затихании ------------
+    # В warmup модель только здоровается/отвечает/болтает (про работу молчит).
+    # Питч роняем сами бриджем inbound_warmup→interest_check, когда беседа затихла
+    # (она перестала активно спрашивать) — после ≥2 ходов или жёстко на 4-м.
+    warmup_turns: int | None = None
+    if current_stage == "inbound_warmup" and target_stage not in TERMINAL_STAGES:
+        warmup_turns = int(metadata_in.get("warmup_turns") or 0) + 1
+        still_asking = semantic.has_unresolved_interrupt or semantic.message_type in {
+            "interrupt_question",
+            "objection",
+            "mixed",
+        }
+        if (warmup_turns >= 2 and not still_asking) or warmup_turns >= 4:
+            target_stage = "interest_check"
+            profile["warmup_pitched"] = True
+        else:
+            target_stage = "inbound_warmup"
+
     if target_stage != current_stage and not semantic.has_unresolved_interrupt:
         target_stage = advance_through_completed_waiting_stages(target_stage, profile)
 
@@ -406,12 +459,20 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
         if bridge and not outgoing_contains(outgoing, bridge):
             outgoing.append({"type": "text", "text": bridge, "voice_pack_id": None})
         next_question = get_stage_policy(target_stage).current_question
-        if next_question and not outgoing_contains(outgoing, next_question):
+        # Питч-бридж warmup→interest_check уже содержит вопрос интереса
+        # («если интересно — расскажу»), поэтому канонный вопрос стадии не дублируем.
+        suppress_next_question = (current_stage, target_stage) == ("inbound_warmup", "interest_check")
+        if next_question and not suppress_next_question and not outgoing_contains(outgoing, next_question):
             outgoing.append({"type": "text", "text": next_question, "voice_pack_id": None})
     elif send_reply and not outgoing and policy.current_question and semantic.message_type != "empty":
         outgoing.append({"type": "text", "text": policy.current_question, "voice_pack_id": None})
 
     metadata = dict(state.get("metadata") or {})
+    # Счётчик ходов warmup живёт, пока мы в нём; при выходе — чистим.
+    if target_stage == "inbound_warmup" and warmup_turns is not None:
+        metadata["warmup_turns"] = warmup_turns
+    elif target_stage != "inbound_warmup":
+        metadata.pop("warmup_turns", None)
     if invalid_reason:
         metadata["controller_invalid_transition"] = invalid_reason
     metadata["previous_state"] = current_stage if target_stage != current_stage else state.get("previous_state")
