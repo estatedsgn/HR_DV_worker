@@ -70,6 +70,11 @@ class Settings(BaseSettings):
     model_test_profile: str = Field(
         default="plus_max_router", alias="MODEL_TEST_PROFILE"
     )
+    # A/B по аккаунтам: какой профиль модели использовать на каждый аккаунт и как
+    # его подписывать в транскриптах. Формат "id=value,id=value" (id — UUID
+    # аккаунта или его crmchat_account_id). Пусто → общий MODEL_TEST_PROFILE.
+    account_model_profiles: str | None = Field(default=None, alias="ACCOUNT_MODEL_PROFILES")
+    account_labels: str | None = Field(default=None, alias="ACCOUNT_LABELS")
     qwen_max_model: str = Field(default="qwen3.7-max", alias="QWEN_MAX_MODEL")
     qwen_plus_model: str = Field(default="qwen-plus", alias="QWEN_PLUS_MODEL")
     qwen_flash_model: str = Field(default="qwen-flash", alias="QWEN_FLASH_MODEL")
@@ -247,6 +252,34 @@ class Settings(BaseSettings):
         default="daivinchik", alias="DAIVINCHIK_LEAD_SOURCE"
     )
 
+
+    @staticmethod
+    def _parse_account_map(raw: str | None) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for pair in (raw or "").replace("\n", ",").split(","):
+            pair = pair.strip()
+            if not pair or "=" not in pair:
+                continue
+            key, _, value = pair.partition("=")
+            key, value = key.strip(), value.strip()
+            if key and value:
+                result[key] = value
+        return result
+
+    def model_profile_for_account(self, *account_keys: str | None) -> str | None:
+        """Профиль модели для аккаунта по любому из его ключей (UUID / crmchat id)."""
+        mapping = self._parse_account_map(self.account_model_profiles)
+        for key in account_keys:
+            if key and str(key) in mapping:
+                return mapping[str(key)]
+        return None
+
+    def label_for_account(self, *account_keys: str | None) -> str | None:
+        mapping = self._parse_account_map(self.account_labels)
+        for key in account_keys:
+            if key and str(key) in mapping:
+                return mapping[str(key)]
+        return None
 
     def llm_api_key_pool(self) -> list[str]:
         """All interchangeable LLM keys in priority order, de-duplicated.

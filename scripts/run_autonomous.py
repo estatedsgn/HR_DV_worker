@@ -34,14 +34,18 @@ logger = logging.getLogger("autonomous")
 RESTART_DELAY = 10.0
 
 
-def _legacy_specs() -> list[tuple[str, list[str], float]]:
+# Каждая спека: (имя, команда, restart_delay, доп-env). env=None — наследуем как есть.
+ProcessSpec = tuple[str, list[str], float, dict[str, str] | None]
+
+
+def _legacy_specs() -> list[ProcessSpec]:
     """Single-account fallback: the original global Дайвинчик + autopilot pair.
 
     Used when no account in the DB has its own credentials / daivinchik_enabled,
     so the existing single-account (.env) live test keeps running unchanged.
     """
     return [
-        ("daivinchik", [PY, "-m", "app.services.daivinchik"], RESTART_DELAY),
+        ("daivinchik", [PY, "-m", "app.services.daivinchik"], RESTART_DELAY, None),
         (
             "autopilot",
             [
@@ -52,18 +56,29 @@ def _legacy_specs() -> list[tuple[str, list[str], float]]:
                 "--allow-real-send",
             ],
             RESTART_DELAY,
+            None,
         ),
+        _exporter_spec(),
     ]
 
 
 def _label(account) -> str:
-    return account.telegram_username or account.crmchat_account_id or str(account.id)
+    from app.core.config import get_settings
+
+    label = get_settings().label_for_account(account.id, account.crmchat_account_id)
+    return label or account.telegram_username or account.crmchat_account_id or str(account.id)
 
 
-def _autopilot_spec(account) -> tuple[str, list[str], float]:
+def _autopilot_spec(account) -> ProcessSpec:
     """A scoped reply-autopilot for one account: its own key, only its dialogs and
     only its outbound jobs (account_id filter) — so accounts never claim each
-    other's jobs."""
+    other's jobs. Per-account model profile (A/B) via MODEL_TEST_PROFILE env."""
+    from app.core.config import get_settings
+
+    env: dict[str, str] | None = None
+    profile = get_settings().model_profile_for_account(account.id, account.crmchat_account_id)
+    if profile:
+        env = {"MODEL_TEST_PROFILE": profile}
     return (
         f"autopilot[{_label(account)}]",
         [
@@ -75,18 +90,30 @@ def _autopilot_spec(account) -> tuple[str, list[str], float]:
             "--allow-real-send",
         ],
         RESTART_DELAY,
+        env,
     )
 
 
-def _swiper_spec(account) -> tuple[str, list[str], float]:
+def _swiper_spec(account) -> ProcessSpec:
     return (
         f"daivinchik[{_label(account)}]",
         [PY, "-m", "app.services.daivinchik", "--account", str(account.id)],
         RESTART_DELAY,
+        None,
     )
 
 
-async def _build_process_specs() -> list[tuple[str, list[str], float]]:
+def _exporter_spec() -> ProcessSpec:
+    """Фоновый экспортёр дневных чатов в txt (для анализа/улучшения промптов)."""
+    return (
+        "chat_exporter",
+        [PY, str(ROOT / "scripts" / "export_chats.py"), "--loop", "--interval", "180"],
+        RESTART_DELAY,
+        None,
+    )
+
+
+async def _build_process_specs() -> list[ProcessSpec]:
     """Per-account processes: a scoped reply-autopilot for every active account
     plus a Дайвинчик swiper for every daivinchik-enabled account.
 
@@ -116,21 +143,28 @@ async def _build_process_specs() -> list[tuple[str, list[str], float]]:
 
     specs = [_autopilot_spec(account) for account in active]
     specs.extend(_swiper_spec(account) for account in daivinchik)
+    specs.append(_exporter_spec())
     logger.info(
-        "spawning per-account: %d autopilots + %d swipers",
+        "spawning per-account: %d autopilots + %d swipers + chat exporter",
         len(active),
         len(daivinchik),
     )
     return specs
 
 
-async def _supervise(name: str, cmd: list[str], restart_delay: float, stop: asyncio.Event) -> None:
+async def _supervise(
+    name: str,
+    cmd: list[str],
+    restart_delay: float,
+    stop: asyncio.Event,
+    extra_env: dict[str, str] | None = None,
+) -> None:
     """Запускает один процесс и перезапускает его, пока не попросят остановиться."""
     while not stop.is_set():
         logger.info("[%s] starting: %s", name, " ".join(cmd[1:]))
         # PYTHONUNBUFFERED — чтобы print()-вывод автопилота шёл в общий лог сразу,
         # а не застревал в блочном буфере при перенаправлении в файл.
-        child_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        child_env = {**os.environ, "PYTHONUNBUFFERED": "1", **(extra_env or {})}
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(ROOT),
@@ -194,10 +228,10 @@ async def _amain() -> None:
 
     specs = await _build_process_specs()
     tasks = [
-        asyncio.create_task(_supervise(name, cmd, delay, stop), name=name)
-        for name, cmd, delay in specs
+        asyncio.create_task(_supervise(name, cmd, delay, stop, env), name=name)
+        for name, cmd, delay, env in specs
     ]
-    logger.info("autonomous runner up: %s", ", ".join(name for name, _, _ in specs))
+    logger.info("autonomous runner up: %s", ", ".join(name for name, *_ in specs))
     try:
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
