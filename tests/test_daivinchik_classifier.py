@@ -222,6 +222,29 @@ def test_unknown_is_flagged_for_review() -> None:
     assert decision.review is True
 
 
+def test_safety_tip_interstitial_is_dismissed_with_right_button() -> None:
+    # Captured live (msg 502): a "совет от Дайвинчика" safety tip with buttons
+    # [Расскажи больше] [Не интересно]. The swiper used to freeze on it forever.
+    # It must press the right (skip) button to advance instead.
+    text = (
+        "margosha, это совет от Дайвинчика\n\nКак не стать жертвой мошенников?\n"
+        "Общайся через видеозвонки, чтобы убедиться..."
+    )
+    message = parse_bot_message(_msg(502, text, [_reply_row("Расскажи больше", "Не интересно")]))
+    decision = classify(message, rng=random.Random(0))
+    assert decision.intent == "dismiss"
+    assert decision.press is not None
+    assert decision.press.text == "Не интересно"
+
+
+def test_unknown_interstitial_with_buttons_presses_rightmost() -> None:
+    # An unrecognised screen with no skip-labelled button -> press the rightmost.
+    message = parse_bot_message(_msg(610, "В приложении кое-что обновилось", [_reply_row("Открыть", "Хорошо")]))
+    decision = classify(message, rng=random.Random(0))
+    assert decision.intent == "dismiss"
+    assert decision.press.text == "Хорошо"
+
+
 def test_daily_like_limit_premium_upsell_pauses() -> None:
     # Captured live: when out of likes Дайвинчик shows a premium upsell instead of
     # a profile card. Must be recognised as the daily limit -> pause, not spam.
