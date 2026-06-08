@@ -19,7 +19,9 @@ class FakeOutboundRepository:
     def __init__(self, jobs):
         self.jobs = jobs
 
-    async def claim_ready_batch(self, *, lease_owner: str, limit: int = 50, lease_seconds: int = 60):
+    async def claim_ready_batch(
+        self, *, lease_owner: str, limit: int = 50, lease_seconds: int = 60, account_id=None
+    ):
         for job in self.jobs[:limit]:
             job.lease_owner = lease_owner
             job.lease_expires_at = datetime.now(UTC) + timedelta(seconds=lease_seconds)
@@ -138,7 +140,9 @@ def test_text_typing_delay_is_random_between_min_and_max(monkeypatch) -> None:
     assert calls == [(5.0, 10.0)]
 
 
-def test_send_guard_blocks_non_allowlisted_username() -> None:
+def test_send_guard_blocks_non_daivinchik_non_allowlisted() -> None:
+    # Диалог не из разрешённого источника (session.get(Dialog) -> None) и username
+    # не в allowlist -> блок. Это обычный telegram:-собеседник (бот/случайный).
     worker = OutboundQueueWorker(
         FakeSession(make_account()),
         connector=FakeConnector(),
@@ -148,7 +152,46 @@ def test_send_guard_blocks_non_allowlisted_username() -> None:
     job = OutboundJob(target_username="@other", text="hello", scheduled_at=datetime.now(UTC))
 
     with pytest.raises(OutboundSendBlockedError):
-        worker._assert_send_allowed(job)
+        asyncio.run(worker._assert_send_allowed(job))
+
+
+def test_send_guard_allows_daivinchik_intake_dialog() -> None:
+    # Диалог заведён интейком daivinchik -> аутрич разрешён даже без username в
+    # allowlist (динамический лид по взаимной симпатии).
+    from app.models.dialog import Dialog
+
+    account = make_account()
+    dialog = Dialog(
+        id=uuid.uuid4(),
+        account_id=account.id,
+        crmchat_dialog_id="intake:daivinchik:@yulia_k",
+        telegram_username="@yulia_k",
+        status="open",
+    )
+    session = FakeSession(account)
+
+    async def get(model, object_id):
+        if model.__name__ == "Dialog" and object_id == dialog.id:
+            return dialog
+        if model.__name__ == "Account" and object_id == account.id:
+            return account
+        return None
+
+    session.get = get  # type: ignore[assignment]
+    worker = OutboundQueueWorker(
+        session,
+        connector=FakeConnector(),
+        settings=Settings(OUTBOUND_ALLOWED_USERNAMES=""),
+        allow_real_send=True,
+    )
+    job = OutboundJob(
+        dialog_id=dialog.id,
+        target_username="@yulia_k",
+        text="hello",
+        scheduled_at=datetime.now(UTC),
+    )
+    # не бросает -> отправка разрешена
+    asyncio.run(worker._assert_send_allowed(job))
 
 
 def test_send_guard_blocks_when_real_send_disabled() -> None:
@@ -161,7 +204,7 @@ def test_send_guard_blocks_when_real_send_disabled() -> None:
     job = OutboundJob(target_username="@iamnekiy", text="hello", scheduled_at=datetime.now(UTC))
 
     with pytest.raises(OutboundSendBlockedError):
-        worker._assert_send_allowed(job)
+        asyncio.run(worker._assert_send_allowed(job))
 
 
 def test_worker_sends_allowlisted_job_and_updates_message() -> None:

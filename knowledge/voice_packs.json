@@ -3,14 +3,14 @@
     {
       "id": "offer_overview",
       "media_path": "data/voice_intro/voice_intro_01_offer_overview.ogg",
-      "caption": "[voice] initial_offer_overview",
+      "caption": "",
       "recording_delay_seconds": 40,
       "duration_seconds": 0
     },
     {
       "id": "work_format_overview",
       "media_path": "data/voice_intro/voice_intro_02_work_format.ogg",
-      "caption": "[voice] work_format_overview",
+      "caption": "",
       "recording_delay_seconds": 40,
       "duration_seconds": 0
     }
@@ -19,14 +19,14 @@
     {
       "id": "platforms_process_and_support",
       "media_path": "data/voice_intro/voice_intro_03_platform_process.ogg",
-      "caption": "[voice] platforms_process_and_support",
+      "caption": "",
       "recording_delay_seconds": 40,
       "duration_seconds": 0
     },
     {
       "id": "next_steps_and_interview",
       "media_path": "data/voice_intro/voice_intro_04_next_steps.ogg",
-      "caption": "[voice] next_steps_and_interview",
+      "caption": "",
       "recording_delay_seconds": 40,
       "duration_seconds": 0
     }

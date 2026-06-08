@@ -47,6 +47,15 @@ class Settings(BaseSettings):
     )
     llm_provider: str | None = Field(default=None, alias="LLM_PROVIDER")
     llm_api_key: str | None = Field(default=None, alias="LLM_API_KEY")
+    # Pool of interchangeable keys for the same provider (comma/whitespace
+    # separated). When the active key's quota is exhausted the runtime rotates
+    # to the next one automatically. LLM_API_KEY is appended as a fallback so
+    # existing single-key setups keep working unchanged.
+    llm_api_keys: str | None = Field(default=None, alias="LLM_API_KEYS")
+    # Shared cursor file so every worker process agrees on the active key.
+    llm_key_state_path: str = Field(
+        default="runtime_logs/llm_key_cursor.json", alias="LLM_KEY_STATE_PATH"
+    )
     llm_base_url: str | None = Field(default=None, alias="LLM_BASE_URL")
     llm_endpoint: str = Field(default="responses", alias="LLM_ENDPOINT")
     llm_model: str = Field(default="gpt-5.4-mini", alias="LLM_MODEL")
@@ -130,11 +139,24 @@ class Settings(BaseSettings):
     outbound_allowed_usernames: str = Field(
         default="@iamnekiy", alias="OUTBOUND_ALLOWED_USERNAMES"
     )
+    # Источники интейка, чьи лиды разрешено вести аутричем. Диалог такого лида
+    # имеет crmchat_dialog_id вида "intake:<source>:<id>". Только эти диалоги
+    # (плюс явный username-allowlist) получают исходящие — обычные telegram:-диалоги
+    # (боты/случайные, с кем аккаунт переписывается) НЕ трогаются.
+    outbound_allowed_intake_sources: str = Field(
+        default="daivinchik", alias="OUTBOUND_ALLOWED_INTAKE_SOURCES"
+    )
+    # Анти-флуд пейсинг между исходящими с одного аккаунта. Раньше было 300/60 c —
+    # это создавало 5-минутную стену между «пузырями» одного ответа и между
+    # репликами внутри живого диалога (next_available_at гейтит каждый следующий
+    # job). Реальная отправка + имитация печати и так дают естественную паузу,
+    # поэтому держим интервал маленьким. Холодный first-touch всё ещё ограничен
+    # outbound-гейтом (только daivinchik-лиды / allowlist), а не таймером.
     outbound_default_send_interval_seconds: int = Field(
-        default=300, alias="OUTBOUND_DEFAULT_SEND_INTERVAL_SECONDS"
+        default=3, alias="OUTBOUND_DEFAULT_SEND_INTERVAL_SECONDS"
     )
     outbound_default_send_jitter_seconds: int = Field(
-        default=60, alias="OUTBOUND_DEFAULT_SEND_JITTER_SECONDS"
+        default=3, alias="OUTBOUND_DEFAULT_SEND_JITTER_SECONDS"
     )
     outbound_mark_read_on_send: bool = Field(
         default=True, alias="OUTBOUND_MARK_READ_ON_SEND"
@@ -148,6 +170,103 @@ class Settings(BaseSettings):
     outbound_voice_recording_delay_seconds: float = Field(
         default=40.0, alias="OUTBOUND_VOICE_RECORDING_DELAY_SECONDS"
     )
+
+    # --- Supervisor / remote control pult ---
+    control_bot_token: str | None = Field(default=None, alias="CONTROL_BOT_TOKEN")
+    control_admin_chat_id: str | None = Field(
+        default=None, alias="CONTROL_ADMIN_CHAT_ID"
+    )
+    control_target_username: str | None = Field(
+        default="@iamnekiy", alias="CONTROL_TARGET_USERNAME"
+    )
+    control_autopilot_args: str = Field(
+        default="--all-accounts --allow-real-send --typing-delay-seconds 2 --poll-interval-seconds 3",
+        alias="CONTROL_AUTOPILOT_ARGS",
+    )
+    control_db_health_retries: int = Field(
+        default=30, alias="CONTROL_DB_HEALTH_RETRIES"
+    )
+    lead_alerts_enabled: bool = Field(default=True, alias="LEAD_ALERTS_ENABLED")
+    # Hand-off alerts go to a dedicated bot/chat when set, otherwise they fall
+    # back to the supervisor control bot (control_bot_token / control_admin_chat_id).
+    handoff_bot_token: str | None = Field(default=None, alias="HANDOFF_BOT_TOKEN")
+    handoff_chat_id: str | None = Field(default=None, alias="HANDOFF_CHAT_ID")
+    control_skip_docker: bool = Field(default=False, alias="CONTROL_SKIP_DOCKER")
+    control_skip_migrations: bool = Field(
+        default=False, alias="CONTROL_SKIP_MIGRATIONS"
+    )
+
+    # --- Дайвинчик auto-swiper ---
+    daivinchik_enabled: bool = Field(default=False, alias="DAIVINCHIK_ENABLED")
+    daivinchik_bot_username: str = Field(
+        default="@leomatchbot", alias="DAIVINCHIK_BOT_USERNAME"
+    )
+    daivinchik_timezone: str = Field(
+        default="Europe/Moscow", alias="DAIVINCHIK_TIMEZONE"
+    )
+    daivinchik_active_hours_start: int = Field(
+        default=10, alias="DAIVINCHIK_ACTIVE_HOURS_START"
+    )
+    daivinchik_active_hours_end: int = Field(
+        default=21, alias="DAIVINCHIK_ACTIVE_HOURS_END"
+    )
+    daivinchik_poll_interval_seconds: float = Field(
+        default=5.0, alias="DAIVINCHIK_POLL_INTERVAL_SECONDS"
+    )
+    daivinchik_min_action_delay_seconds: float = Field(
+        default=30.0, alias="DAIVINCHIK_MIN_ACTION_DELAY_SECONDS"
+    )
+    daivinchik_max_action_delay_seconds: float = Field(
+        default=60.0, alias="DAIVINCHIK_MAX_ACTION_DELAY_SECONDS"
+    )
+    daivinchik_like_probability: float = Field(
+        default=0.5, alias="DAIVINCHIK_LIKE_PROBABILITY"
+    )
+    daivinchik_daily_lead_limit: int = Field(
+        default=7, alias="DAIVINCHIK_DAILY_LEAD_LIMIT"
+    )
+    daivinchik_limit_pause_minutes: int = Field(
+        default=90, alias="DAIVINCHIK_LIMIT_PAUSE_MINUTES"
+    )
+    daivinchik_ad_button_from_right: int = Field(
+        default=2, alias="DAIVINCHIK_AD_BUTTON_FROM_RIGHT"
+    )
+    daivinchik_history_limit: int = Field(
+        default=12, alias="DAIVINCHIK_HISTORY_LIMIT"
+    )
+    daivinchik_state_path: str = Field(
+        default="daivinchik_state.json", alias="DAIVINCHIK_STATE_PATH"
+    )
+    daivinchik_review_log_path: str = Field(
+        default="daivinchik_review.jsonl", alias="DAIVINCHIK_REVIEW_LOG_PATH"
+    )
+    daivinchik_leads_path: str = Field(
+        default="daivinchik_leads.jsonl", alias="DAIVINCHIK_LEADS_PATH"
+    )
+    daivinchik_lead_source: str = Field(
+        default="daivinchik", alias="DAIVINCHIK_LEAD_SOURCE"
+    )
+
+
+    def llm_api_key_pool(self) -> list[str]:
+        """All interchangeable LLM keys in priority order, de-duplicated.
+
+        Combines ``LLM_API_KEYS`` (comma/whitespace separated) with the legacy
+        single ``LLM_API_KEY`` appended last as a fallback.
+        """
+        raw: list[str] = []
+        if self.llm_api_keys:
+            raw.extend(self.llm_api_keys.replace("\n", ",").replace(" ", ",").split(","))
+        if self.llm_api_key:
+            raw.append(self.llm_api_key)
+        seen: set[str] = set()
+        keys: list[str] = []
+        for item in raw:
+            key = item.strip()
+            if key and key not in seen:
+                seen.add(key)
+                keys.append(key)
+        return keys
 
 
 @lru_cache

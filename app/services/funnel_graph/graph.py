@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
@@ -36,6 +37,49 @@ TRANSITION_BRIDGES: dict[tuple[str, str], str] = {
     ("room_available_check", "equipment_phone_check"): "супер",
     ("equipment_phone_check", "interview_offer"): "нам подходит",
 }
+
+# Переходы сценария «скоро 18», которые НЕ обязаны проходить обычный gate
+# required-полей (кандидатке ещё нет 18 / стадия-пауза без полей).
+SOFT_AGE_TRANSITIONS: set[tuple[str, str]] = {
+    ("age_check", "age_pending_18"),
+    ("scheduled_until_18", "work_intro_delivery"),
+    ("scheduled_until_18", "age_check"),
+}
+
+# Тексты отложенных сообщений в день 18-летия (поздравление) и на след. день
+# (возврат к работе). Меняются здесь либо через knowledge/templates.json.
+BIRTHDAY_CONGRATS_TEXT = "с днём рождения!! 🎉🎂 теперь тебе 18 — поздравляю от всей души) пусть всё задуманное сбывается 💖"
+BIRTHDAY_WORK_FOLLOWUP_TEXT = "привет ещё раз) как и обещала — возвращаюсь по поводу работы в стриминге 🤩 теперь тебе уже можно, и я с радостью всё расскажу. готова продолжить?"
+
+
+def birthday_18_reached(profile: dict[str, Any], now: datetime | None = None) -> bool:
+    raw = profile.get("birthday_18_at")
+    if not raw:
+        return False
+    try:
+        when = datetime.fromisoformat(str(raw))
+    except ValueError:
+        return False
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return (now or datetime.now(UTC)) >= when
+
+
+def birthday_followup_action(state: FunnelGraphState) -> dict[str, Any] | None:
+    """Сформировать action на планирование 2 отложенных сообщений в день 18-летия:
+    поздравление в сам др и сообщение о работе на следующий день."""
+    profile = dict(state.get("candidate_profile") or {})
+    birthday_at = profile.get("birthday_18_at")
+    if not birthday_at:
+        return None
+    dialog_id = state.get("dialog_id") or "lead"
+    return {
+        "type": "schedule_birthday_followup",
+        "birthday_at": str(birthday_at),
+        "text": template_from_state(state, "birthday_congrats_message") or BIRTHDAY_CONGRATS_TEXT,
+        "caption": template_from_state(state, "birthday_work_followup_message") or BIRTHDAY_WORK_FOLLOWUP_TEXT,
+        "idempotency_key": f"birthday18:{dialog_id}",
+    }
 
 
 def build_funnel_graph(
@@ -262,15 +306,22 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
         and not semantic.has_unresolved_interrupt
         and stage_requirement_met(current_stage, profile)
     )
-    # A plain question (not an objection/refusal) at the salary/schedule offer means
-    # she is engaged: answer it and deliver the materials in the same turn instead of
-    # stalling on an explicit "yes". The voice pack's recording simulation gives the
-    # natural pause before the audio lands.
-    offer_question_voice_advance = (
-        current_stage == "salary_schedule_offer"
-        and semantic.has_unresolved_interrupt
-        and semantic.interrupt_type == "question"
-        and semantic.message_type not in {"do_not_contact", "hard_refusal", "objection"}
+    # At the salary/schedule offer we answer her questions/objections first and wait.
+    # Once she has no further question — a neutral ack like "понятно", any non-interrupt
+    # message, or the follow-up window elapses (timeout_event) — we deliver the voice
+    # materials instead of stalling forever on an explicit "yes".
+    metadata_in = dict(state.get("metadata") or {})
+    awaiting_offer_followup = current_stage == "salary_schedule_offer" and bool(
+        metadata_in.get("awaiting_interrupt_followup")
+    )
+    offer_deliver_voices = (
+        awaiting_offer_followup
+        and not semantic.has_unresolved_interrupt
+        and not handoff_required
+        and (
+            semantic.message_type not in {"empty", "do_not_contact", "hard_refusal", "soft_refusal"}
+            or state.get("timeout_event") == "interrupt_followup"
+        )
     )
 
     if semantic.message_type == "do_not_contact":
@@ -291,7 +342,25 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
         else:
             target_stage = current_stage
 
-    if offer_question_voice_advance and not handoff_required:
+    # --- Сценарий «скоро 18» ------------------------------------------------
+    if current_stage == "age_check" and profile.get("qualification_status") == "pending_18":
+        # Ещё нет 18, но скоро — спрашиваем дату рождения, не теряем.
+        target_stage = "age_pending_18"
+    elif current_stage == "age_pending_18" and profile.get("birthday_18_at"):
+        # Дата получена → пауза до 18-летия (отложенные сообщения запланирует executor).
+        target_stage = "scheduled_until_18"
+    elif current_stage == "scheduled_until_18" and semantic.message_type != "empty":
+        # Возобновляемся, только если 18-летие уже наступило; иначе тихо ждём.
+        if birthday_18_reached(profile):
+            profile["age_confirmed"] = True
+            profile["qualification_status"] = "age_ok"
+            target_stage = "work_intro_delivery"
+        else:
+            target_stage = "scheduled_until_18"
+            send_reply = False
+            outgoing = []
+
+    if offer_deliver_voices:
         profile["salary_schedule_interest"] = True
         target_stage = next_stage_if_requirement_met(current_stage, profile)
 
@@ -301,7 +370,12 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
     if not can_transition_via_completed_stages(current_stage, target_stage, profile):
         invalid_reason = f"transition_not_allowed:{current_stage}->{target_stage}"
         target_stage = current_stage
-    elif target_stage != current_stage and target_stage not in TERMINAL_STAGES and not stage_requirement_met(current_stage, profile):
+    elif (
+        target_stage != current_stage
+        and target_stage not in TERMINAL_STAGES
+        and (current_stage, target_stage) not in SOFT_AGE_TRANSITIONS
+        and not stage_requirement_met(current_stage, profile)
+    ):
         invalid_reason = f"stage_requirement_not_met:{current_stage}"
         target_stage = current_stage
 
@@ -313,12 +387,17 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
     elif target_stage == "human_handoff":
         if not outgoing:
             outgoing = [{"type": "text", "text": handoff_text(profile), "voice_pack_id": None}]
+    elif target_stage == "scheduled_until_18" and current_stage != "scheduled_until_18" and not outgoing:
+        outgoing = [{
+            "type": "text",
+            "text": template_from_state(state, "scheduled_until_18_message")
+            or "супер, тогда договорились) поздравлю тебя в твой др и сразу всё расскажу про работу 🎂 до связи!",
+            "voice_pack_id": None,
+        }]
+        send_reply = True
     elif get_stage_policy(target_stage).stage_type == "action":
-        # Action executor owns voice/template/smalltalk sends. Keep the interrupt
-        # answer when we advance the offer off a question, so she gets the reply
-        # first and the voices follow in the same turn.
-        if not offer_question_voice_advance:
-            outgoing = []
+        # Action executor owns voice/template/smalltalk sends.
+        outgoing = []
         send_reply = True
     elif target_stage != current_stage:
         if completed_by_fields:
@@ -337,7 +416,7 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
         metadata["controller_invalid_transition"] = invalid_reason
     metadata["previous_state"] = current_stage if target_stage != current_stage else state.get("previous_state")
     metadata["last_user_message"] = state.get("last_user_message")
-    if semantic.has_unresolved_interrupt and not offer_question_voice_advance:
+    if semantic.has_unresolved_interrupt:
         metadata["last_interrupt_type"] = semantic.interrupt_type
         metadata["last_interrupt_topic"] = semantic.interrupt_topic
         metadata["resume_state"] = current_stage
@@ -348,6 +427,11 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
             metadata["interrupt_followup_question"] = policy.current_question
             metadata["interrupt_followup_started_at"] = datetime.now(UTC).isoformat()
             metadata["interrupt_followup_timeout_seconds"] = 120
+        # Любое несогласие (деньги/«есть работа»/«не интересует») отрабатывается
+        # возражением РОВНО раз; помечаем, чтобы повторный отказ ушёл в lost, а не
+        # крутил питч по кругу. См. [[soft-decline-objection-once]].
+        if semantic.interrupt_topic in {"soft_decline_income", "already_employed"}:
+            metadata["soft_decline_rebutted"] = True
     elif target_stage != current_stage:
         metadata["last_interrupt_type"] = None
         metadata["last_interrupt_topic"] = None
@@ -588,6 +672,34 @@ def graph_total_latency_ms(started_at: Any) -> int | None:
     return max(0, int((datetime.now(UTC) - started).total_seconds() * 1000))
 
 
+# Leading greeting we only ever say once, in the first-touch opener. If the LLM
+# (or a template) re-greets on a later turn, we strip it so the candidate never
+# gets a second "привет".
+_GREETING_PREFIX = re.compile(
+    r"^\s*(привет(ик|ствую)?|здравствуй(те)?|здаров(а)?|доброе\s+утро"
+    r"|добрый\s+(день|вечер)|доброго\s+времени[^,.!?]*|хай+|хеллоу?|хелло|йоу|ку)"
+    r"\b[\s,.!?)…—–-]*",
+    re.IGNORECASE,
+)
+
+
+def dialog_has_prior_agent_message(state: FunnelGraphState) -> bool:
+    history = list(state.get("conversation_history") or []) + list(state.get("recent_messages") or [])
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        direction = str(item.get("direction") or "").lower()
+        sender = str(item.get("sender_type") or "").lower()
+        if direction == "outbound" or sender in {"agent", "bot", "recruiter"}:
+            return True
+    return False
+
+
+def strip_redundant_greeting(text: str) -> str:
+    stripped = _GREETING_PREFIX.sub("", text, count=1).lstrip()
+    return stripped or text
+
+
 def normalize_outgoing_message(message: Any) -> dict[str, Any]:
     if hasattr(message, "model_dump"):
         message = message.model_dump()
@@ -661,21 +773,29 @@ def pending_actions_from_outgoing(state: FunnelGraphState, outgoing: list[dict[s
         return []
     actions = []
     normalized_outgoing = [normalize_outgoing_message(message) for message in outgoing]
+    drop_greeting = dialog_has_prior_agent_message(state)
     reply_group_id = build_reply_group_id(state, normalized_outgoing)
     group_size = outgoing_action_count(state, normalized_outgoing)
     group_index = 0
     cumulative_delay_seconds = 0
     for index, message in enumerate(normalized_outgoing):
         if message.get("type") == "voice_pack":
+            # Все голосовые пака планируем на ОДИН момент (общий base delay), чтобы
+            # outbound-воркер забрал их в одном батче и отправил подряд за один цикл,
+            # как настоящий «пак». Реалистичную паузу записи между ними даёт сам
+            # воркер (recording_delay симулируется при отправке) — не надо разносить
+            # их по scheduled_at, иначе при ~минутных циклах поллинга пак растягивается
+            # и второе голосовое уезжает в следующий цикл.
+            pack_base_delay = cumulative_delay_seconds
             for voice_index, item in enumerate(voice_pack_action_items(state, str(message.get("voice_pack_id") or ""))):
                 group_index += 1
-                delay_seconds = int(item.get("delay_seconds") if item.get("delay_seconds") is not None else cumulative_delay_seconds)
+                delay_seconds = int(item.get("delay_seconds") if item.get("delay_seconds") is not None else pack_base_delay)
                 recording_delay_seconds = item.get("recording_delay_seconds")
                 actions.append(
                     {
                         "type": "send_voice",
                         "media_path": item.get("media_path"),
-                        "caption": item.get("caption") or f"[voice_pack: {message.get('voice_pack_id')}]",
+                        "caption": item.get("caption") or "",
                         "recording_delay_seconds": recording_delay_seconds,
                         "duration_seconds": item.get("duration_seconds"),
                         "delay_seconds": delay_seconds,
@@ -688,13 +808,16 @@ def pending_actions_from_outgoing(state: FunnelGraphState, outgoing: list[dict[s
                         ),
                     }
                 )
-                cumulative_delay_seconds = max(
-                    cumulative_delay_seconds,
-                    delay_seconds + int(float(recording_delay_seconds or 0)),
-                )
+            # Хвостовой вопрос после пака — в тот же батч/цикл (тот же base delay).
+            cumulative_delay_seconds = pack_base_delay
             continue
         if message.get("type") != "text" or not message.get("text"):
             continue
+        if drop_greeting:
+            cleaned = strip_redundant_greeting(str(message["text"]))
+            if not cleaned.strip():
+                continue
+            message["text"] = cleaned
         group_index += 1
         delay_seconds = message.get("delay_seconds")
         if delay_seconds is None:
@@ -717,6 +840,10 @@ def pending_actions_from_outgoing(state: FunnelGraphState, outgoing: list[dict[s
         actions.append({"type": "close_lost", "reason": "candidate_refused"})
     elif state.get("stage") == "human_handoff":
         actions.append({"type": "handoff", "reason": "funnel_requested_handoff"})
+    elif state.get("stage") == "scheduled_until_18":
+        birthday_action = birthday_followup_action(state)
+        if birthday_action:
+            actions.append(birthday_action)
     followup_action = interrupt_followup_action(state)
     if followup_action:
         actions.append(followup_action)
@@ -741,13 +868,13 @@ def voice_pack_action_items(state: FunnelGraphState, voice_pack_id: str) -> list
             if isinstance(raw_item, dict):
                 item = dict(raw_item)
             else:
-                item = {"id": str(raw_item), "caption": f"[voice] {raw_item}"}
+                item = {"id": str(raw_item), "caption": ""}
             if item.get("media_path"):
                 item.setdefault("recording_delay_seconds", 40)
             items.append(item)
     if items:
         return items
-    return [{"id": voice_pack_id, "caption": f"[voice_pack: {voice_pack_id}]"}]
+    return [{"id": voice_pack_id, "caption": ""}]
 
 
 def text_typing_delay_range(state: FunnelGraphState) -> tuple[float, float]:

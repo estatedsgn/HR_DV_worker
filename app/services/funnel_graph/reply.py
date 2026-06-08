@@ -640,11 +640,40 @@ def stage_question_like(stage: str, text: str) -> bool:
     return False
 
 
+def has_prior_agent_message(state: FunnelGraphState) -> bool:
+    history = list(state.get("conversation_history") or []) + list(state.get("recent_messages") or [])
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        direction = str(item.get("direction") or "").lower()
+        sender = str(item.get("sender_type") or "").lower()
+        if direction == "outbound" or sender in {"agent", "bot", "recruiter"}:
+            return True
+    return False
+
+
 def deterministic_reply(state: FunnelGraphState) -> ReplyResult:
     semantic = SemanticResult.model_validate(state.get("semantic_result") or {})
     stage = str(state.get("stage") or "interest_check")
     current_question = str(state.get("pending_question_text") or state.get("current_question") or "")
     templates = dict((state.get("metadata") or {}).get("templates") or {})
+
+    # Первый контакт (мы ещё ни разу не писали в диалог): кто бы ни написал первым
+    # — «привет», вопрос, что угодно — открываем тем же first-touch опенером, что и
+    # все остальные лиды, а не вопросом из середины воронки. Исключение —
+    # явная просьба не писать.
+    if (
+        stage == "interest_check"
+        and not has_prior_agent_message(state)
+        and semantic.message_type != "do_not_contact"
+    ):
+        first_touch = str(
+            (state.get("retrieved_knowledge") or {}).get("first_touch_message")
+            or templates.get("first_touch_message")
+            or ""
+        )
+        if first_touch:
+            return text_reply(first_touch, "first touch (inbound-first contact)")
 
     if semantic.message_type == "empty":
         timeout_reply = interrupt_timeout_reply(state)
@@ -719,10 +748,10 @@ def question_variants(question: str) -> list[str]:
             "если вопросиков больше нет, можем двигаться дальше",
             "ещё что-то хочешь уточнить по условиям или формату?",
         ],
-        "рассказать подробнее?": [
-            "рассказать?",
-            "хочешь, запишу тебе голосовое с условиями?",
-            "могу рассказать про условия и график, интересно?",
+        "давай расскажу поподробнее?": [
+            "давай расскажу поподробнее?",
+            "если интересно, могу рассказать про условия и график",
+            "напомню: готова рассказать про условия и график, тебе интересно?",
         ],
         "какая у тебя моделька телефончика?": [
             "классно, что с оборудованием уже есть база) для старта всё равно нужна моделька телефончика — какая у тебя?",

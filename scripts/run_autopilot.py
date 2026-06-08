@@ -5,13 +5,17 @@ import asyncio
 import os
 import sys
 from datetime import UTC, datetime
+from uuid import UUID
 
 from sqlalchemy import func, select, update
 
+from app.core.config import get_settings
 from app.db.session import AsyncSessionLocal
 from app.models.account import Account
 from app.models.dialog import Dialog
 from app.models.funnel_graph import LeadFunnelRuntime
+from app.models.lead_intake_event import LeadIntakeEvent
+from app.repositories.account import AccountRepository
 from app.services.account_sync import AccountSyncService
 from app.services.campaign_sequence import CampaignSequenceService
 from app.services.crmchat_connector import CRMChatAPIError, CRMChatConnector
@@ -25,7 +29,26 @@ def parse_args() -> argparse.Namespace:
         description="Run the full HR DV worker loop: poll, inbound, LLM recovery, outbound."
     )
     parser.add_argument("--all-accounts", action="store_true", help="Poll every active Telegram account.")
+    parser.add_argument(
+        "--account",
+        default=None,
+        help=(
+            "Scope the whole loop to one account (UUID / CRMchat id / @username): "
+            "use its own CRMchat key, poll only it, and only claim its inbound/"
+            "outbound jobs. This is how each per-account process runs."
+        ),
+    )
     parser.add_argument("--only-username", help="Only sync one username, for example @iamnekiy.")
+    parser.add_argument(
+        "--leads-only",
+        action="store_true",
+        help=(
+            "Scope polling and inbound to active funnel leads (dialogs with a "
+            "LeadFunnelRuntime) plus the username allowlist. Avoids walking every "
+            "dialog of the account each cycle (one get_history call per lead, not 20+). "
+            "Refreshed every cycle, so new Дайвинчик leads are picked up automatically."
+        ),
+    )
     parser.add_argument(
         "--mark-read",
         action="store_true",
@@ -73,13 +96,30 @@ async def main() -> None:
         print("autopilot refused to start: pass --allow-real-send to send Telegram messages")
         raise SystemExit(2)
 
+    # Per-account mode: resolve once, then every cycle talks to CRMchat with this
+    # account's own key and only touches this account's dialogs/jobs.
+    account = None
+    account_id: str | None = None
+    if args.account:
+        async with AsyncSessionLocal() as session:
+            account = await AccountRepository(session).get_by_reference(args.account)
+        if account is None:
+            print(f"autopilot: account not found: {args.account!r}")
+            raise SystemExit(2)
+        account_id = str(account.id)
+        print(f"autopilot scoped to account={account.telegram_username or account.crmchat_account_id} id={account_id}")
+
     cycle = 0
+    only_dialog_ids: list[str] | None = None
     while True:
         cycle += 1
         started = datetime.now(UTC)
         sleep_seconds = args.poll_interval_seconds
         try:
-            async with CRMChatConnector() as connector:
+            connector = (
+                CRMChatConnector.for_account(account) if account is not None else CRMChatConnector()
+            )
+            async with connector:
                 async with AsyncSessionLocal() as session:
                     if cycle == 1 or cycle % max(1, args.sync_accounts_every) == 0:
                         sync = await AccountSyncService(session, connector=connector).sync_active_accounts()
@@ -90,19 +130,38 @@ async def main() -> None:
                     if args.test_fast_pacing_seconds is not None:
                         await set_fast_pacing(session, args.test_fast_pacing_seconds)
 
+                    # Скоуп на лидов воронки: пересобираем каждый цикл, чтобы новые
+                    # лиды подхватывались, а мусорные диалоги не поллились.
+                    lead_usernames: set[str] | None = None
+                    if args.leads_only:
+                        only_dialog_ids, lead_usernames = await resolve_lead_scope(
+                            session, account_id=account_id
+                        )
+
                     polling = TelegramPollingService(
                         session,
                         connector=connector,
                         only_username=args.only_username,
+                        only_usernames=lead_usernames,
                         mark_read=args.mark_read_on_poll,
                     )
+                    # In per-account mode poll just this account (the connector is
+                    # already bound to its key); --all-accounts is for the legacy
+                    # single-key, many-telegram-accounts setup only.
                     poll_result = (
                         await polling.poll_all_active_accounts_once()
-                        if args.all_accounts
+                        if args.all_accounts and account is None
                         else await polling.poll_once()
                     )
+                    # Узкий автопилот (--only-username) читает из inbound-очереди
+                    # только свой диалог, не вычитывая чужие/мусорные события.
+                    if args.only_username and not args.leads_only and only_dialog_ids is None:
+                        only_dialog_ids = await resolve_dialog_ids(session, args.only_username)
+                    scope_tag = account_id or args.only_username or "all"
                     inbound_result = await InboundQueueWorker(
-                        session, lease_owner="autopilot-inbound"
+                        session,
+                        lease_owner=f"autopilot-inbound:{scope_tag}",
+                        only_dialog_ids=only_dialog_ids,
                     ).process_queued_batch(limit=args.inbound_limit)
                     recovery_result = await CampaignSequenceService(session).recover_stale_runs(
                         older_than_seconds=args.recover_older_than_seconds
@@ -110,9 +169,10 @@ async def main() -> None:
                     outbound_result = await OutboundQueueWorker(
                         session,
                         connector=connector,
-                        lease_owner="autopilot-outbound",
+                        lease_owner=f"autopilot-outbound:{scope_tag}",
                         allow_real_send=True,
                         typing_delay_seconds=args.typing_delay_seconds,
+                        account_id=account_id,
                     ).process_queued_batch(limit=args.outbound_limit)
                     metrics = await latest_model_metrics(session, args.only_username)
 
@@ -147,6 +207,76 @@ async def set_fast_pacing(session, seconds: int) -> None:
         )
     )
     await session.commit()
+
+
+async def resolve_dialog_ids(session, username: str) -> list[str] | None:
+    """Срезолвить username в id канонических telegram-диалогов (для скоупа inbound)."""
+    normalized = username.strip().lower().lstrip("@")
+    result = await session.execute(
+        select(Dialog.id).where(
+            func.lower(func.replace(Dialog.telegram_username, "@", "")) == normalized,
+            Dialog.crmchat_dialog_id.like("telegram:%"),
+        )
+    )
+    ids = [str(row[0]) for row in result.fetchall()]
+    return ids or None
+
+
+async def resolve_lead_scope(
+    session, account_id: str | None = None
+) -> tuple[list[str] | None, set[str] | None]:
+    """Собрать КУРИРУЕМЫЙ скоуп лидов воронки для текущего цикла.
+
+    Возвращает (dialog_ids, usernames). Скоуп = реальные лиды, которых мы ведём:
+      * username-allowlist (`OUTBOUND_ALLOWED_USERNAMES`) — ручные тест-лиды;
+      * лиды из разрешённых источников интейка (`OUTBOUND_ALLOWED_INTAKE_SOURCES`,
+        напр. daivinchik) — подхватываются динамически, как только заведены.
+
+    Намеренно НЕ берём «все диалоги с runtime»: мусорные демо-диалоги CRMChat
+    (`*_crm` и пр.) тоже могли получить runtime в старом unscoped-прогоне, и их
+    история не должна тянуться каждый цикл (по одному get_history на диалог).
+    """
+    settings = get_settings()
+    allow = [u.strip() for u in settings.outbound_allowed_usernames.split(",") if u.strip()]
+    allow_norm = {u.lstrip("@").lower() for u in allow}
+
+    # Per-account scope: only this account's intake leads / dialogs, so account A's
+    # process never polls or messages account B's leads.
+    account_uuid = UUID(account_id) if account_id else None
+
+    sources = [s.strip() for s in settings.outbound_allowed_intake_sources.split(",") if s.strip()]
+    wanted = set(allow_norm)
+    if sources:
+        intake_filters = [
+            LeadIntakeEvent.source.in_(sources),
+            LeadIntakeEvent.telegram_username.isnot(None),
+        ]
+        if account_uuid is not None:
+            intake_filters.append(LeadIntakeEvent.account_id == account_uuid)
+        rows = await session.execute(
+            select(func.lower(func.replace(LeadIntakeEvent.telegram_username, "@", "")))
+            .where(*intake_filters)
+        )
+        wanted.update(value for (value,) in rows.fetchall() if value)
+
+    dialog_ids: set[str] = set()
+    usernames: set[str] = set(allow)  # allowlisted — даже если диалога ещё нет (для опенера)
+    if wanted:
+        dialog_filters = [
+            func.lower(func.replace(Dialog.telegram_username, "@", "")).in_(list(wanted)),
+            Dialog.crmchat_dialog_id.like("telegram:%"),
+        ]
+        if account_uuid is not None:
+            dialog_filters.append(Dialog.account_id == account_uuid)
+        rows = await session.execute(
+            select(Dialog.id, Dialog.telegram_username).where(*dialog_filters)
+        )
+        for did, uname in rows.fetchall():
+            dialog_ids.add(str(did))
+            if uname:
+                usernames.add(uname)
+
+    return (list(dialog_ids) or None, usernames or None)
 
 
 async def latest_model_metrics(session, username: str | None) -> str:

@@ -40,17 +40,26 @@ class DeferredInboundEvent(Exception):
 
 
 class InboundQueueWorker:
-    def __init__(self, session: AsyncSession, *, lease_owner: str = "worker", lease_seconds: int = 60) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        *,
+        lease_owner: str = "worker",
+        lease_seconds: int = 60,
+        only_dialog_ids: list[str] | None = None,
+    ) -> None:
         self.session = session
         self.repository = InboundEventRepository(session)
         self.lease_owner = lease_owner
         self.lease_seconds = lease_seconds
+        self.only_dialog_ids = only_dialog_ids
 
     async def process_queued_batch(self, *, limit: int = 100) -> InboundQueueBatchResult:
         events = await self.repository.claim_ready_batch(
             lease_owner=self.lease_owner,
             limit=limit,
             lease_seconds=self.lease_seconds,
+            dialog_ids=self.only_dialog_ids,
         )
         logger.info(
             "claimed inbound queue batch",

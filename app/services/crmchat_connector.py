@@ -4,11 +4,14 @@ import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from app.core.config import Settings, get_settings
+
+if TYPE_CHECKING:
+    from app.models.account import Account
 
 CRMCHAT_TELEGRAM_ALLOWED_METHODS = frozenset(
     {
@@ -22,6 +25,7 @@ CRMCHAT_TELEGRAM_ALLOWED_METHODS = frozenset(
         "messages.sendMessage",
         "messages.sendMedia",
         "messages.editMessage",
+        "messages.getBotCallbackAnswer",
         "upload.saveFilePart",
     }
 )
@@ -142,25 +146,56 @@ class CRMChatConnector:
         settings: Settings | None = None,
         http_client: httpx.AsyncClient | None = None,
         allowed_methods: frozenset[str] = CRMCHAT_TELEGRAM_ALLOWED_METHODS,
+        *,
+        base_url: str | None = None,
+        api_key: str | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.allowed_methods = allowed_methods
+        # Per-account overrides: when an Account carries its own CRMchat base url
+        # and bearer key, the connector authenticates as that account. Falls back
+        # to the global .env CRMCHAT_* settings when not supplied.
+        self._base_url_override = base_url
+        self._api_key_override = api_key
         self._owns_http_client = http_client is None
         self.http_client = http_client or self._build_http_client()
 
+    @classmethod
+    def for_account(
+        cls,
+        account: "Account",
+        *,
+        settings: Settings | None = None,
+        allowed_methods: frozenset[str] = CRMCHAT_TELEGRAM_ALLOWED_METHODS,
+    ) -> "CRMChatConnector":
+        """Build a connector authenticated with this account's own credentials.
+
+        Each Дайвинчик account is a separate CRMchat connection (its own bearer
+        key). When the account has no stored credentials the connector falls back
+        to the global settings, preserving the original single-account behaviour.
+        """
+        return cls(
+            settings=settings,
+            allowed_methods=allowed_methods,
+            base_url=account.crmchat_api_base_url or None,
+            api_key=account.crmchat_api_key or None,
+        )
+
     def _build_http_client(self) -> httpx.AsyncClient:
-        if not self.settings.crmchat_api_base_url:
+        base_url = self._base_url_override or self.settings.crmchat_api_base_url
+        api_key = self._api_key_override or self.settings.crmchat_api_key
+        if not base_url:
             raise CRMChatConfigurationError(
                 "CRMCHAT_API_BASE_URL is required for CRMchat API calls"
             )
-        if not self.settings.crmchat_api_key:
+        if not api_key:
             raise CRMChatConfigurationError(
                 "CRMCHAT_API_KEY is required for CRMchat API calls"
             )
 
         return httpx.AsyncClient(
-            base_url=self.settings.crmchat_api_base_url,
-            headers={"Authorization": f"Bearer {self.settings.crmchat_api_key}"},
+            base_url=base_url,
+            headers={"Authorization": f"Bearer {api_key}"},
             timeout=self.settings.crmchat_timeout_seconds,
         )
 
@@ -467,6 +502,27 @@ class CRMChatConnector:
             account_id,
             "messages.sendMessage",
             {"peer": dict(peer), "message": message, "randomId": str(random_id)},
+        )
+
+    async def get_bot_callback_answer(
+        self,
+        workspace_id: str,
+        account_id: str,
+        peer: Mapping[str, Any],
+        message_id: int | str,
+        data: str,
+    ) -> Mapping[str, Any]:
+        """Press an inline keyboard button (keyboardButtonCallback).
+
+        ``data`` is the button's callback payload exactly as returned by
+        messages.getHistory (base64-encoded bytes). Pressing the button is what
+        Telegram clients do under the hood when a user taps an inline button.
+        """
+        return await self.call_telegram_method(
+            workspace_id,
+            account_id,
+            "messages.getBotCallbackAnswer",
+            {"peer": dict(peer), "msgId": int(message_id), "data": data},
         )
 
     async def set_voice_recording(

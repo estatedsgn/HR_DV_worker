@@ -25,6 +25,8 @@ CANDIDATE_PROFILE_FIELDS: tuple[str, ...] = (
     "interest_status",
     "age",
     "age_confirmed",
+    "birthday",
+    "birthday_18_at",
     "salary_schedule_interest",
     "questions_resolved",
     "profile_info",
@@ -52,7 +54,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "interest_check": StagePolicy(
         name="interest_check",
         goal="Понять, есть ли у кандидатки интерес узнать подробности.",
-        current_question="рассказать подробнее?",
+        current_question="давай расскажу поподробнее?",
         required_fields=("interest_confirmed",),
         next_stage_if_completed="age_check",
         allowed_transitions=("interest_check", "age_check", "lost", "do_not_contact", "human_handoff"),
@@ -64,7 +66,29 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
         current_question="давай для начала уточним небольшую формальность, сколько тебе лет?",
         required_fields=("age_confirmed",),
         next_stage_if_completed="work_intro_delivery",
-        allowed_transitions=("age_check", "work_intro_delivery", "lost", "do_not_contact", "human_handoff"),
+        allowed_transitions=("age_check", "work_intro_delivery", "age_pending_18", "lost", "do_not_contact", "human_handoff"),
+        stage_type="waiting",
+    ),
+    # Кандидатке ещё нет 18, но скоро исполнится — не теряем её, а спрашиваем дату
+    # рождения, чтобы вернуться с поздравлением и предложением в день 18-летия.
+    "age_pending_18": StagePolicy(
+        name="age_pending_18",
+        goal="Узнать дату рождения, чтобы вернуться в день 18-летия.",
+        current_question="оо, ну тогда тебе ещё нет 18) но это вообще не проблема — напишу тебе сразу, как только можно будет 🎂 подскажи, когда у тебя день рождения?",
+        required_fields=("birthday_18_at",),
+        next_stage_if_completed="scheduled_until_18",
+        allowed_transitions=("age_pending_18", "scheduled_until_18", "lost", "do_not_contact", "human_handoff"),
+        stage_type="waiting",
+    ),
+    # Пауза до 18-летия: отложенные сообщения (поздравление в др + работа на след.
+    # день) уже запланированы. Возобновляемся, когда кандидатка пишет после др.
+    "scheduled_until_18": StagePolicy(
+        name="scheduled_until_18",
+        goal="Ждём 18-летия кандидатки; поздравление и оффер запланированы.",
+        current_question=None,
+        required_fields=(),
+        next_stage_if_completed=None,
+        allowed_transitions=("scheduled_until_18", "work_intro_delivery", "age_check", "lost", "do_not_contact", "human_handoff"),
         stage_type="waiting",
     ),
     "work_intro_delivery": StagePolicy(
@@ -297,6 +321,11 @@ def stage_requirement_met(stage: str, profile: dict[str, Any]) -> bool:
         return profile.get("interest_confirmed") is True
     if stage == "age_check":
         return profile.get("age_confirmed") is True and int(profile.get("age") or 0) >= 18
+    if stage == "age_pending_18":
+        return bool(profile.get("birthday_18_at"))
+    if stage == "scheduled_until_18":
+        # Возобновление управляется контроллером по дате 18-летия, не авто-переходом.
+        return False
     if stage == "salary_schedule_offer":
         return profile.get("salary_schedule_interest") is True
     if stage == "post_equipment_questions_check":

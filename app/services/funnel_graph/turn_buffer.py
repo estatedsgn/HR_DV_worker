@@ -101,6 +101,9 @@ class FunnelTurnBufferService:
                 # Never break an in-flight voice pack: let the current pack finish,
                 # we react to the candidate's message on the next turn.
                 OutboundJob.job_type != "voice",
+                # Never cancel a scheduled birthday/18+ follow-up just because she
+                # writes again before the date — it must survive until it's due.
+                OutboundJob.media_metadata.op("->>")("scheduled_followup").is_distinct_from("true"),
             )
         )
         cancelled = 0

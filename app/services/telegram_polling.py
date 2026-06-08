@@ -57,6 +57,7 @@ class TelegramPollingService:
         connector: CRMChatConnector | None = None,
         settings: Settings | None = None,
         only_username: str | None = None,
+        only_usernames: set[str] | None = None,
         mark_read: bool | None = None,
     ) -> None:
         self.session = session
@@ -64,6 +65,14 @@ class TelegramPollingService:
         self.connector = connector or CRMChatConnector(settings=self.settings)
         self.inbound_pipeline = InboundPipelineService(session)
         self.only_username = normalize_username(only_username) if only_username else None
+        # Множество юзернеймов, которые разрешено поллить (скоуп на лидов воронки).
+        # Если задано — историю тянем ТОЛЬКО по этим диалогам, не обходя все 20+
+        # чужих/мусорных диалогов аккаунта (каждый = отдельный get_history-вызов).
+        self.only_usernames = (
+            {u for u in (normalize_username(v) for v in only_usernames) if u}
+            if only_usernames
+            else None
+        )
         self.mark_read = (
             self.settings.telegram_mark_read_after_poll
             if mark_read is None
@@ -132,7 +141,7 @@ class TelegramPollingService:
         run.dialogs_seen = len(dialogs)
 
         for dialog_snapshot in dialogs:
-            if not should_sync_dialog(dialog_snapshot, self.only_username):
+            if not should_sync_dialog(dialog_snapshot, self.only_username, self.only_usernames):
                 continue
             synced, seen, created = await self._sync_dialog(
                 context, account, dialog_snapshot
@@ -366,11 +375,16 @@ def initial_dialog_status(dialog_snapshot: TelegramDialogSnapshot) -> str:
 
 
 def should_sync_dialog(
-    dialog_snapshot: TelegramDialogSnapshot, only_username: str | None = None
+    dialog_snapshot: TelegramDialogSnapshot,
+    only_username: str | None = None,
+    only_usernames: set[str] | None = None,
 ) -> bool:
+    username = normalize_username(dialog_snapshot.peer.username)
+    if only_usernames is not None:
+        return username is not None and username in only_usernames
     if only_username is None:
         return True
-    return normalize_username(dialog_snapshot.peer.username) == normalize_username(only_username)
+    return username == normalize_username(only_username)
 
 
 def normalize_username(value: str | None) -> str | None:

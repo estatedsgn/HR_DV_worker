@@ -18,8 +18,12 @@ class FunnelMessage(BaseModel):
 class FunnelAction(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    type: Literal["send_text", "send_voice", "handoff", "close_lost", "do_not_contact"] = "send_text"
+    type: Literal[
+        "send_text", "send_voice", "handoff", "close_lost", "do_not_contact",
+        "schedule_birthday_followup",
+    ] = "send_text"
     idempotency_key: str | None = None
+    birthday_at: str | None = None
     reply_group_id: str | None = None
     reply_group_index: int | None = None
     reply_group_size: int | None = None

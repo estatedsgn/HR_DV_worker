@@ -8,6 +8,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from app.core.config import Settings
 from app.models.dialog import Dialog
 from app.models.funnel_graph import LeadFunnelRuntime
+from app.models.human_handoff import HumanHandoff
 from app.models.lead import Lead
 from app.models.outbound_job import OutboundJob
 from app.services.funnel_graph.actions import FunnelActionExecutor
@@ -24,7 +25,13 @@ from app.services.funnel_graph.reply import (
     reply_llm_payload,
     sanitize_reply_result,
 )
-from app.services.funnel_graph.semantic import SemanticResult, deterministic_semantic, merge_deterministic_facts
+from app.services.funnel_graph.semantic import (
+    SemanticResult,
+    deterministic_semantic,
+    extract_birthday_18_at,
+    is_turning_18_soon,
+    merge_deterministic_facts,
+)
 from app.services.funnel_graph.turn_buffer import FunnelTurnBufferService, is_before_reset_baseline
 from scripts.annotate_dialogue_examples import parse_dialogues
 
@@ -74,13 +81,13 @@ def test_interest_question_is_interrupt_and_repeats_current_question() -> None:
     assert state["stage"] == "interest_check"
     assert state["candidate_profile"]["interest_confirmed"] is None
     assert "Контакт мог" in state["reply_text"]
-    assert "рассказать подробнее?" not in state["reply_text"]
+    assert "давай расскажу поподробнее?" not in state["reply_text"]
     assert state["metadata"]["awaiting_interrupt_followup"] is True
-    assert state["metadata"]["interrupt_followup_question"] == "рассказать подробнее?"
+    assert state["metadata"]["interrupt_followup_question"] == "давай расскажу поподробнее?"
     delayed = delayed_followup_actions(state)
     assert len(delayed) == 1
     assert delayed[0]["delay_seconds"] == 120
-    assert delayed[0]["text"] == "рассказать?"
+    assert delayed[0]["text"] == "давай расскажу поподробнее?"
 
 
 def test_interest_job_question_does_not_move_to_age() -> None:
@@ -89,7 +96,7 @@ def test_interest_job_question_does_not_move_to_age() -> None:
     assert state["stage"] == "interest_check"
     assert state["candidate_profile"]["interest_confirmed"] is None
     assert "Сколько тебе лет?" not in state["reply_text"]
-    assert "рассказать подробнее?" not in state["reply_text"]
+    assert "давай расскажу поподробнее?" not in state["reply_text"]
     assert state["metadata"]["awaiting_interrupt_followup"] is True
 
 
@@ -113,6 +120,56 @@ def test_phone_model_number_at_age_check_is_not_read_as_underage() -> None:
     assert state["candidate_profile"]["qualification_status"] != "underage"
 
 
+def test_turning_18_soon_detection_and_birthday_parsing() -> None:
+    from datetime import UTC, datetime
+
+    assert is_turning_18_soon("через несколько дней 18") is True
+    assert is_turning_18_soon("скоро будет 18") is True
+    assert is_turning_18_soon("мне 25") is False
+
+    now = datetime(2026, 6, 7, tzinfo=UTC)
+    assert extract_birthday_18_at("через 3 дня", now).date().isoformat() == "2026-06-10"
+    by_month = extract_birthday_18_at("15 июня", now)
+    assert (by_month.month, by_month.day) == (6, 15)
+    # дата уже прошла в этом году -> переносится на следующий
+    assert extract_birthday_18_at("1 января", now).year == 2027
+
+
+def test_age_17_routes_to_pending_18_and_asks_birthday() -> None:
+    state = run_graph(
+        initial_state(stage="age_check", profile={"interest_confirmed": True}),
+        "мне 17, но скоро будет 18",
+    )
+
+    assert state["stage"] == "age_pending_18"
+    assert state["candidate_profile"]["age_confirmed"] is False
+    assert "день рождения" in (state["reply_text"] or "")
+
+
+def test_age_pending_18_captures_birthday_and_schedules_followups() -> None:
+    state = run_graph(
+        initial_state(stage="age_pending_18", profile={"interest_confirmed": True}),
+        "15 июня",
+    )
+
+    assert state["stage"] == "scheduled_until_18"
+    assert state["candidate_profile"]["birthday_18_at"]
+    reply = (state["reply_text"] or "").lower()
+    assert "др" in reply or "поздравл" in reply
+    schedule = [a for a in (state.get("pending_actions") or []) if a.get("type") == "schedule_birthday_followup"]
+    assert len(schedule) == 1
+    assert schedule[0]["birthday_at"]
+
+
+def test_age_under_17_still_goes_to_lost() -> None:
+    state = run_graph(
+        initial_state(stage="age_check", profile={"interest_confirmed": True}),
+        "мне 15",
+    )
+
+    assert state["stage"] == "lost"
+
+
 def test_age_answer_sends_work_intro_pack_and_salary_offer() -> None:
     state = run_graph(initial_state(stage="age_check", profile={"interest_confirmed": True}), "18")
 
@@ -134,6 +191,64 @@ def test_salary_offer_question_is_interrupt() -> None:
     assert "не OnlyFans" in state["reply_text"]
     assert "если интересна наша сфера, давай расскажу про зп и график 🐬" not in state["reply_text"]
     assert state["metadata"]["awaiting_interrupt_followup"] is True
+
+
+def test_not_interested_has_job_is_rebutted_once_not_lost() -> None:
+    # «не интересует, у меня есть работа» раньше падало в unclear/мгновенный отказ.
+    # Теперь это возражение already_employed: отрабатываем углом совмещения, диалог
+    # остаётся на месте, а не уходит в lost.
+    result = deterministic_semantic(
+        initial_state(stage="interest_check") | {"incoming_message": "не интересует, у меня есть работа"}
+    )
+
+    assert result.message_type == "objection"
+    assert result.interrupt_topic == "already_employed"
+    assert result.has_unresolved_interrupt is True
+
+
+def test_not_interested_short_is_rebutted_once() -> None:
+    result = deterministic_semantic(
+        initial_state(stage="interest_check") | {"incoming_message": "не интересует"}
+    )
+
+    assert result.message_type == "objection"
+    assert result.interrupt_topic == "soft_decline_income"
+
+
+def test_repeated_decline_after_rebuttal_goes_to_refusal() -> None:
+    result = deterministic_semantic(
+        initial_state(stage="interest_check")
+        | {"incoming_message": "всё равно не интересует", "metadata": {"soft_decline_rebutted": True}}
+    )
+
+    assert result.message_type == "hard_refusal"
+
+
+def test_has_job_objection_runs_funnel_and_stays_then_lost_on_repeat() -> None:
+    first = run_graph(initial_state(stage="interest_check"), "спасибо, у меня уже есть работа")
+    assert first["stage"] == "interest_check"
+    assert first["metadata"].get("soft_decline_rebutted") is True
+    assert first["semantic_result"]["interrupt_topic"] == "already_employed"
+
+    second = run_graph(
+        initial_state(stage="interest_check", profile=None)
+        | {"metadata": {"soft_decline_rebutted": True}},
+        "нет, не интересно",
+    )
+    assert second["stage"] == "lost"
+
+
+def test_meet_in_person_request_is_answered_not_deflected() -> None:
+    state = run_graph(
+        initial_state(stage="interest_check"),
+        "А ты не хочешь встретиться в реальности и поговорить об этом?",
+    )
+
+    assert state["stage"] == "interest_check"
+    assert state["semantic_result"]["interrupt_topic"] == "meet_in_person"
+    reply = (state["reply_text"] or "").lower()
+    assert "вживую" in reply or "онлайн" in reply
+    assert "точных данных" not in reply
 
 
 def test_interested_but_english_concern_is_not_refusal() -> None:
@@ -205,32 +320,59 @@ def test_salary_agreement_sends_salary_pack_and_asks_any_questions() -> None:
     assert text_messages(state) == ["остались ли у тебя какие-нибудь ещё вопросики?"]
 
 
-def test_salary_offer_question_answers_then_sends_pack_same_turn() -> None:
+def _salary_offer_awaiting_state():
+    state = initial_state(
+        stage="salary_schedule_offer",
+        profile={"interest_confirmed": True, "age_confirmed": True},
+    )
+    state["metadata"] = {
+        "awaiting_interrupt_followup": True,
+        "interrupt_followup_stage": "salary_schedule_offer",
+        "interrupt_followup_question": "если интересна наша сфера, давай расскажу про зп и график 🐬",
+    }
+    return state
+
+
+def test_salary_offer_question_is_answered_and_waits() -> None:
+    # First interrupt turn: answer the question, stay on the offer, arm the follow-up.
     state = run_graph(
         initial_state(stage="salary_schedule_offer", profile={"interest_confirmed": True, "age_confirmed": True}),
         "а сколько по деньгам платят?",
     )
 
+    assert state["stage"] == "salary_schedule_offer"
+    assert state["candidate_profile"]["salary_schedule_interest"] is None
+    assert voice_packs(state) == []
+    assert state["metadata"]["awaiting_interrupt_followup"] is True
+
+
+def test_salary_offer_no_more_questions_sends_pack() -> None:
+    # After we answered, a neutral "понятно" means no more questions -> deliver voices.
+    state = run_graph(_salary_offer_awaiting_state(), "понятно")
+
     assert state["stage"] == "post_equipment_questions_check"
     assert state["candidate_profile"]["salary_schedule_interest"] is True
     assert voice_packs(state) == ["salary_schedule"]
-    messages = text_messages(state)
-    # The interrupt answer comes first, then the next stage question after the voices.
-    assert len(messages) >= 2
-    assert messages[-1] == "остались ли у тебя какие-нибудь ещё вопросики?"
-    # We moved on instead of stalling on a re-ask of the offer.
+    assert text_messages(state)[-1] == "остались ли у тебя какие-нибудь ещё вопросики?"
     assert not state["metadata"].get("awaiting_interrupt_followup")
-    assert delayed_followup_actions(state) == []
 
 
-def test_salary_offer_objection_does_not_auto_send_pack() -> None:
-    state = run_graph(
-        initial_state(stage="salary_schedule_offer", profile={"interest_confirmed": True, "age_confirmed": True}),
-        "честно, звучит как развод какой-то",
-    )
+def test_salary_offer_followup_timeout_sends_pack() -> None:
+    # No reply within the window: the follow-up timeout delivers the voices.
+    state = _salary_offer_awaiting_state()
+    state["timeout_event"] = "interrupt_followup"
+    state = run_graph(state)
+
+    assert state["stage"] == "post_equipment_questions_check"
+    assert state["candidate_profile"]["salary_schedule_interest"] is True
+    assert voice_packs(state) == ["salary_schedule"]
+
+
+def test_salary_offer_new_question_after_answer_keeps_waiting() -> None:
+    # A fresh question while awaiting must be answered, not skipped to the voices.
+    state = run_graph(_salary_offer_awaiting_state(), "а что за платформа?")
 
     assert state["stage"] == "salary_schedule_offer"
-    assert state["candidate_profile"]["salary_schedule_interest"] is None
     assert voice_packs(state) == []
 
 
@@ -435,7 +577,7 @@ def test_repeated_interrupts_softly_return_to_goal_after_fourth_question() -> No
     assert state["stage"] == "interest_check"
     assert "английский не обязателен" in state["reply_text"]
     assert "чтобы не грузить всем сразу" in state["reply_text"]
-    assert "рассказать подробнее?" not in state["reply_text"]
+    assert "давай расскажу поподробнее?" not in state["reply_text"]
 
 
 def test_mixed_interest_question_preserves_interest_fact() -> None:
@@ -464,7 +606,7 @@ def test_multi_message_interest_source_and_selection_interrupt() -> None:
     assert state["semantic_result"]["retrieval_topics"][:2] == ["contact_source", "why_selected"]
     assert "Контакт мог" in state["reply_text"]
     assert "Жёстких критериев" in state["reply_text"]
-    assert "рассказать подробнее?" not in state["reply_text"]
+    assert "давай расскажу поподробнее?" not in state["reply_text"]
 
 
 def test_multi_message_nudity_batch_is_one_objection() -> None:
@@ -480,9 +622,33 @@ def test_multi_message_nudity_batch_is_one_objection() -> None:
     assert state["stage"] == "salary_schedule_offer"
     assert state["semantic_result"]["has_unresolved_interrupt"] is True
     assert "nudity_onlyfans" in state["semantic_result"]["retrieval_topics"]
-    assert "job_description" in state["semantic_result"]["retrieval_topics"]
+    # The broad job_description blob is demoted once a specific concern (nudity) is
+    # present, so the reply stays focused on her actual question instead of dumping
+    # the whole job description on top.
+    assert "job_description" not in state["semantic_result"]["retrieval_topics"]
     assert "не OnlyFans" in state["reply_text"]
-    assert "прямые трансляции" in state["reply_text"]
+
+
+def test_specific_question_demotes_broad_job_description() -> None:
+    """Asking a pointed question whose wording merely mentions streaming must answer
+    the specific topic, not blend in the whole job_description blob (regression:
+    «на каких платформах стримы будут проходить» → only platform_info)."""
+    state = initial_state(
+        stage="salary_schedule_offer",
+        profile={"interest_confirmed": True, "age_confirmed": True},
+    )
+    state["message_batch"] = [
+        {"direction": "inbound", "sender_type": "lead", "body": "а на каких платформах стримы будут проходить?"},
+    ]
+
+    state = run_graph(state)
+
+    topics = state["semantic_result"]["retrieval_topics"]
+    assert "platform_info" in topics
+    assert "job_description" not in topics
+    assert "Dacast" in state["reply_text"] or "Restream" in state["reply_text"]
+    # the job-description blob must NOT be appended
+    assert "разговорные эфиры" not in state["reply_text"]
 
 
 def test_multi_topic_question_batch_answers_all_relevant_knowledge() -> None:
@@ -517,11 +683,8 @@ def test_friend_and_platform_batch_is_question_not_objection() -> None:
 
     state = run_graph(state)
 
-    # A question at the offer is engagement: answer it, then deliver the materials
-    # and move on in the same turn instead of stalling on the offer.
-    assert state["stage"] == "post_equipment_questions_check"
-    assert state["candidate_profile"]["salary_schedule_interest"] is True
-    assert voice_packs(state) == ["salary_schedule"]
+    # First interrupt turn: answer the questions and wait; do not deliver yet.
+    assert state["stage"] == "salary_schedule_offer"
     assert state["semantic_result"]["message_type"] == "interrupt_question"
     assert state["semantic_result"]["interrupt_type"] == "question"
     assert {"friend_streaming", "platform_info"} <= set(state["semantic_result"]["retrieval_topics"])
@@ -547,7 +710,7 @@ def test_social_only_greeting_does_not_create_interrupt_or_repeat_greeting() -> 
 
     assert state["stage"] == "interest_check"
     assert state["semantic_result"]["has_unresolved_interrupt"] is False
-    assert text_messages(state) == ["рассказать подробнее?"]
+    assert text_messages(state) == ["давай расскажу поподробнее?"]
 
 
 def test_actionable_topic_answers_knowledge_instead_of_repeating_question() -> None:
@@ -706,7 +869,10 @@ def test_voice_pack_expands_to_recorded_voice_jobs_before_text() -> None:
     assert actions[1]["media_path"].endswith("voice_intro_04_next_steps.ogg")
     assert actions[0]["recording_delay_seconds"] == 40
     assert actions[1]["recording_delay_seconds"] == 40
-    assert [action["delay_seconds"] for action in actions[:3]] == [0, 40, 80]
+    # Весь пак планируется на один момент (один батч/цикл отправки) — реалистичную
+    # паузу записи между голосовыми даёт сам outbound-воркер (recording_delay при
+    # отправке), а не разнос по scheduled_at. Хвостовой текст — туда же.
+    assert [action["delay_seconds"] for action in actions[:3]] == [0, 0, 0]
     assert [action["reply_group_index"] for action in actions[:3]] == [1, 2, 3]
     assert all(action["reply_group_size"] == 3 for action in actions[:3])
 
@@ -1245,6 +1411,65 @@ def test_action_executor_creates_voice_job_with_recording_metadata() -> None:
     assert jobs[0].media_metadata["duration_seconds"] == 0
 
 
+def test_action_executor_handoff_notifies_once() -> None:
+    dialog = Dialog(
+        id=uuid.uuid4(),
+        account_id=uuid.uuid4(),
+        crmchat_dialog_id="d1",
+        telegram_username="@lead",
+    )
+    lead = Lead(id=uuid.uuid4(), dialog_id=dialog.id)
+    runtime = LeadFunnelRuntime(
+        id=uuid.uuid4(),
+        lead_id=lead.id,
+        dialog_id=dialog.id,
+        thread_id=str(dialog.id),
+        metadata_json={"candidate_profile": {"candidate_name": "Аня", "phone_number": "+79990000000"}},
+    )
+
+    captured: list[dict] = []
+
+    class _Notifier:
+        handoff_enabled = True
+
+        async def notify_handoff(self, **kwargs):
+            captured.append(kwargs)
+
+    class _HandoffSession:
+        def __init__(self):
+            self.added = []
+            self.handoff = None
+
+        async def execute(self, query):
+            return FakeScalarResult(self.handoff)
+
+        async def get(self, model, object_id):
+            return None
+
+        def add(self, instance):
+            self.added.append(instance)
+            if isinstance(instance, HumanHandoff):
+                self.handoff = instance
+
+        async def flush(self):
+            pass
+
+    session = _HandoffSession()
+    executor = FunnelActionExecutor(session, notifier=_Notifier())
+    action = {"type": "handoff", "reason": "funnel_requested_handoff"}
+
+    asyncio.run(executor.execute(dialog=dialog, lead=lead, runtime=runtime, actions=[action]))
+    # Повторный прогон (терминальная стадия переобрабатывается) не должен дублировать.
+    asyncio.run(executor.execute(dialog=dialog, lead=lead, runtime=runtime, actions=[action]))
+
+    handoffs = [item for item in session.added if isinstance(item, HumanHandoff)]
+    assert len(handoffs) == 1
+    assert runtime.stage == "human_handoff"
+    assert len(captured) == 1
+    assert captured[0]["telegram_username"] == "@lead"
+    assert captured[0]["profile"]["candidate_name"] == "Аня"
+
+
 def test_psycopg_conn_string_converts_asyncpg_scheme() -> None:
     assert psycopg_conn_string("postgresql+asyncpg://u:p@localhost/db") == "postgresql://u:p@localhost/db"
 
@@ -1303,7 +1528,12 @@ def initial_state(stage="interest_check", profile=None):
         "slots": candidate_profile,
         "sent_voice_packs": [],
         "sent_templates": [],
-        "recent_messages": [],
+        # Кандидат на interest_check и далее уже отвечает на наш first-touch опенер,
+        # поэтому в истории есть прошлое агентское сообщение (иначе это «первый
+        # контакт» и воронка по дизайну отдаёт опенер ещё раз).
+        "recent_messages": [
+            {"direction": "outbound", "sender_type": "agent", "body": "first-touch opener"}
+        ],
         "message_batch": [],
         "metadata": {},
     }
