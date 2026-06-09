@@ -1,0 +1,18 @@
+[Unit]
+Description=HR_DV_worker — sync CRMchat accounts into DB (so swiper intakes never fail with "no account")
+Requires=hrdv-postgres.service
+After=hrdv-postgres.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+User=hrdv
+Group=hrdv
+WorkingDirectory=/opt/HR_DV_worker
+ExecStart=/opt/HR_DV_worker/.venv/bin/python /opt/HR_DV_worker/scripts/sync_crmchat_accounts.py --report --reset-expired-rate-limits
+StandardOutput=append:/opt/HR_DV_worker/runtime_logs/account_sync.log
+StandardError=append:/opt/HR_DV_worker/runtime_logs/account_sync.log
+
+[Install]
+WantedBy=multi-user.target

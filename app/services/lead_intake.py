@@ -178,6 +178,56 @@ class LeadIntakeService:
             raise
         return LeadIntakeResult(event=event, idempotent=False)
 
+    async def reprocess_event(self, event: LeadIntakeEvent, account: Account) -> str | None:
+        """Materialize a lead from an EXISTING intake event, in place.
+
+        Used to retry events that previously failed (e.g. status='failed' because
+        no account was synced into the DB yet when the swiper caught the match).
+        The unique constraint (source, external_lead_id) blocks re-inserting a new
+        event, so instead we bind a dialog + lead to the existing row and flip it to
+        'accepted'. Same downstream behaviour as a fresh capture: проактивный
+        first-touch опенер, либо inbound-first если кандидатка уже написала первой.
+
+        Returns the first_message (for the 'new lead' notification), or None.
+        """
+        normalized_username = normalize_username(event.telegram_username)
+        dialog = await self._get_or_create_dialog(
+            account=account,
+            source=event.source,
+            external_lead_id=event.external_lead_id,
+            telegram_username=normalized_username,
+        )
+        event.account_id = account.id
+        event.dialog_id = dialog.id
+        event.status = "accepted"
+        event.error_message = None
+        await self._ensure_lead(dialog)
+        await self.session.flush()
+
+        settings = get_settings()
+        first_message: str | None = None
+        if settings.langgraph_funnel_enabled:
+            from app.services.funnel_graph.gateway import LangGraphFunnelGateway
+
+            if await self._candidate_already_messaged(dialog):
+                logger.info(
+                    "reprocess: lead %s already wrote first — inbound-first warmup",
+                    normalized_username,
+                )
+            else:
+                await LangGraphFunnelGateway(self.session, settings=settings).start_for_dialog(
+                    dialog_id=str(dialog.id)
+                )
+                first_message = await self._funnel_first_touch(normalized_username)
+        await self.session.commit()
+        await self.notifier.notify_new_lead(
+            telegram_username=normalized_username,
+            account_label=account_label(account),
+            source=event.source,
+            first_message=first_message,
+        )
+        return first_message
+
     async def _select_account(self, account_id: str | None) -> Account | None:
         """Pick the account that will serve this lead.
 
