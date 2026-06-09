@@ -118,9 +118,13 @@ class Supervisor:
             )
 
     async def _launch_autopilot(self) -> None:
-        argv = [sys.executable, "scripts/run_autopilot.py"]
+        # -u + PYTHONUNBUFFERED: иначе stdout автопилота блочно буферизуется и
+        # строки циклов/ошибок попадают в лог с задержкой в минуты — отладка
+        # падений (и хвост лога в авто-рестарте) становится бесполезной.
+        argv = [sys.executable, "-u", "scripts/run_autopilot.py"]
         argv += shlex.split(self._settings.control_autopilot_args)
         env = dict(os.environ)
+        env["PYTHONUNBUFFERED"] = "1"
         target = self._settings.control_target_username
         if target:
             argv += ["--only-username", target]
