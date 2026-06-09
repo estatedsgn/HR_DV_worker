@@ -1,0 +1,10 @@
+[Unit]
+Description=Run HR_DV_worker heartbeat every hour
+
+[Timer]
+OnBootSec=3min
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target

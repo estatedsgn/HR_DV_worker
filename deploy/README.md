@@ -4,19 +4,31 @@
 NL/DE, Ubuntu 22.04/24.04) с круглосуточной работой воркера и «поселённым» рядом
 Claude Code, которым можно управлять с телефона/ПК, не заходя на сам сервер руками.
 
-## Что где крутится
+## Что где крутится (топология «супервизор-пульт» — основная)
 
 ```
 VPS (Ubuntu)
 ├─ Docker → Postgres (pgvector) + том данных + ежедневный бэкап-дамп
 ├─ systemd:
-│   ├─ hrdv-autopilot.service   → scripts/run_autonomous.py  (Дайвинчик + автопилот)
-│   └─ hrdv-supervisor.service  → python -m app.supervisor   (пульт вкл/выкл)
+│   ├─ hrdv-postgres.service    → docker compose up postgres (поднимает БД на boot)
+│   ├─ hrdv-supervisor.service  → python -m app.supervisor   (пульт @HrAgentControlbot,
+│   │                             ▶️ Старт/⏹ Стоп автопилота с телефона; автопилот —
+│   │                             его дочерний процесс, НЕ отдельный сервис)
+│   ├─ hrdv-daivinchik.service  → python -m app.services.daivinchik (свайпер, сам
+│   │                             тормозит вне рабочих часов 10–22)
+│   └─ hrdv-heartbeat.timer     → scripts/heartbeat.py (раз в час «процессы идут» в чат)
 ├─ Claude Code (Node.js) в tmux-сессии — живёт 24/7, отвечает когда пишешь
-└─ Tailscale — приватная сеть для безопасного доступа с телефона (SSH наружу закрыт)
+└─ Tailscale — приватная сеть для безопасного доступа с телефона
 ```
 
-Воркер работает всегда. Claude — отдельный процесс, «думает» только когда ты пишешь.
+Инфра (Postgres, пульт, свайпер) работает всегда; **автопилот воронки** ты включаешь/
+выключаешь кнопкой ▶️/⏹ в Telegram — ⏹ Стоп не убивает Postgres и свайпер. Claude —
+отдельный процесс, «думает» только когда пишешь.
+
+> ⚠️ **Не включай `hrdv-autopilot.service`** (он гоняет `run_autonomous.py` =
+> свайпер + автопилот разом) **вместе** с супервизором/`hrdv-daivinchik` — будет
+> дубль процессов. Это альтернативный «автономный» режим без пульта; в основной
+> топологии он не используется.
 
 > **Секреты никогда не коммитятся.** `.env`, `daivinchik_*` state/leads и `*.session`
 > уже в `.gitignore`. На сервер `.env` копируется руками (см. шаг 3).
@@ -70,14 +82,17 @@ bash deploy/deploy_app.sh      # venv + зависимости + Postgres в Doc
 
 ### 5. Включить сервисы (как root)
 ```bash
-cp /opt/HR_DV_worker/deploy/hrdv-autopilot.service  /etc/systemd/system/
-cp /opt/HR_DV_worker/deploy/hrdv-supervisor.service /etc/systemd/system/
+cd /opt/HR_DV_worker/deploy
+cp hrdv-postgres.service hrdv-supervisor.service hrdv-daivinchik.service \
+   hrdv-heartbeat.service hrdv-heartbeat.timer /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now hrdv-autopilot hrdv-supervisor
-systemctl status hrdv-autopilot          # проверить, что поднялось
-journalctl -u hrdv-autopilot -f          # живые логи
+systemctl enable --now hrdv-postgres hrdv-supervisor hrdv-daivinchik hrdv-heartbeat.timer
+systemctl status hrdv-supervisor hrdv-daivinchik   # проверить
+journalctl -u hrdv-daivinchik -f                   # живые логи свайпера
 ```
-Воркер теперь работает 24/7 и сам перезапустится после падения или ребута.
+Инфра и свайпер работают 24/7 и сами перезапустятся после падения/ребута.
+**Автопилот воронки** запускается отдельно — кнопкой ▶️ Старт в Telegram-пульте
+(@HrAgentControlbot), см. шаг 6б.
 
 ### 6. Поселить Claude и общаться с телефона
 ```bash
