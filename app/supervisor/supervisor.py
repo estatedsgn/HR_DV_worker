@@ -10,6 +10,7 @@ import asyncio
 import os
 import shlex
 import sys
+import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from enum import Enum
@@ -56,6 +57,15 @@ class Supervisor:
         self.last_error: str | None = None
         self._autopilot: ManagedProcess | None = None
         self._started_at: datetime | None = None
+        # Авто-рестарт автопилота: считаем падения в пределах окна, чтобы
+        # самовосстанавливаться от разовых падений, но не уходить в горячий
+        # цикл, если автопилот падает сразу при старте.
+        self._crash_count = 0
+        self._last_crash_at = 0.0
+        self._restart_window_seconds = 600.0  # «серия» падений сбрасывается через 10 мин аптайма
+        self._restart_base_backoff = 5.0
+        self._restart_max_backoff = 120.0
+        self._max_restarts_in_window = 6
 
     def set_notifier(self, notifier: Notifier) -> None:
         self._notifier = notifier
@@ -130,13 +140,56 @@ class Supervisor:
         # Сработает, только если процесс умер сам (не по нашей команде stop).
         if self.state != SupervisorState.RUNNING:
             return
-        self.state = SupervisorState.ERROR
-        self.last_error = f"автопилот неожиданно завершился (rc={proc.returncode})"
-        await self._emit(
-            f"🔴 Автопилот неожиданно упал (rc={proc.returncode}).\n"
-            f"Последние строки лога:\n{proc.tail(15)}\n\n"
-            f"Нажми ▶️ Старт, чтобы перезапустить."
+        rc = proc.returncode
+        tail = proc.tail(15)
+
+        now = time.monotonic()
+        # Если предыдущее падение было давно — автопилот успел нормально
+        # поработать, значит это новая «серия», счётчик сбрасываем.
+        if now - self._last_crash_at > self._restart_window_seconds:
+            self._crash_count = 0
+        self._crash_count += 1
+        self._last_crash_at = now
+
+        # Предохранитель: если автопилот падает раз за разом (например, битый
+        # конфиг), не крутим бесконечный рестарт — паркуемся в ERROR.
+        if self._crash_count > self._max_restarts_in_window:
+            self.state = SupervisorState.ERROR
+            self.last_error = (
+                f"автопилот падает повторно (rc={rc}); авто-рестарт остановлен "
+                f"после {self._crash_count - 1} попыток"
+            )
+            await self._emit(
+                f"🔴 Автопилот упал {self._crash_count} раз подряд (rc={rc}). "
+                f"Авто-рестарт остановлен — нужна ручная проверка.\n"
+                f"Последние строки лога:\n{tail}\n\nНажми ▶️ Старт после фикса."
+            )
+            return
+
+        backoff = min(
+            self._restart_base_backoff * (2 ** (self._crash_count - 1)),
+            self._restart_max_backoff,
         )
+        await self._emit(
+            f"🔁 Автопилот упал (rc={rc}), авто-рестарт #{self._crash_count} "
+            f"через {backoff:.0f}с…\nПоследние строки лога:\n{tail}"
+        )
+        await asyncio.sleep(backoff)
+
+        # Пока ждали — могли нажать ⏹ Стоп или поднять автопилот вручную.
+        async with self._lock:
+            if self.state != SupervisorState.RUNNING:
+                return
+            if self._autopilot is not None and self._autopilot.is_running:
+                return
+            try:
+                await self._launch_autopilot()
+            except Exception as exc:  # noqa: BLE001
+                self.state = SupervisorState.ERROR
+                self.last_error = f"авто-рестарт не удался: {type(exc).__name__}: {exc}"
+                await self._emit(f"🔴 Авто-рестарт автопилота не удался: {exc}")
+                return
+        await self._emit("🟢 Автопилот перезапущен автоматически.")
 
     # ------------------------------------------------------------------- stop
     async def stop(self) -> None:

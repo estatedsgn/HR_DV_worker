@@ -47,11 +47,13 @@ class TelegramControlAdapter(ControlAdapter):
         admin_chat_id: str | None,
         root: Path,
         poll_timeout: int = 30,
+        autostart: bool = False,
     ) -> None:
         self._token = token
         self._admin_chat_id = str(admin_chat_id) if admin_chat_id else None
         self._root = root
         self._poll_timeout = poll_timeout
+        self._autostart = autostart
         self._base = f"https://api.telegram.org/bot{token}"
         self._client: httpx.AsyncClient | None = None
         self._offset: int | None = None
@@ -102,6 +104,12 @@ class TelegramControlAdapter(ControlAdapter):
             else:
                 print("[telegram] CONTROL_ADMIN_CHAT_ID не задан — напиши боту /start, "
                       "чтобы привязать чат.")
+            # Авто-старт после ребута / рестарта systemd: поднимаем агента сами,
+            # не дожидаясь ручного ▶️ Старт. Делаем фоновой задачей, чтобы пульт
+            # сразу начал слушать команды (и можно было нажать ⏹ Стоп).
+            if self._autostart:
+                await self.notify("⚙️ Авто-старт включён — поднимаю агента…")
+                asyncio.create_task(self.supervisor.start())
             try:
                 await self._poll_loop()
             finally:

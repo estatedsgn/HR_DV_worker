@@ -32,6 +32,7 @@ async def amain() -> None:
         token=token,
         admin_chat_id=settings.control_admin_chat_id,
         root=ROOT,
+        autostart=settings.control_autostart,
     )
     print("🎛 Пульт запущен. Открой бота в Telegram и нажми /start.")
     await adapter.run()

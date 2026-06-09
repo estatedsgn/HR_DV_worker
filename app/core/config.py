@@ -188,6 +188,10 @@ class Settings(BaseSettings):
         default="--all-accounts --allow-real-send --typing-delay-seconds 2 --poll-interval-seconds 3",
         alias="CONTROL_AUTOPILOT_ARGS",
     )
+    # Когда True, пульт сам поднимает агента при старте процесса (после ребута /
+    # рестарта systemd) — не дожидаясь ручного ▶️ Старт в Telegram. Вместе с
+    # авто-рестартом автопилота это делает агента самовосстанавливающимся 24/7.
+    control_autostart: bool = Field(default=False, alias="CONTROL_AUTOSTART")
     control_db_health_retries: int = Field(
         default=30, alias="CONTROL_DB_HEALTH_RETRIES"
     )
