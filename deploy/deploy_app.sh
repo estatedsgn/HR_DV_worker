@@ -47,6 +47,13 @@ done
 log "Applying Alembic migrations"
 ./.venv/bin/alembic upgrade head
 
+# --- 3b. LangGraph checkpointer tables --------------------------------------
+# The funnel persists state via langgraph's Postgres checkpointer, whose tables
+# (checkpoints, checkpoint_writes, ...) are created by .setup(), NOT by alembic.
+# Without this, starting the funnel fails with: relation "checkpoints" does not exist.
+log "Initializing LangGraph Postgres checkpointer"
+./.venv/bin/python scripts/setup_langgraph_checkpointer.py
+
 mkdir -p runtime_logs
 
 log "App bootstrap complete. Manage services with:"
