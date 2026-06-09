@@ -193,10 +193,17 @@ class CRMChatConnector:
                 "CRMCHAT_API_KEY is required for CRMchat API calls"
             )
 
+        # Раздельные таймауты: коннект падает быстро (мёртвый/троттленый аккаунт не
+        # должен висеть полную минуту), чтение ограничено общим бюджетом. Иначе при
+        # троттлинге аккаунта (после массовых лайков Дайвинчика) каждый getHistory
+        # висел до 60с, и цикл поллинга раздувался до ~5+ минут — ответы лидам
+        # «западали». См. [[account-throttle-fast-timeout]].
+        read_timeout = self.settings.crmchat_timeout_seconds
+        connect_timeout = min(10.0, float(read_timeout))
         return httpx.AsyncClient(
             base_url=base_url,
             headers={"Authorization": f"Bearer {api_key}"},
-            timeout=self.settings.crmchat_timeout_seconds,
+            timeout=httpx.Timeout(read_timeout, connect=connect_timeout),
         )
 
     async def aclose(self) -> None:

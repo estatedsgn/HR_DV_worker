@@ -769,17 +769,16 @@ def natural_timeout_followup(question: str, metadata: dict[str, Any]) -> str:
     return variants[count % len(variants)] if variants else question
 
 
-def question_variants(question: str) -> list[str]:
-    variants_by_question = {
+QUESTION_VARIANTS: dict[str, list[str]] = {
         "остались ли у тебя какие-нибудь ещё вопросики?": [
             "что-то ещё осталось непонятным?",
             "если вопросиков больше нет, можем двигаться дальше",
             "ещё что-то хочешь уточнить по условиям или формату?",
         ],
-        "давай расскажу поподробнее?": [
-            "давай расскажу поподробнее?",
-            "если интересно, могу рассказать про условия и график",
-            "напомню: готова рассказать про условия и график, тебе интересно?",
+        "если интересно — расскажу, что за работа и как всё устроено 🙂": [
+            "если интересно — расскажу, что за работа и как всё устроено 🙂",
+            "если хочешь, расскажу про условия и график — что да как)",
+            "могу рассказать поподробнее, что за работа и сколько выходит — интересно?",
         ],
         "какая у тебя моделька телефончика?": [
             "классно, что с оборудованием уже есть база) для старта всё равно нужна моделька телефончика — какая у тебя?",
@@ -811,8 +810,24 @@ def question_variants(question: str) -> list[str]:
             "во сколько тебе комфортнее в окне 11:00–18:00 по мск?",
             "какое время с 11 до 18 по мск тебе подойдёт?",
         ],
-    }
-    return variants_by_question.get(question, [question])
+}
+
+
+def question_variants(question: str) -> list[str]:
+    return QUESTION_VARIANTS.get(question, [question])
+
+
+_CANONICAL_BY_VARIANT: dict[str, str] = {
+    variant: canonical
+    for canonical, variants in QUESTION_VARIANTS.items()
+    for variant in [canonical, *variants]
+}
+
+
+def canonical_question(text: str) -> str:
+    """Свести (возможно переформулированный) вопрос к его канонной форме, чтобы
+    отличать повтор одного и того же вопроса от нового, даже если фраза менялась."""
+    return _CANONICAL_BY_VARIANT.get((text or "").strip(), (text or "").strip())
 
 
 def should_wait_after_neutral_ack(state: FunnelGraphState, semantic: SemanticResult) -> bool:

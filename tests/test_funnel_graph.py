@@ -73,7 +73,83 @@ def test_inbound_warmup_pitches_when_chat_lulls() -> None:
     assert result["candidate_profile"]["warmup_pitched"] is True
     joined = " ".join(text_messages(result))
     assert "стриминге" in joined
-    assert "давай расскажу поподробнее?" not in joined
+    assert "если интересно — расскажу, что за работа и как всё устроено 🙂" not in joined
+
+
+def test_collapse_redundant_questions_keeps_one_question_no_dupes() -> None:
+    from app.services.funnel_graph.graph import collapse_redundant_questions
+
+    # Воспроизводит баг @springvood: мостик + две версии вопроса про возраст подряд.
+    outgoing = [
+        {"type": "text", "text": "расскажу всё подробно, но давай сначала эту формальность закроем)"},
+        {"type": "text", "text": "сколько тебе лет?"},
+        {"type": "text", "text": "давай для начала уточним небольшую формальность, сколько тебе лет?"},
+    ]
+    result = collapse_redundant_questions(outgoing)
+    texts = [m["text"] for m in result]
+    # Мостик (не вопрос) остаётся, вопрос ровно один — первый.
+    assert texts == [
+        "расскажу всё подробно, но давай сначала эту формальность закроем)",
+        "сколько тебе лет?",
+    ]
+    # Точные повторы и второй вопрос вычищены.
+    assert sum(1 for t in texts if t.rstrip().endswith("?")) == 1
+
+
+def test_collapse_redundant_questions_preserves_voice_and_dedupes_text() -> None:
+    from app.services.funnel_graph.graph import collapse_redundant_questions
+
+    outgoing = [
+        {"type": "voice_pack", "voice_pack_id": "vp1"},
+        {"type": "text", "text": "да, общаешься с людьми и за это деньги 💖"},
+        {"type": "text", "text": "да, общаешься с людьми и за это деньги 💖"},  # точный повтор
+        {"type": "text", "text": "если интересна наша сфера, рассказать про зп?"},
+    ]
+    result = collapse_redundant_questions(outgoing)
+    assert result[0]["type"] == "voice_pack"
+    texts = [m["text"] for m in result if m.get("type") == "text"]
+    assert texts == [
+        "да, общаешься с людьми и за это деньги 💖",
+        "если интересна наша сфера, рассказать про зп?",
+    ]
+
+
+def test_dedupe_cross_turn_drops_repeated_stage_question_after_answer() -> None:
+    from app.services.funnel_graph.graph import dedupe_cross_turn_questions
+
+    # Прошлый ход уже спрашивали этот вопрос (канон). В этот ход ответили по делу и
+    # снова тянем его ВАРИАНТ — должен выпасть (баг @hunt_pavluck: «что-то ещё?» ×10).
+    meta = {"last_asked_question_canonical": "остались ли у тебя какие-нибудь ещё вопросики?"}
+    outgoing = [
+        {"type": "text", "text": "работа удалённая, можно стримить из дома)"},
+        {"type": "text", "text": "что-то ещё осталось непонятным?"},
+    ]
+    result = dedupe_cross_turn_questions(outgoing, meta)
+    assert [m["text"] for m in result] == ["работа удалённая, можно стримить из дома)"]
+
+
+def test_dedupe_cross_turn_keeps_question_when_nothing_else_to_say() -> None:
+    from app.services.funnel_graph.graph import dedupe_cross_turn_questions
+
+    # Содержательного ответа нет — значит модель не ответила, переспросить МОЖНО.
+    meta = {"last_asked_question_canonical": "остались ли у тебя какие-нибудь ещё вопросики?"}
+    outgoing = [{"type": "text", "text": "что-то ещё осталось непонятным?"}]
+    result = dedupe_cross_turn_questions(outgoing, meta)
+    assert [m["text"] for m in result] == ["что-то ещё осталось непонятным?"]
+
+
+def test_dedupe_cross_turn_keeps_new_stage_question() -> None:
+    from app.services.funnel_graph.graph import dedupe_cross_turn_questions
+
+    # Новый вопрос (другая стадия) — задаём, даже если есть содержательный текст.
+    meta = {"last_asked_question_canonical": "остались ли у тебя какие-нибудь ещё вопросики?"}
+    outgoing = [
+        {"type": "text", "text": "супер"},
+        {"type": "text", "text": "какая у тебя моделька телефончика?"},
+    ]
+    result = dedupe_cross_turn_questions(outgoing, meta)
+    assert [m["text"] for m in result] == ["супер", "какая у тебя моделька телефончика?"]
+    assert meta["last_asked_question_canonical"] == "какая у тебя моделька телефончика?"
 
 
 def test_annotation_parser_supports_candidate_multiline_batches() -> None:
@@ -110,13 +186,13 @@ def test_interest_question_is_interrupt_and_repeats_current_question() -> None:
     assert state["stage"] == "interest_check"
     assert state["candidate_profile"]["interest_confirmed"] is None
     assert "Контакт мог" in state["reply_text"]
-    assert "давай расскажу поподробнее?" not in state["reply_text"]
+    assert "если интересно — расскажу, что за работа и как всё устроено 🙂" not in state["reply_text"]
     assert state["metadata"]["awaiting_interrupt_followup"] is True
-    assert state["metadata"]["interrupt_followup_question"] == "давай расскажу поподробнее?"
+    assert state["metadata"]["interrupt_followup_question"] == "если интересно — расскажу, что за работа и как всё устроено 🙂"
     delayed = delayed_followup_actions(state)
     assert len(delayed) == 1
     assert delayed[0]["delay_seconds"] == 120
-    assert delayed[0]["text"] == "давай расскажу поподробнее?"
+    assert delayed[0]["text"] == "если интересно — расскажу, что за работа и как всё устроено 🙂"
 
 
 def test_interest_job_question_does_not_move_to_age() -> None:
@@ -125,7 +201,7 @@ def test_interest_job_question_does_not_move_to_age() -> None:
     assert state["stage"] == "interest_check"
     assert state["candidate_profile"]["interest_confirmed"] is None
     assert "Сколько тебе лет?" not in state["reply_text"]
-    assert "давай расскажу поподробнее?" not in state["reply_text"]
+    assert "если интересно — расскажу, что за работа и как всё устроено 🙂" not in state["reply_text"]
     assert state["metadata"]["awaiting_interrupt_followup"] is True
 
 
@@ -606,7 +682,7 @@ def test_repeated_interrupts_softly_return_to_goal_after_fourth_question() -> No
     assert state["stage"] == "interest_check"
     assert "английский не обязателен" in state["reply_text"]
     assert "чтобы не грузить всем сразу" in state["reply_text"]
-    assert "давай расскажу поподробнее?" not in state["reply_text"]
+    assert "если интересно — расскажу, что за работа и как всё устроено 🙂" not in state["reply_text"]
 
 
 def test_mixed_interest_question_preserves_interest_fact() -> None:
@@ -635,7 +711,7 @@ def test_multi_message_interest_source_and_selection_interrupt() -> None:
     assert state["semantic_result"]["retrieval_topics"][:2] == ["contact_source", "why_selected"]
     assert "Контакт мог" in state["reply_text"]
     assert "Жёстких критериев" in state["reply_text"]
-    assert "давай расскажу поподробнее?" not in state["reply_text"]
+    assert "если интересно — расскажу, что за работа и как всё устроено 🙂" not in state["reply_text"]
 
 
 def test_multi_message_nudity_batch_is_one_objection() -> None:
@@ -739,7 +815,7 @@ def test_social_only_greeting_does_not_create_interrupt_or_repeat_greeting() -> 
 
     assert state["stage"] == "interest_check"
     assert state["semantic_result"]["has_unresolved_interrupt"] is False
-    assert text_messages(state) == ["давай расскажу поподробнее?"]
+    assert text_messages(state) == ["если интересно — расскажу, что за работа и как всё устроено 🙂"]
 
 
 def test_actionable_topic_answers_knowledge_instead_of_repeating_question() -> None:

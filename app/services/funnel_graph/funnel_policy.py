@@ -68,7 +68,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "interest_check": StagePolicy(
         name="interest_check",
         goal="Понять, есть ли у кандидатки интерес узнать подробности.",
-        current_question="давай расскажу поподробнее?",
+        current_question="если интересно — расскажу, что за работа и как всё устроено 🙂",
         required_fields=("interest_confirmed",),
         next_stage_if_completed="age_check",
         allowed_transitions=("interest_check", "age_check", "lost", "do_not_contact", "human_handoff"),

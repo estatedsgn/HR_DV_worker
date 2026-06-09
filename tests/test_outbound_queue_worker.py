@@ -117,6 +117,20 @@ def test_normalize_username() -> None:
     assert normalize_username("@IamNekiy") == "@iamnekiy"
 
 
+def test_is_permanent_send_error_classifies_telegram_privacy_rejections() -> None:
+    from app.services.crmchat_connector import CRMChatAPIError
+
+    # Recipient privacy / blocked / gone -> permanent, must NOT be retried.
+    assert OutboundQueueWorker._is_permanent_send_error(
+        CRMChatAPIError("PRIVACY_PREMIUM_REQUIRED PRIVACY_PREMIUM_REQUIRED")
+    )
+    assert OutboundQueueWorker._is_permanent_send_error(Exception("user_privacy_restricted"))
+    assert OutboundQueueWorker._is_permanent_send_error(Exception("PEER_ID_INVALID"))
+    # Transient infra / flood -> retryable, must NOT be classified permanent.
+    assert not OutboundQueueWorker._is_permanent_send_error(Exception("ReadTimeout"))
+    assert not OutboundQueueWorker._is_permanent_send_error(CRMChatAPIError("FLOOD_WAIT_30"))
+
+
 def test_text_typing_delay_is_random_between_min_and_max(monkeypatch) -> None:
     calls = []
 

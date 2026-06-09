@@ -33,6 +33,22 @@ from app.services.crmchat_connector import (
 logger = logging.getLogger(__name__)
 
 
+# Telegram-side errors that can NEVER succeed by retrying: the recipient's own
+# privacy settings forbid this account from messaging them at all (e.g. a girl who
+# only accepts messages from Telegram Premium accounts). Retrying just burns cycles
+# and dead-letters anyway, so we fail such jobs immediately and flag the dialog as
+# uncontactable instead of churning through the full retry ladder.
+_PERMANENT_SEND_ERROR_MARKERS = (
+    "PRIVACY_PREMIUM_REQUIRED",
+    "USER_PRIVACY_RESTRICTED",
+    "YOU_BLOCKED_USER",
+    "USER_IS_BLOCKED",
+    "PEER_ID_INVALID",
+    "USER_DEACTIVATED",
+    "INPUT_USER_DEACTIVATED",
+)
+
+
 @dataclass(slots=True, frozen=True)
 class OutboundQueueBatchResult:
     total: int
@@ -131,7 +147,10 @@ class OutboundQueueWorker:
                 self._mark_flood_wait(job, account, exc)
                 retry += 1
             except CRMChatAPIError as exc:
-                if self._can_retry(job):
+                if self._is_permanent_send_error(exc):
+                    await self._mark_uncontactable(job, exc)
+                    failed += 1
+                elif self._can_retry(job):
                     self._mark_retry(job, exc)
                     retry += 1
                 else:
@@ -547,6 +566,24 @@ class OutboundQueueWorker:
 
     def _can_retry(self, job: OutboundJob) -> bool:
         return (job.attempt_count or 0) < (job.max_attempts or 5)
+
+    @staticmethod
+    def _is_permanent_send_error(exc: Exception) -> bool:
+        message = str(exc).upper()
+        return any(marker in message for marker in _PERMANENT_SEND_ERROR_MARKERS)
+
+    async def _mark_uncontactable(self, job: OutboundJob, exc: Exception) -> None:
+        """Permanent Telegram-side rejection (recipient privacy / blocked / gone):
+        fail the job without retrying and flag the dialog so it stops being worked."""
+        await self._mark_terminal(job, "failed", exc)
+        if job.dialog_id is not None:
+            dialog = await self.session.get(Dialog, job.dialog_id)
+            if dialog is not None:
+                dialog.status = "uncontactable"
+        logger.info(
+            "outbound job permanently undeliverable; flagged uncontactable",
+            extra={"job_id": str(job.id), "error": str(exc)},
+        )
 
     def _compute_backoff_seconds(self, attempt_count: int) -> int:
         base_seconds = min(900, 10 * (2 ** max(0, attempt_count - 1)))

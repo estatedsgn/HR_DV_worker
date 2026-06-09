@@ -197,11 +197,11 @@ class DaivinchikService:
                 if (self._limit_reached or self._daily_cap_reached) and self._stop_on_limit:
                     logger.info("stop condition reached; stopping (stop_on_limit)")
                     return
-                slept = await self._gate_or_sleep()
-                if slept:
+                mode = await self._gate_or_sleep()
+                if mode == "sleep":
                     continue
                 try:
-                    await self._tick(connector, context, peer)
+                    await self._tick(connector, context, peer, passive=(mode == "passive"))
                 except Exception:  # noqa: BLE001
                     logger.exception("tick failed; backing off")
                     await asyncio.sleep(max(5.0, self.cfg.daivinchik_poll_interval_seconds))
@@ -326,8 +326,16 @@ class DaivinchikService:
             raw=message.raw,
         )
 
-    async def _gate_or_sleep(self) -> bool:
-        """Return True (and sleep) if we should not act right now."""
+    async def _gate_or_sleep(self) -> str:
+        """Decide what the swiper may do right now.
+
+        Returns one of:
+          * "sleep"   — do nothing this round (daily lead cap / outside hours);
+          * "passive" — like-лимит на паузе: проактивно листать анкеты НЕЛЬЗЯ, но
+            входящие лайки («ты понравилась — показать?») и взаимные матчи квоту НЕ
+            тратят, поэтому их продолжаем ловить и заводить в воронку;
+          * "go"      — обычный полный тик.
+        """
         now = datetime.now(self.tz)
         self._reset_leads_if_new_day(now)
         if self.state.leads_today >= self.cfg.daivinchik_daily_lead_limit:
@@ -339,18 +347,20 @@ class DaivinchikService:
                 self.cfg.daivinchik_daily_lead_limit,
             )
             await asyncio.sleep(min(wait, 600))
-            return True
+            return "sleep"
         if not self._within_working_hours(now):
             wait = self._seconds_until_window(now)
             logger.info("outside working window; sleeping %ds", min(wait, 600))
             await asyncio.sleep(min(wait, 600))
-            return True
+            return "sleep"
         if self.state.paused_until and now < self.state.paused_until.astimezone(self.tz):
             remaining = (self.state.paused_until.astimezone(self.tz) - now).total_seconds()
-            logger.info("paused (limit) for %.0fs more", remaining)
-            await asyncio.sleep(min(remaining, 600))
-            return True
-        return False
+            logger.info("paused (like-limit) for %.0fs more — watching for incoming likes/matches", remaining)
+            # Мягкая каденция опроса во время паузы: проверяем входящие лайки ~раз в
+            # минуту, не тратя квоту на проактивные свайпы.
+            await asyncio.sleep(min(remaining, 60.0))
+            return "passive"
+        return "go"
 
     def _within_working_hours(self, now: datetime) -> bool:
         start = self.cfg.daivinchik_active_hours_start
@@ -382,6 +392,8 @@ class DaivinchikService:
         connector: CRMChatConnector,
         context: CRMChatBootstrapContext,
         peer: dict[str, Any],
+        *,
+        passive: bool = False,
     ) -> None:
         messages = await self._fetch_messages(
             connector, context, peer, limit=self.cfg.daivinchik_history_limit
@@ -392,7 +404,7 @@ class DaivinchikService:
         # match notification ("Начинай общаться 👉 …") in the middle of a burst
         # (profile -> match -> back to menu), so driving only on the newest message
         # loses it. This captures every not-yet-seen match so leads are never missed.
-        await self._sweep_matches(messages)
+        await self._sweep_matches(messages, connector)
         if self._daily_cap_reached:
             return
 
@@ -402,6 +414,13 @@ class DaivinchikService:
             return
 
         decision = self._decide(effective)
+
+        # Во время паузы like-лимита НЕ листаем анкеты проактивно (это и есть то, что
+        # упёрлось в лимит), но входящие лайки/матчи/навигацию обрабатываем — они
+        # квоту не тратят, а матч уже сведён свипом выше.
+        if passive and decision.intent == "rate":
+            await asyncio.sleep(self.cfg.daivinchik_poll_interval_seconds)
+            return
 
         # Matches are handled exclusively by the sweep above — don't double-capture.
         if decision.intent == "match":
@@ -438,7 +457,7 @@ class DaivinchikService:
         self.state.save()
         await asyncio.sleep(self._human_delay())
 
-    async def _sweep_matches(self, messages: list[BotMessage]) -> None:
+    async def _sweep_matches(self, messages: list[BotMessage], connector: CRMChatConnector | None = None) -> None:
         """Capture every not-yet-seen mutual match in the fetched window.
 
         Scans incoming messages with id > ``last_match_id`` in ascending order,
@@ -462,7 +481,7 @@ class DaivinchikService:
                 )
                 if decision.review:
                     self._log_review(message, decision)
-                await self._capture_lead(decision.lead, message)
+                await self._capture_lead(decision.lead, message, connector)
                 self._actions_done += 1
                 highest = message.message_id
                 if self._daily_cap_reached:
@@ -491,7 +510,7 @@ class DaivinchikService:
             self._log_review(message, decision)
 
         if decision.lead is not None:
-            await self._capture_lead(decision.lead, message)
+            await self._capture_lead(decision.lead, message, connector)
             if self._daily_cap_reached:
                 # Hit the daily lead cap on this very match — stop here, don't
                 # browse further. _gate_or_sleep will hold until tomorrow.
@@ -521,7 +540,9 @@ class DaivinchikService:
             await connector.send_message(ws, acc, peer, text_to_send, random_id=self.rng.getrandbits(63))
             logger.info("sent %r", text_to_send)
 
-    async def _capture_lead(self, lead: LeadCapture, message: BotMessage) -> None:
+    async def _capture_lead(
+        self, lead: LeadCapture, message: BotMessage, connector: CRMChatConnector | None = None
+    ) -> None:
         source = self.cfg.daivinchik_lead_source
         # Always persist the contact to the durable leads table first, so a match
         # is never lost even if the DB intake can't run.
@@ -554,7 +575,7 @@ class DaivinchikService:
 
         try:
             async with AsyncSessionLocal() as session:
-                result = await LeadIntakeService(session).enqueue_lead(
+                result = await LeadIntakeService(session, connector=connector).enqueue_lead(
                     source=source,
                     external_lead_id=lead.external_id,
                     telegram_username=lead.telegram_username,

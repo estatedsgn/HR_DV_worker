@@ -515,6 +515,11 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
     if profile.get("qualification_status"):
         metadata["qualification_status"] = profile.get("qualification_status")
 
+    # Финальная страховка от «допроса»: один ход — один вопрос, без повторов
+    # в самом ходу и без переспрашивания того же вопроса ход за ходом.
+    outgoing = collapse_redundant_questions(outgoing)
+    outgoing = dedupe_cross_turn_questions(outgoing, metadata)
+
     controller_decision = {
         "stage_before": current_stage,
         "target_stage": target_stage,
@@ -644,8 +649,11 @@ def _action_executor_node(knowledge: StaticFunnelKnowledgeBase, replier: ReplyOr
                 outgoing.append({"type": "text", "text": next_question, "voice_pack_id": None})
             stage = next_stage
 
-        pending_actions = pending_actions_from_outgoing(state, outgoing)
         metadata = dict(state.get("metadata") or {})
+        # collapse — идемпотентен; кросс-ходовый dedupe делаем ТОЛЬКО в state_controller,
+        # иначе он сработает второй раз в этом же ходу и выкинет только что заданный вопрос.
+        outgoing = collapse_redundant_questions(outgoing)
+        pending_actions = pending_actions_from_outgoing(state, outgoing)
         last_bot_message = "\n\n".join(str(message.get("text")) for message in outgoing if message.get("type") == "text" and message.get("text")) or state.get("last_bot_message")
         metadata["last_bot_message"] = last_bot_message
         reply_group_ids = [action.get("reply_group_id") for action in pending_actions if action.get("reply_group_id")]
@@ -779,6 +787,80 @@ def normalize_outgoing_message(message: Any) -> dict[str, Any]:
 
 def outgoing_contains(outgoing: list[Any], text: str) -> bool:
     return any(text in str(normalize_outgoing_message(message).get("text") or "") for message in outgoing)
+
+
+def collapse_redundant_questions(outgoing: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Один ход — максимум ОДИН вопрос и никаких повторов.
+
+    Воронка иногда копит в одном ходу несколько вопросительных сообщений (ответ
+    модели + канонный вопрос стадии + его переформулировка-бридж), и бот начинает
+    «допрашивать»: шлёт 2-3 версии одного вопроса подряд — главный признак того,
+    что общение выглядит роботным. Оставляем ПЕРВЫЙ вопрос (он контекстный) и
+    выкидываем все последующие вопросительные сообщения, плюс режем точные повторы
+    текста. Не-вопросы (ответы, мостики, голосовые, шаблоны) сохраняем как есть.
+    """
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    question_kept = False
+    for message in outgoing:
+        norm = normalize_outgoing_message(message)
+        if norm.get("type") != "text":
+            result.append(message)
+            continue
+        text = str(norm.get("text") or "").strip()
+        if not text:
+            result.append(message)
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        if text.rstrip().endswith("?"):
+            if question_kept:
+                continue
+            question_kept = True
+        seen.add(key)
+        result.append(message)
+    return result
+
+
+def dedupe_cross_turn_questions(
+    outgoing: list[dict[str, Any]], metadata: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Не переспрашивать один и тот же вопрос ход за ходом.
+
+    Если за этот ход уже есть содержательный ответ модели (текст-не-вопрос, голос
+    или шаблон) И вопрос-«хвостик» совпадает ПО СМЫСЛУ с тем, что задавали в прошлый
+    ход (даже если переформулирован), — выкидываем его. Так бот отвечает по делу и
+    НЕ долбит «что-то ещё осталось непонятным?»/«давай расскажу поподробнее?» каждый
+    раз (главное палево из живых переписок). Вопрос остаётся, только когда сказать
+    больше нечего — то есть переспрашиваем лишь если модель фактически не ответила.
+    """
+    from app.services.funnel_graph.reply import canonical_question
+
+    last_canon = metadata.get("last_asked_question_canonical")
+    norm = [normalize_outgoing_message(m) for m in outgoing]
+
+    def _is_substantive(n: dict[str, Any]) -> bool:
+        if n.get("type") != "text":
+            return bool(n.get("voice_pack_id") or n.get("template_id"))
+        text = str(n.get("text") or "").strip()
+        return bool(text) and not text.endswith("?")
+
+    has_substantive = any(_is_substantive(n) for n in norm)
+    result: list[dict[str, Any]] = []
+    emitted_canon: str | None = None
+    for message, n in zip(outgoing, norm):
+        text = str(n.get("text") or "").strip()
+        if n.get("type") == "text" and text.endswith("?"):
+            canon = canonical_question(text)
+            if has_substantive and last_canon is not None and canon == last_canon:
+                continue  # уже ответили — не переспрашиваем то же самое
+            emitted_canon = canon
+        result.append(message)
+    metadata["last_asked_question_canonical"] = (
+        emitted_canon if emitted_canon is not None else last_canon
+    )
+    return result
 
 
 def template_from_state(state: FunnelGraphState, template_id: str) -> str:
