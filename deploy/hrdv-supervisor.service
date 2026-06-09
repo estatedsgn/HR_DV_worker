@@ -1,0 +1,19 @@
+[Unit]
+Description=HR_DV_worker — supervisor control bot (start/stop the agent from Telegram)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=hrdv
+Group=hrdv
+WorkingDirectory=/opt/HR_DV_worker
+ExecStart=/opt/HR_DV_worker/.venv/bin/python -m app.supervisor
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/HR_DV_worker/runtime_logs/supervisor.log
+StandardError=append:/opt/HR_DV_worker/runtime_logs/supervisor.log
+
+[Install]
+WantedBy=multi-user.target

@@ -42,3 +42,11 @@ daivinchik_state*.json
 daivinchik_leads*.jsonl
 daivinchik_review*.jsonl
 daivinchik_run*.log
+
+# Telegram / client session files (never commit — full account access)
+*.session
+*.session-journal
+
+# Server-side deploy artifacts (generated on the host)
+backups/
+*.local.env

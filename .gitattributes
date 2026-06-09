@@ -1,0 +1,5 @@
+# Keep server-side scripts and unit files LF so they run on Linux regardless of
+# the OS they were committed from (Windows would otherwise inject CRLF and break
+# the shebang / systemd parsing).
+*.sh            text eol=lf
+deploy/*.service text eol=lf
