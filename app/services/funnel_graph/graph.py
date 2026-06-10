@@ -519,6 +519,9 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
     # в самом ходу и без переспрашивания того же вопроса ход за ходом.
     outgoing = collapse_redundant_questions(outgoing)
     outgoing = dedupe_cross_turn_questions(outgoing, metadata)
+    # Жёсткое правило «никаких одинаковых сообщений»: ловит и не-вопросные повторы
+    # (канонный вопрос стадии, мостики), которые фильтры выше пропускали.
+    outgoing = dedupe_against_recent_outbound(outgoing, state)
 
     controller_decision = {
         "stage_before": current_stage,
@@ -860,6 +863,70 @@ def dedupe_cross_turn_questions(
     metadata["last_asked_question_canonical"] = (
         emitted_canon if emitted_canon is not None else last_canon
     )
+    return result
+
+
+def _norm_reply_text(text: Any) -> str:
+    """Нормализовать текст для сравнения «то же самое сообщение»: схлопнуть
+    пробелы и привести к нижнему регистру. Эмодзи/пунктуацию оставляем — канонные
+    фразы повторяются дословно, и точного совпадения достаточно."""
+    return " ".join(str(text or "").split()).lower()
+
+
+def dedupe_against_recent_outbound(
+    outgoing: list[dict[str, Any]], state: FunnelGraphState
+) -> list[dict[str, Any]]:
+    """Жёсткое правило: НЕ отправлять текст, который мы уже слали недавно.
+
+    Канонный вопрос стадии и шаблонные «мостики» не кончаются на «?», поэтому
+    фильтры по вопросам (collapse/ dedupe_cross_turn) их не ловили — и бот слал одну
+    и ту же фразу («если интересно — расскажу…») ход за ходом. Здесь для каждого
+    исходящего текста, который совпадает с нашим недавним исходящим (из истории) или
+    уже есть в этом ходу, пытаемся подставить СВЕЖУЮ формулировку того же вопроса из
+    QUESTION_VARIANTS; если свежих формулировок нет — лучше промолчать, чем дублить
+    (мягкий timeout-followup вернётся к цели позже другими словами). Голос/шаблоны/
+    не-текст не трогаем.
+    """
+    from app.services.funnel_graph.reply import canonical_question, question_variants
+
+    history = list(state.get("conversation_history") or []) + list(state.get("recent_messages") or [])
+    recent_bot: set[str] = set()
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("direction") or "").lower() != "outbound":
+            continue
+        body = _norm_reply_text(item.get("body"))
+        if body:
+            recent_bot.add(body)
+
+    def _fresh_variant(raw: str) -> str | None:
+        for variant in question_variants(canonical_question(raw)):
+            norm = _norm_reply_text(variant)
+            if norm and norm not in recent_bot and norm not in seen_this_turn:
+                return variant
+        return None
+
+    result: list[dict[str, Any]] = []
+    seen_this_turn: set[str] = set()
+    for message in outgoing:
+        norm = normalize_outgoing_message(message)
+        if norm.get("type") != "text":
+            result.append(message)
+            continue
+        raw = str(norm.get("text") or "").strip()
+        text = _norm_reply_text(raw)
+        if not text:
+            result.append(message)
+            continue
+        if text in seen_this_turn or text in recent_bot:
+            replacement = _fresh_variant(raw)
+            if replacement is None:
+                continue  # нечего сказать нового — не дублим
+            message = {**norm, "text": replacement}
+            text = _norm_reply_text(replacement)
+        seen_this_turn.add(text)
+        result.append(message)
     return result
 
 

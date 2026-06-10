@@ -974,6 +974,37 @@ def test_collapse_outbound_duplicates_removes_readback_pairs() -> None:
     ]
 
 
+def test_dedupe_against_recent_outbound_swaps_repeated_question_for_variant() -> None:
+    """Канонный вопрос стадии, уже отправленный недавно, не дублируется дословно —
+    подставляется свежая формулировка того же вопроса."""
+    from app.services.funnel_graph.graph import dedupe_against_recent_outbound
+
+    canned = "если интересно — расскажу, что за работа и как всё устроено 🙂"
+    state = {"recent_messages": [{"direction": "outbound", "body": canned}], "conversation_history": []}
+    out = dedupe_against_recent_outbound([{"type": "text", "text": canned}], state)
+    assert len(out) == 1
+    assert out[0]["text"] != canned  # заменено на вариант, не дословный повтор
+
+
+def test_dedupe_against_recent_outbound_drops_exact_repeat_without_variants() -> None:
+    from app.services.funnel_graph.graph import dedupe_against_recent_outbound
+
+    state = {"recent_messages": [{"direction": "outbound", "body": "привет как дела"}], "conversation_history": []}
+    out = dedupe_against_recent_outbound([{"type": "text", "text": "Привет как дела"}], state)
+    assert out == []  # нечего сказать нового -> не дублим, лучше промолчать
+
+
+def test_dedupe_against_recent_outbound_keeps_new_and_drops_in_turn_dup() -> None:
+    from app.services.funnel_graph.graph import dedupe_against_recent_outbound
+
+    state = {"recent_messages": [], "conversation_history": []}
+    out = dedupe_against_recent_outbound(
+        [{"type": "text", "text": "спасибо"}, {"type": "text", "text": "Спасибо"}, {"type": "text", "text": "новое по делу"}],
+        state,
+    )
+    assert [m.get("text") for m in out] == ["спасибо", "новое по делу"]
+
+
 def test_reply_idempotency_key_is_independent_of_generated_text() -> None:
     """Один и тот же ход (та же стадия + те же входящие), но разный текст ответа
     LLM, обязан давать ОДИНАКОВЫЙ idempotency_key. Иначе повторная обработка хода
