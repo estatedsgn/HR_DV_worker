@@ -653,6 +653,20 @@ def deterministic_semantic(state: FunnelGraphState) -> SemanticResult:
             facts["age_confirmed"] = False
             facts["qualification_status"] = "underage"
             return hard_refusal_result(text, "underage")
+        # «Да / конечно / есть» в ответ на наш вопрос, упоминавший «18» («тебе уже
+        # есть 18?») — засчитываем 18+ без числа. Реальные диалоги застревали тут:
+        # модель спрашивала про 18, девочка отвечала «Да», а воронка тупо
+        # переспрашивала канонный «сколько тебе лет?». Документы проверит собес.
+        if (
+            agreement
+            and not has_question
+            and not has_objection
+            and "18" in last_outbound_bot_text(state)
+        ):
+            facts["age"] = 18
+            facts["age_confirmed"] = True
+            facts["qualification_status"] = "age_ok"
+            return stage_answer(text, facts, "18+ confirmed affirmatively")
     elif stage == "age_pending_18":
         birthday_at = extract_birthday_18_at(normalized)
         if birthday_at is not None:
@@ -877,6 +891,30 @@ def partial_or_objection(text: str, facts: dict[str, Any], topic: str) -> Semant
         evidence=topic,
         confidence=0.8,
     )
+
+
+def last_outbound_bot_text(state: FunnelGraphState) -> str:
+    """Текст нашего ПОСЛЕДНЕГО исходящего (что бот реально спросил последним).
+
+    Сначала metadata.last_bot_message (его пишет action_executor каждый ход),
+    затем — последняя outbound-запись из recent_messages / conversation_history.
+    Нужен, чтобы понимать утвердительные ответы на переформулированные вопросы
+    («тебе уже есть 18?» → «да»)."""
+    metadata = dict(state.get("metadata") or {})
+    last = str(metadata.get("last_bot_message") or "").strip()
+    if last:
+        return last
+    for source in ("recent_messages", "conversation_history"):
+        for item in reversed(list(state.get(source) or [])):
+            if not isinstance(item, dict):
+                continue
+            direction = str(item.get("direction") or "").lower()
+            sender = str(item.get("sender_type") or "").lower()
+            if direction == "outbound" or sender in {"agent", "bot", "recruiter"}:
+                body = str(item.get("body") or "").strip()
+                if body:
+                    return body
+    return ""
 
 
 def hard_refusal_result(text: str, topic: str) -> SemanticResult:

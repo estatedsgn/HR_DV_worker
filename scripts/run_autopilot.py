@@ -83,6 +83,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--stop-after-cycles", type=int, default=None)
     parser.add_argument(
+        "--reengage-every-cycles",
+        type=int,
+        default=100,
+        help=(
+            "Раз в сколько циклов сканировать замолчавших лидов и слать бампы "
+            "(~5 минут при 3с-цикле). 0 — отключить скан в этом процессе."
+        ),
+    )
+    parser.add_argument(
         "--ignore-active-hours",
         action="store_true",
         help=(
@@ -220,6 +229,17 @@ async def main() -> None:
                         typing_delay_seconds=args.typing_delay_seconds,
                         account_id=account_id,
                     ).process_queued_batch(limit=args.outbound_limit)
+                    # Догоняем замолчавших лидов (до 3 бампов с нарастающими
+                    # паузами) — редким сканом, чтобы не грузить каждый цикл.
+                    reengaged = 0
+                    if args.reengage_every_cycles > 0 and (
+                        cycle == 1 or cycle % args.reengage_every_cycles == 0
+                    ):
+                        from app.services.funnel_graph.reengage import ReengagementService
+
+                        reengaged = await ReengagementService(session).run_once(
+                            account_id=account_id
+                        )
                     metrics = await latest_model_metrics(session, args.only_username)
 
                 elapsed = (datetime.now(UTC) - started).total_seconds()
@@ -228,7 +248,8 @@ async def main() -> None:
                     f"poll={poll_result.status}/created:{poll_result.messages_created} "
                     f"inbound=p:{inbound_result.processed},f:{inbound_result.failed},r:{inbound_result.retry} "
                     f"recovery={recovery_result} "
-                    f"outbound=s:{outbound_result.sent},res:{outbound_result.rescheduled},f:{outbound_result.failed}"
+                    f"outbound=s:{outbound_result.sent},res:{outbound_result.rescheduled},f:{outbound_result.failed} "
+                    f"reengaged={reengaged}"
                 )
                 if metrics:
                     print(f"[{cycle}] model_metrics {metrics}")

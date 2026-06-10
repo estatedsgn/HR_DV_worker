@@ -52,6 +52,11 @@ SOFT_AGE_TRANSITIONS: set[tuple[str, str]] = {
     ("scheduled_until_18", "age_check"),
 }
 
+# Мостик перед паком голосовых о работе+ЗП: тёплое предупреждение, что сейчас
+# прилетит несколько войсов. Переопределяется через templates.json
+# (voice_pack_bridge_message).
+VOICE_PACK_BRIDGE_TEXT = "отлично) сейчас скину пару голосовых — там вся суть: что за работа, про деньги и график. послушай, как будет минутка 🐬"
+
 # Тексты отложенных сообщений в день 18-летия (поздравление) и на след. день
 # (возврат к работе). Меняются здесь либо через knowledge/templates.json.
 BIRTHDAY_CONGRATS_TEXT = "с днём рождения!! 🎉🎂 теперь тебе 18 — поздравляю от всей души) пусть всё задуманное сбывается 💖"
@@ -625,32 +630,47 @@ def _action_executor_node(knowledge: StaticFunnelKnowledgeBase, replier: ReplyOr
         profile = normalize_candidate_profile(state.get("candidate_profile"))
 
         if policy.stage_type == "action":
-            if stage == "support_smalltalk":
-                reaction = None
-                if replier is not None:
-                    reaction = await replier.generate_smalltalk_reaction(state)
-                outgoing.append({"type": "text", "text": reaction or smalltalk_text(profile), "voice_pack_id": None})
-                profile["smalltalk_done"] = True
-            if policy.voice_pack_id and policy.voice_pack_id not in sent_voice_packs:
-                outgoing.append({"type": "voice_pack", "text": None, "voice_pack_id": policy.voice_pack_id})
-                sent_voice_packs.append(policy.voice_pack_id)
-            if policy.template_id and policy.template_id not in sent_templates:
-                outgoing.append(
-                    {
-                        "type": "text",
-                        "text": knowledge.template(policy.template_id),
-                        "voice_pack_id": None,
-                        "template_id": policy.template_id,
-                    }
-                )
-                sent_templates.append(policy.template_id)
-            next_stage = ACTION_STAGE_TO_WAITING_STAGE[stage]
-            next_question = get_stage_policy(next_stage).current_question
+            # Цепочка action-стадий проходит ЗА ОДИН ход (work_intro_delivery →
+            # salary_schedule_delivery → вопрос следующей waiting-стадии): девочка
+            # сказала «интересно» и назвала возраст — получает ВСЁ содержимое сразу,
+            # без промежуточного «давай расскажу про зп?» (лишний гейт терял лидов).
+            hops = 0
+            while policy.stage_type == "action" and hops < 6:
+                hops += 1
+                if stage == "support_smalltalk":
+                    reaction = None
+                    if replier is not None:
+                        reaction = await replier.generate_smalltalk_reaction(state)
+                    outgoing.append({"type": "text", "text": reaction or smalltalk_text(profile), "voice_pack_id": None})
+                    profile["smalltalk_done"] = True
+                if stage == "work_intro_delivery" and "work_intro" not in sent_voice_packs:
+                    # Мостик перед паком голосовых: предупреждаем, что сейчас будет
+                    # несколько войсов — без него пак выглядит как бот-вывалка.
+                    bridge = template_from_state(state, "voice_pack_bridge_message") or VOICE_PACK_BRIDGE_TEXT
+                    if bridge and not outgoing_contains(outgoing, bridge):
+                        outgoing.append({"type": "text", "text": bridge, "voice_pack_id": None})
+                if policy.voice_pack_id and policy.voice_pack_id not in sent_voice_packs:
+                    outgoing.append({"type": "voice_pack", "text": None, "voice_pack_id": policy.voice_pack_id})
+                    sent_voice_packs.append(policy.voice_pack_id)
+                if policy.template_id and policy.template_id not in sent_templates:
+                    template_text = template_from_state(state, policy.template_id) or knowledge.template(policy.template_id)
+                    if template_text:
+                        outgoing.append(
+                            {
+                                "type": "text",
+                                "text": template_text,
+                                "voice_pack_id": None,
+                                "template_id": policy.template_id,
+                            }
+                        )
+                        sent_templates.append(policy.template_id)
+                stage = ACTION_STAGE_TO_WAITING_STAGE[stage]
+                policy = get_stage_policy(stage)
+            next_question = policy.current_question
             if next_question:
                 # Always keep the live reaction and the next stage question as
                 # separate messages so the bot reads like a human texting.
                 outgoing.append({"type": "text", "text": next_question, "voice_pack_id": None})
-            stage = next_stage
 
         metadata = dict(state.get("metadata") or {})
         # collapse — идемпотентен; кросс-ходовый dedupe делаем ТОЛЬКО в state_controller,

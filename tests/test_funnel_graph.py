@@ -275,14 +275,49 @@ def test_age_under_17_still_goes_to_lost() -> None:
     assert state["stage"] == "lost"
 
 
-def test_age_answer_sends_work_intro_pack_and_salary_offer() -> None:
+def test_age_answer_sends_both_voice_packs_and_digest_without_gate() -> None:
+    # Конверсионный пакет №1: после возраста СРАЗУ оба пака голосовых + текстовый
+    # дайджест условий + вопрос «остались вопросики?» — без гейта-разрешения
+    # «давай расскажу про зп?» (на нём умирали лиды).
     state = run_graph(initial_state(stage="age_check", profile={"interest_confirmed": True}), "18")
 
-    assert state["stage"] == "salary_schedule_offer"
+    assert state["stage"] == "post_equipment_questions_check"
     assert state["candidate_profile"]["age_confirmed"] is True
-    assert state["sent_voice_packs"] == ["work_intro"]
-    assert voice_packs(state) == ["work_intro"]
-    assert text_messages(state) == ["если интересна наша сфера, давай расскажу про зп и график 🐬"]
+    assert state["sent_voice_packs"] == ["work_intro", "salary_schedule"]
+    assert voice_packs(state) == ["work_intro", "salary_schedule"]
+    texts = text_messages(state)
+    # Мостик-предупреждение перед войсами, дайджест после, вопрос в конце.
+    assert any("голосовых" in t for t in texts)
+    assert any("выплаты на карту" in t for t in texts)
+    assert texts[-1] == "остались ли у тебя какие-нибудь ещё вопросики?"
+    # Гейта про «расскажу про зп» больше нет.
+    assert all("давай расскажу про зп" not in t for t in texts)
+
+
+def test_age_affirmative_to_18_question_confirms_age() -> None:
+    # «Да» в ответ на наш вопрос, упоминавший 18 («тебе уже есть 18?»), — это
+    # подтверждение возраста, а не повод переспрашивать «сколько тебе лет?».
+    state = initial_state(stage="age_check", profile={"interest_confirmed": True})
+    state["recent_messages"] = [
+        {"direction": "outbound", "sender_type": "agent", "body": "сразу уточню базовый момент — тебе уже есть 18?"}
+    ]
+    result = run_graph(state, "да")
+
+    assert result["candidate_profile"]["age_confirmed"] is True
+    assert result["candidate_profile"]["age"] == 18
+    assert result["stage"] == "post_equipment_questions_check"
+
+
+def test_age_bare_affirmative_without_18_context_does_not_confirm() -> None:
+    # Без «18» в нашем последнем сообщении голое «да» возраст НЕ подтверждает.
+    state = initial_state(stage="age_check", profile={"interest_confirmed": True})
+    state["recent_messages"] = [
+        {"direction": "outbound", "sender_type": "agent", "body": "давай для начала уточним небольшую формальность, сколько тебе лет?"}
+    ]
+    result = run_graph(state, "да")
+
+    assert result["candidate_profile"]["age_confirmed"] is None
+    assert result["stage"] == "age_check"
 
 
 def test_salary_offer_question_is_interrupt() -> None:
@@ -422,7 +457,10 @@ def test_salary_agreement_sends_salary_pack_and_asks_any_questions() -> None:
     assert state["stage"] == "post_equipment_questions_check"
     assert state["candidate_profile"]["salary_schedule_interest"] is True
     assert voice_packs(state) == ["salary_schedule"]
-    assert text_messages(state) == ["остались ли у тебя какие-нибудь ещё вопросики?"]
+    texts = text_messages(state)
+    # Дайджест условий текстом (на случай, если голосовые не слушает) + вопрос.
+    assert any("выплаты на карту" in t for t in texts)
+    assert texts[-1] == "остались ли у тебя какие-нибудь ещё вопросики?"
 
 
 def _salary_offer_awaiting_state():
@@ -489,7 +527,9 @@ def test_action_stage_sends_voice_even_when_llm_reply_send_is_false() -> None:
 
     assert state["stage"] == "post_equipment_questions_check"
     assert voice_packs(state) == ["salary_schedule"]
-    assert text_messages(state) == ["остались ли у тебя какие-нибудь ещё вопросики?"]
+    texts = text_messages(state)
+    assert any("выплаты на карту" in t for t in texts)
+    assert texts[-1] == "остались ли у тебя какие-нибудь ещё вопросики?"
 
 
 def test_equipment_does_not_close_phone_model_requirement() -> None:

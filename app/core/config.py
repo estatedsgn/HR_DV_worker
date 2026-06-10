@@ -108,6 +108,15 @@ class Settings(BaseSettings):
     langgraph_checkpoint_postgres_enabled: bool = Field(
         default=True, alias="LANGGRAPH_CHECKPOINT_POSTGRES_ENABLED"
     )
+    # Повторные касания замолчавших лидов: до 3 «бампов» с нарастающими паузами
+    # (часы, через запятую), потом замолкаем навсегда. См. funnel_graph/reengage.py.
+    reengage_enabled: bool = Field(default=True, alias="REENGAGE_ENABLED")
+    reengage_touch_delays_hours: str = Field(
+        default="4,20,48", alias="REENGAGE_TOUCH_DELAYS_HOURS"
+    )
+    # Максимум бампов за один скан — чтобы открытие рабочего окна не давало
+    # массовую волну одинаковых сообщений со всех аккаунтов разом.
+    reengage_batch_limit: int = Field(default=10, alias="REENGAGE_BATCH_LIMIT")
     brain_default_provider: str | None = Field(default=None, alias="BRAIN_DEFAULT_PROVIDER")
     brain_interest_classifier_provider: str | None = Field(
         default=None, alias="BRAIN_INTEREST_CLASSIFIER_PROVIDER"

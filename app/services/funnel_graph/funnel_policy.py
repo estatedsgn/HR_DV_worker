@@ -105,16 +105,21 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
         allowed_transitions=("scheduled_until_18", "work_intro_delivery", "age_check", "lost", "do_not_contact", "human_handoff"),
         stage_type="waiting",
     ),
+    # После возраста СРАЗУ выдаём всё: голосовые о работе + голосовые про ЗП/график
+    # одним паком, без промежуточного вопроса-разрешения. Каждый лишний гейт-вопрос
+    # терял часть лидов (см. docs/CHANGELOG_AGENT.md, конверсионный пакет №1).
     "work_intro_delivery": StagePolicy(
         name="work_intro_delivery",
         goal="Отправить готовые голосовые о работе.",
         current_question=None,
         required_fields=(),
-        next_stage_if_completed="salary_schedule_offer",
-        allowed_transitions=("salary_schedule_offer",),
+        next_stage_if_completed="salary_schedule_delivery",
+        allowed_transitions=("salary_schedule_delivery",),
         stage_type="action",
         voice_pack_id="work_intro",
     ),
+    # Совместимость: лиды, уже стоящие на этом гейте, доезжают через
+    # offer_deliver_voices (state_controller). Новые лиды сюда не попадают.
     "salary_schedule_offer": StagePolicy(
         name="salary_schedule_offer",
         goal="Получить согласие кандидатки узнать про зарплату и график.",
@@ -133,6 +138,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
         allowed_transitions=("post_equipment_questions_check",),
         stage_type="action",
         voice_pack_id="salary_schedule",
+        template_id="salary_digest_message",
     ),
     "post_equipment_questions_check": StagePolicy(
         name="post_equipment_questions_check",
@@ -283,8 +289,10 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
 }
 
 
+# Куда «хопает» action-стадия после выполнения. Цепочки action→action разрешены:
+# executor проходит их подряд за один ход (work_intro → salary_schedule → вопрос).
 ACTION_STAGE_TO_WAITING_STAGE = {
-    "work_intro_delivery": "salary_schedule_offer",
+    "work_intro_delivery": "salary_schedule_delivery",
     "salary_schedule_delivery": "post_equipment_questions_check",
     "support_smalltalk": "room_available_check",
     "company_intro": "profile_theme_check",
