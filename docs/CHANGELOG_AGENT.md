@@ -5,6 +5,33 @@
 
 ---
 
+## 2026-06-10 ~23:10 МСК — СТАТУС ДЕПЛОЯ: код готов, ждёт одной команды
+
+Конверсионный пакет №1 закоммичен в ветку `conv-fixes` (коммиты 223288a,
+614c127 поверх живого серверного b9021df), все 257 тестов зелёные. Деплой на
+прод требует подтверждения владельца. Как задеплоить (одна команда с локальной
+машины, из каталога C:/Users/nyaku/hrdv_live):
+
+```bash
+git push serverlive conv-fixes:refs/heads/conv-fixes \
+  && ssh hrdv@85.137.90.2 "cd /opt/HR_DV_worker \
+       && git merge --ff-only conv-fixes \
+       && .venv/bin/python -m pytest tests/test_funnel_graph.py tests/test_funnel_reengage.py -q \
+       && sudo systemctl restart hrdv-autopilot-2 hrdv-supervisor"
+```
+
+(Если push упадёт с «unable to migrate objects» — на сервере мог остаться мусор
+прав в .git/objects; тогда: `git bundle create /tmp/conv.bundle b9021df..conv-fixes`,
+`scp /tmp/conv.bundle hrdv@85.137.90.2:/tmp/`, на сервере
+`git fetch /tmp/conv.bundle conv-fixes:conv-fixes && git merge --ff-only conv-fixes`
+и тот же рестарт.)
+
+Сейчас ~23:10 МСК, автопилот спит до 10:00 — если задеплоить вечером/ночью,
+новая логика заработает ровно с открытием окна, и в течение первого часа
+~29 «холодных» молчунов получат бамп №1 (пачками по 10 за скан раз в ~5 минут).
+
+---
+
 ## 2026-06-10 ~21:45 МСК — Конверсионный пакет №1 (локальная сессия Claude)
 
 Контекст: полное исследование живой системы (50 лидов в БД сервера, все переписки
