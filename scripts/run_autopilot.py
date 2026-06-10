@@ -6,6 +6,7 @@ import os
 import sys
 from datetime import UTC, datetime
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select, update
 
@@ -81,7 +82,27 @@ def parse_args() -> argparse.Namespace:
         help="Test mode: keep the brain talking until this many inbound messages are collected before handoff.",
     )
     parser.add_argument("--stop-after-cycles", type=int, default=None)
+    parser.add_argument(
+        "--ignore-active-hours",
+        action="store_true",
+        help=(
+            "Keep running outside the configured working window "
+            "(DAIVINCHIK_ACTIVE_HOURS_START..END). By default the autopilot goes "
+            "fully silent outside those hours — no polling, no replies, no sends — "
+            "mirroring the swiper. Use this for evals/manual runs at night."
+        ),
+    )
     return parser.parse_args()
+
+
+def _within_active_hours(settings) -> tuple[bool, datetime, str]:
+    """Сейчас ли рабочее окно агента (то же, что у свайпера Дайвинчика)."""
+    tz = ZoneInfo(settings.daivinchik_timezone)
+    now = datetime.now(tz)
+    start = settings.daivinchik_active_hours_start
+    end = settings.daivinchik_active_hours_end
+    window = f"{start:02d}-{end:02d} {settings.daivinchik_timezone}"
+    return (start <= now.hour < end), now, window
 
 
 async def main() -> None:
@@ -117,10 +138,29 @@ async def main() -> None:
 
     cycle = 0
     only_dialog_ids: list[str] | None = None
+    was_paused = False
     while True:
         cycle += 1
         started = datetime.now(UTC)
         sleep_seconds = args.poll_interval_seconds
+
+        # Гейт рабочих часов: вне окна 10–22 (DAIVINCHIK_ACTIVE_HOURS_*) агент
+        # полностью молчит — не поллит, не отвечает, не шлёт, как свайпер. Так
+        # лид, написавший в 23:00, получит ответ в 10:00, а не ночью.
+        if not args.ignore_active_hours:
+            in_hours, now_local, window = _within_active_hours(get_settings())
+            if not in_hours:
+                if not was_paused:
+                    print(
+                        f"[{cycle}] вне рабочего окна {window} "
+                        f"(сейчас {now_local:%H:%M}) — пауза до начала окна"
+                    )
+                    was_paused = True
+                await asyncio.sleep(60)
+                continue
+            if was_paused:
+                print(f"[{cycle}] рабочее окно {window} открыто — возобновляю")
+                was_paused = False
         try:
             connector = (
                 CRMChatConnector.for_account(account) if account is not None else CRMChatConnector()

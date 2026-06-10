@@ -1,0 +1,11 @@
+[Unit]
+Description=HR_DV_worker — watchdog (alerts the control chat ONLY on problems)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=hrdv
+Group=hrdv
+WorkingDirectory=/opt/HR_DV_worker
+ExecStart=/opt/HR_DV_worker/.venv/bin/python /opt/HR_DV_worker/scripts/heartbeat.py --quiet-if-healthy

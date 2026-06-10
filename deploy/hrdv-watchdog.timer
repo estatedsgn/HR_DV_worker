@@ -1,0 +1,10 @@
+[Unit]
+Description=Run HR_DV_worker watchdog every 10 minutes (problem-only alerts)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

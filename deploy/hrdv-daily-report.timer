@@ -1,0 +1,12 @@
+[Unit]
+Description=Run HR_DV_worker daily funnel report once a day (after the work window)
+
+[Timer]
+# Время системное (на VPS Europe/Amsterdam, CEST). MSK = система +1, поэтому
+# 21:15 по системе = 22:15 МСК — сразу после закрытия рабочего окна 10–22 МСК.
+# Сверь `timedatectl` при установке: при другой системной TZ поправь час.
+OnCalendar=*-*-* 21:15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

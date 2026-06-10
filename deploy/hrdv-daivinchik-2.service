@@ -1,0 +1,19 @@
+[Unit]
+Description=HR_DV_worker — Daivinchik swiper for account #2 (Марго, own key)
+After=network-online.target docker.service hrdv-postgres.service hrdv-account-sync.service
+Wants=network-online.target hrdv-postgres.service hrdv-account-sync.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=hrdv
+Group=hrdv
+WorkingDirectory=/opt/HR_DV_worker
+ExecStart=/opt/HR_DV_worker/.venv/bin/python -u -m app.services.daivinchik --account db850ae7-d8dc-4618-a038-8957dd9dd616
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/HR_DV_worker/runtime_logs/daivinchik2.log
+StandardError=append:/opt/HR_DV_worker/runtime_logs/daivinchik2.log
+
+[Install]
+WantedBy=multi-user.target
