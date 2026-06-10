@@ -241,7 +241,13 @@ class Settings(BaseSettings):
         default=2, alias="DAIVINCHIK_AD_BUTTON_FROM_RIGHT"
     )
     daivinchik_history_limit: int = Field(
-        default=12, alias="DAIVINCHIK_HISTORY_LIMIT"
+        default=40, alias="DAIVINCHIK_HISTORY_LIMIT"
+    )
+    # Сколько страниц истории листать назад за тик, чтобы покрыть пачку сообщений
+    # Дайвинчика (открытые «взаимные симпатии» вываливают десятки карточек разом).
+    # 40 * 8 = до 320 сообщений с момента последнего курсора — с большим запасом.
+    daivinchik_history_max_pages: int = Field(
+        default=8, alias="DAIVINCHIK_HISTORY_MAX_PAGES"
     )
     daivinchik_state_path: str = Field(
         default="daivinchik_state.json", alias="DAIVINCHIK_STATE_PATH"

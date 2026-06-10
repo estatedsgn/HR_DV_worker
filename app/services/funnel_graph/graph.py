@@ -921,7 +921,7 @@ def pending_actions_from_outgoing(state: FunnelGraphState, outgoing: list[dict[s
     group_size = outgoing_action_count(state, normalized_outgoing)
     group_index = 0
     cumulative_delay_seconds = 0
-    for index, message in enumerate(normalized_outgoing):
+    for message in normalized_outgoing:
         if message.get("type") == "voice_pack":
             # Все голосовые пака планируем на ОДИН момент (общий base delay), чтобы
             # outbound-воркер забрал их в одном батче и отправил подряд за один цикл,
@@ -945,10 +945,10 @@ def pending_actions_from_outgoing(state: FunnelGraphState, outgoing: list[dict[s
                         "reply_group_id": reply_group_id,
                         "reply_group_index": group_index,
                         "reply_group_size": group_size,
-                        "idempotency_key": (
-                            f"{reply_group_id}:{index}:{message.get('voice_pack_id')}:"
-                            f"{voice_index}:{item.get('id') or stable_digest(item)}"
-                        ),
+                        # Детерминированный ключ: позиция в ответе (group_index), а
+                        # НЕ digest текста/элемента. Повторная обработка того же хода
+                        # даёт тот же ключ -> дубль не создаётся.
+                        "idempotency_key": f"{reply_group_id}:{group_index}",
                     }
                 )
             # Хвостовой вопрос после пака — в тот же батч/цикл (тот же base delay).
@@ -976,7 +976,9 @@ def pending_actions_from_outgoing(state: FunnelGraphState, outgoing: list[dict[s
                 "reply_group_id": reply_group_id,
                 "reply_group_index": group_index,
                 "reply_group_size": group_size,
-                "idempotency_key": f"{reply_group_id}:{index}:{stable_digest(str(message.get('text')))}",
+                # Детерминированный ключ по позиции в ответе, без digest текста —
+                # см. build_reply_group_id: повторный прогон того же хода не дублит.
+                "idempotency_key": f"{reply_group_id}:{group_index}",
             }
         )
     if state.get("stage") == "lost":
@@ -1030,6 +1032,18 @@ def text_typing_delay_range(state: FunnelGraphState) -> tuple[float, float]:
 
 
 def build_reply_group_id(state: FunnelGraphState, outgoing: list[dict[str, Any]]) -> str:
+    """Стабильный идентификатор ответа на ход — детерминированно зависит ТОЛЬКО
+    от входа хода (стадия + входящие, на которые отвечаем), но НЕ от
+    сгенерированного LLM текста.
+
+    Раньше в digest входил `outgoing` (текст ответа). Текст недетерминирован: при
+    повторной обработке того же хода (ретрай inbound-события, гонка, наложение
+    циклов автопилота) LLM выдавал чуть другую формулировку → другой ключ →
+    дедуп `_existing_job` промахивался → уходило ВТОРОЕ сообщение тому же человеку.
+    Теперь ключ зависит от id входящих сообщений хода, поэтому повторная обработка
+    того же хода всегда даёт тот же ключ и дубль не создаётся, какой бы текст LLM
+    ни сгенерировал во второй раз. `outgoing` оставлен в сигнатуре для совместимости.
+    """
     thread_id = state.get("thread_id") or state.get("candidate_id") or "local"
     stage = state.get("stage") or "unknown"
     payload = {
@@ -1042,16 +1056,6 @@ def build_reply_group_id(state: FunnelGraphState, outgoing: list[dict[str, Any]]
                 "sent_at": item.get("sent_at"),
             }
             for item in list(state.get("message_batch") or [])
-        ],
-        "outgoing": [
-            {
-                "type": message.get("type"),
-                "text": message.get("text"),
-                "voice_pack_id": message.get("voice_pack_id"),
-                "template_id": message.get("template_id"),
-            }
-            for message in outgoing
-            if message.get("type") == "voice_pack" or (message.get("type") == "text" and message.get("text"))
         ],
     }
     return f"{thread_id}:{stage}:reply:{stable_digest(payload)}"

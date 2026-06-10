@@ -265,7 +265,7 @@ class LangGraphFunnelGateway:
         )
         messages = list(result.scalars().all())
         messages.reverse()
-        return messages
+        return _collapse_outbound_duplicates(messages)
 
     async def _inbound_batch_since_last_outbound(self, dialog_id) -> list[Message]:
         from app.services.funnel_graph.turn_buffer import FunnelTurnBufferService
@@ -352,6 +352,31 @@ class LangGraphFunnelGateway:
         if message is not None:
             runtime.last_processed_message_id = message.id
         await self.session.flush()
+
+
+def _collapse_outbound_duplicates(messages: list[Message]) -> list[Message]:
+    """Свернуть дубли исходящих, оставшиеся от readback-копий (sent + synced).
+
+    Даже после фикса на стороне поллинга в БД могут лежать ранее накопленные пары
+    «то же исходящее дважды». Если скормить их LLM, она решит, что написала дважды,
+    и извинится. Поэтому соседние исходящие с одинаковым текстом схлопываем в одно.
+    """
+    collapsed: list[Message] = []
+    for message in messages:
+        if (
+            message.direction == "outbound"
+            and collapsed
+            and collapsed[-1].direction == "outbound"
+            and _norm_body(collapsed[-1].body) == _norm_body(message.body)
+            and _norm_body(message.body) != ""
+        ):
+            continue
+        collapsed.append(message)
+    return collapsed
+
+
+def _norm_body(body: str | None) -> str:
+    return " ".join((body or "").split()).lower()
 
 
 def message_to_funnel_message(message: Message) -> FunnelMessage:

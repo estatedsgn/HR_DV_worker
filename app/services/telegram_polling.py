@@ -303,6 +303,18 @@ class TelegramPollingService:
         if await repository.get_by_crmchat_message_id(external_message_id):
             return False
 
+        # Перечитанное НАШЕ исходящее: не плодим вторую запись — привязываем
+        # crmchat_message_id к существующей записи отправки. Иначе бот видел бы своё
+        # сообщение в истории дважды и извинялся, что написал дважды.
+        if message_snapshot.outgoing:
+            adopted = await repository.adopt_outbound_readback(
+                dialog.id,
+                message_snapshot.text or "",
+                external_message_id,
+            )
+            if adopted is not None:
+                return False
+
         message_kwargs = {
             "dialog_id": dialog.id,
             "crmchat_message_id": external_message_id,

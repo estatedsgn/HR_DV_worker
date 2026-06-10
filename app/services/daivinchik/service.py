@@ -395,8 +395,17 @@ class DaivinchikService:
         *,
         passive: bool = False,
     ) -> None:
+        # Курсор покрытия: самый старый из «уже обработанных» указателей. Листаем
+        # историю назад до него, чтобы ни одно сообщение (особенно матч из пачки)
+        # не проскочило мимо между тиками.
+        cursors = [c for c in (self.state.last_match_id, self.state.last_acted_id) if c > 0]
+        coverage_min_id = min(cursors) if cursors else 0
         messages = await self._fetch_messages(
-            connector, context, peer, limit=self.cfg.daivinchik_history_limit
+            connector,
+            context,
+            peer,
+            limit=self.cfg.daivinchik_history_limit,
+            min_id=coverage_min_id,
         )
         self._remember_keyboard(messages)
 
@@ -639,19 +648,55 @@ class DaivinchikService:
         peer: dict[str, Any],
         *,
         limit: int,
+        min_id: int = 0,
     ) -> list[BotMessage]:
-        payload = await connector.get_history(
-            context.workspace.id, context.telegram_account.id, peer, limit=limit
-        )
-        snapshots = normalize_messages_response(payload)
-        messages: list[BotMessage] = []
-        for snapshot in snapshots:
-            if snapshot.raw is None:
-                continue
-            parsed = parse_bot_message(snapshot.raw)
-            if parsed is not None:
-                messages.append(parsed)
-        return messages
+        """Прочитать последние сообщения диалога с ботом.
+
+        Если задан ``min_id`` (курсор последнего обработанного), листаем историю
+        назад страницами, пока не покроем ВСЁ, что пришло после курсора. Это спасает
+        от потери матчей, когда Дайвинчик вываливает пачку сообщений (открыли
+        «взаимные симпатии» — прилетает десятки карточек разом): без пагинации матч,
+        выпавший за окно ``limit``, уезжал ниже last_match_id и пропадал навсегда.
+        """
+        collected: dict[int, BotMessage] = {}
+        offset_id = 0
+        pages = 0
+        max_pages = max(1, self.cfg.daivinchik_history_max_pages)
+        while True:
+            payload = await connector.get_history(
+                context.workspace.id,
+                context.telegram_account.id,
+                peer,
+                limit=limit,
+                offset_id=offset_id,
+            )
+            snapshots = normalize_messages_response(payload)
+            if not snapshots:
+                break
+            page_min_id = None
+            for snapshot in snapshots:
+                if snapshot.raw is None:
+                    continue
+                parsed = parse_bot_message(snapshot.raw)
+                if parsed is None:
+                    continue
+                collected[parsed.message_id] = parsed
+                if page_min_id is None or parsed.message_id < page_min_id:
+                    page_min_id = parsed.message_id
+            pages += 1
+            # Дальше листаем, только если просили покрыть курсор и ещё не дошли до него.
+            if page_min_id is None or min_id <= 0 or page_min_id <= min_id:
+                break
+            if pages >= max_pages:
+                logger.warning(
+                    "history pagination hit cap (%d pages); oldest id %s still > cursor %s",
+                    max_pages,
+                    page_min_id,
+                    min_id,
+                )
+                break
+            offset_id = page_min_id
+        return sorted(collected.values(), key=lambda m: m.message_id)
 
     def _human_delay(self) -> float:
         return self.rng.uniform(

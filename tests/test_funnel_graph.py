@@ -13,7 +13,7 @@ from app.models.lead import Lead
 from app.models.outbound_job import OutboundJob
 from app.services.funnel_graph.actions import FunnelActionExecutor
 from app.services.funnel_graph.checkpoint import psycopg_conn_string
-from app.services.funnel_graph.gateway import LangGraphFunnelGateway
+from app.services.funnel_graph.gateway import LangGraphFunnelGateway, _collapse_outbound_duplicates
 from app.services.funnel_graph.graph import build_funnel_graph, pending_actions_from_outgoing, state_controller
 from app.services.funnel_graph.knowledge import StaticFunnelKnowledgeBase
 from app.services.funnel_graph.reply import (
@@ -939,7 +939,59 @@ def test_multi_message_outbound_actions_share_reply_group_id() -> None:
     assert None not in group_ids
     assert [action["reply_group_index"] for action in actions[:3]] == [1, 2, 3]
     assert all(action["reply_group_size"] == 3 for action in actions[:3])
-    assert [action["idempotency_key"].rsplit(":", 2)[-2] for action in actions[:3]] == ["0", "1", "2"]
+    # Ключ детерминирован и зависит только от reply_group_id + позиции (group_index),
+    # без digest текста: повторный прогон того же хода даёт те же ключи.
+    group_id = next(iter(group_ids))
+    assert [action["idempotency_key"] for action in actions[:3]] == [
+        f"{group_id}:1",
+        f"{group_id}:2",
+        f"{group_id}:3",
+    ]
+
+
+def test_collapse_outbound_duplicates_removes_readback_pairs() -> None:
+    """Соседние исходящие с одинаковым текстом (sent + перечитанный поллингом
+    synced) схлопываются в одно, чтобы LLM не видела, что «написала дважды»,
+    и не извинялась. Входящие и разные исходящие не трогаем."""
+    from app.models.message import Message
+
+    def msg(direction: str, body: str) -> Message:
+        return Message(direction=direction, body=body)
+
+    messages = [
+        msg("inbound", "привет"),
+        msg("outbound", "Привет! как дела"),
+        msg("outbound", "Привет!  как дела"),  # readback-дубль (норм. совпадает)
+        msg("inbound", "норм"),
+        msg("outbound", "ок"),
+    ]
+    collapsed = _collapse_outbound_duplicates(messages)
+    assert [(m.direction, m.body) for m in collapsed] == [
+        ("inbound", "привет"),
+        ("outbound", "Привет! как дела"),
+        ("inbound", "норм"),
+        ("outbound", "ок"),
+    ]
+
+
+def test_reply_idempotency_key_is_independent_of_generated_text() -> None:
+    """Один и тот же ход (та же стадия + те же входящие), но разный текст ответа
+    LLM, обязан давать ОДИНАКОВЫЙ idempotency_key. Иначе повторная обработка хода
+    с чуть другой формулировкой создаёт дубль-отправку — ровно тот баг, который мы
+    чиним. Ключ должен зависеть только от входа хода, не от вывода модели."""
+    state = initial_state(stage="interest_check")
+    state["incoming_message"] = "привет, расскажи подробнее"
+    state["message_batch"] = [{"id": "m-1", "body": "привет, расскажи подробнее", "sent_at": "2026-06-10T10:00:00+00:00"}]
+
+    first = pending_actions_from_outgoing(
+        state | {"send_reply": True}, [{"type": "text", "text": "Привет! Расскажу с радостью."}]
+    )
+    second = pending_actions_from_outgoing(
+        state | {"send_reply": True}, [{"type": "text", "text": "Приветик) конечно расскажу."}]
+    )
+
+    assert first[0]["idempotency_key"] == second[0]["idempotency_key"]
+    assert first[0]["reply_group_id"] == second[0]["reply_group_id"]
 
 
 def test_voice_pack_expands_to_recorded_voice_jobs_before_text() -> None:
