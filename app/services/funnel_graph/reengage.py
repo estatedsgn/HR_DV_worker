@@ -173,6 +173,10 @@ class ReengagementService:
                 "reengage_count": touch_number,
                 "reengage_last_at": now.isoformat(),
             }
+            # Коммит после КАЖДОГО касания: сужает окно гонки с параллельным
+            # процессом (scoped + all-accounts) до долей секунды, а судьба уже
+            # поставленного бампа не зависит от ошибок на следующих лидах.
+            await self.session.commit()
             sent += 1
             logger.info(
                 "reengage touch sent",
@@ -183,8 +187,6 @@ class ReengagementService:
                     "stage": candidate.runtime.stage,
                 },
             )
-        if sent:
-            await self.session.commit()
         return sent
 
     async def _send_touch(self, candidate: ReengageCandidate, touch_number: int, text: str) -> None:
