@@ -41,6 +41,13 @@ class LangGraphFunnelGateway:
             return None
         lead = await self._get_or_create_lead(dialog)
         runtime = await self.get_or_create_runtime(lead=lead, dialog=dialog)
+        # A human has taken over this dialog (handoff or explicit pause): the bot
+        # must stay COMPLETELY silent — no graph run, no reply — until a human
+        # explicitly resumes it (scripts/resume_funnel_dialog.py). Otherwise the
+        # funnel keeps answering the lead's messages and "interjects" right in the
+        # middle of the recruiter's own conversation.
+        if is_bot_silenced(runtime):
+            return None
         message = await self.session.get(Message, message_id) if message_id else None
         if message is None:
             message = await self._latest_inbound(dialog.id)
@@ -352,6 +359,22 @@ class LangGraphFunnelGateway:
         if message is not None:
             runtime.last_processed_message_id = message.id
         await self.session.flush()
+
+
+def is_bot_silenced(runtime: LeadFunnelRuntime) -> bool:
+    """True when the dialog is human-controlled and the bot must not write.
+
+    Triggered by a human handoff (``status == "handoff"`` / ``stage ==
+    "human_handoff"``) or by an explicit manual pause flag in the runtime
+    metadata (``bot_paused``). ``scripts/resume_funnel_dialog.py`` clears all of
+    these to hand the conversation back to the bot.
+    """
+    if str(runtime.status or "") == "handoff":
+        return True
+    if str(runtime.stage or "") == "human_handoff":
+        return True
+    metadata = runtime.metadata_json or {}
+    return bool(metadata.get("bot_paused"))
 
 
 def _collapse_outbound_duplicates(messages: list[Message]) -> list[Message]:
