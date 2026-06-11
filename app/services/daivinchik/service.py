@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import random
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -163,6 +164,11 @@ class DaivinchikService:
         self._stop_on_limit = False
         self._limit_reached = False
         self._daily_cap_reached = False
+        # Пользователи из getHistory-ответов (id -> raw user dict с username и
+        # accessHash). Нужны, чтобы написать мэтчу, у которого нет публичного
+        # @handle: Дайвинчик линкует таких по tg://user?id=…, а peer для отправки
+        # собирается из accessHash, который Telegram уже отдал вместе с историей.
+        self._users_by_id: dict[str, dict[str, Any]] = {}
 
     def _make_connector(self) -> CRMChatConnector:
         if self._external_connector is not None:
@@ -553,6 +559,7 @@ class DaivinchikService:
         self, lead: LeadCapture, message: BotMessage, connector: CRMChatConnector | None = None
     ) -> None:
         source = self.cfg.daivinchik_lead_source
+        lead, access_hash = self._enrich_lead_from_history_users(lead)
         # Always persist the contact to the durable leads table first, so a match
         # is never lost even if the DB intake can't run.
         self._log_lead(lead, message)
@@ -571,14 +578,14 @@ class DaivinchikService:
             self._daily_cap_reached = True
             logger.info("daily lead cap reached — will stop until tomorrow")
 
-        if not lead.telegram_username:
-            # Дайвинчик linked the person by user-id only (no public @handle).
-            # The worker can't auto-resolve that, so flag it for manual handling.
-            logger.warning("match without username: %s (link=%s)", lead.external_id, lead.link)
+        if not lead.telegram_username and not (lead.telegram_user_id and access_hash):
+            # Дайвинчик linked the person by user-id only (no public @handle) И
+            # accessHash не нашёлся в истории — написать физически нечем, only manual.
+            logger.warning("match without username/peer: %s (link=%s)", lead.external_id, lead.link)
             await self.notifier.notify_intake_blocked(
                 telegram_username=lead.link or lead.external_id,
                 source=source,
-                reason="Мэтч без @username (ссылка на профиль по id) — собран в daivinchik_leads.jsonl, обработай вручную",
+                reason="Мэтч без @username и без peer — собран в daivinchik_leads.jsonl, обработай вручную",
             )
             return
 
@@ -588,6 +595,10 @@ class DaivinchikService:
                     source=source,
                     external_lead_id=lead.external_id,
                     telegram_username=lead.telegram_username,
+                    # Прямой peer (id + accessHash из истории): открывает интейк
+                    # мэтчам без @handle и экономит resolveUsername остальным.
+                    telegram_user_id=lead.telegram_user_id,
+                    telegram_access_hash=access_hash,
                     # Bind the lead to THIS swiper's account — the one that got the
                     # mutual match — so the funnel replies from the same account.
                     account_id=str(self.account.id) if self.account is not None else None,
@@ -595,21 +606,22 @@ class DaivinchikService:
                         "display_name": lead.display_name,
                         "profile_text": lead.profile_text,
                         "telegram_user_id": lead.telegram_user_id,
+                        "telegram_access_hash": access_hash,
                         "link": lead.link,
                         "match_message_id": message.message_id,
                     },
                 )
             logger.info(
                 "lead captured %s (idempotent=%s)",
-                lead.telegram_username,
+                lead.telegram_username or lead.external_id,
                 result.idempotent,
             )
         except Exception as exc:  # noqa: BLE001
             # DB unavailable etc. The contact is already safe in the leads file,
             # so never let a match stall the swipe loop — log and move on.
-            logger.warning("DB intake failed for %s: %s", lead.telegram_username, exc)
+            logger.warning("DB intake failed for %s: %s", lead.telegram_username or lead.external_id, exc)
             await self.notifier.notify_intake_blocked(
-                telegram_username=lead.telegram_username,
+                telegram_username=lead.telegram_username or lead.link or lead.external_id,
                 source=source,
                 reason=f"БД недоступна, лид сохранён в {self.leads_path.name}: {type(exc).__name__}",
             )
@@ -630,6 +642,39 @@ class DaivinchikService:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         except OSError as exc:  # noqa: BLE001
             logger.warning("could not write leads table: %s", exc)
+
+    def _enrich_lead_from_history_users(self, lead: LeadCapture) -> tuple[LeadCapture, str | None]:
+        """Дотянуть username/accessHash мэтча из user-объектов getHistory.
+
+        Telegram отдаёт вместе с историей полные user-объекты всех, кто упомянут
+        в сообщениях — включая мэтча, на имени которого висит mention. Отсюда
+        берём публичный @handle (если он есть, но не попал в текст) и accessHash,
+        по которому можно писать даже без @handle."""
+        if not lead.telegram_user_id:
+            return lead, None
+        user = self._users_by_id.get(str(lead.telegram_user_id))
+        if not user:
+            return lead, None
+        access_hash = user.get("accessHash") or user.get("access_hash")
+        username = user.get("username")
+        if not lead.telegram_username and username:
+            lead = replace(lead, telegram_username=f"@{username}")
+        return lead, (str(access_hash) if access_hash is not None else None)
+
+    def _remember_users(self, payload: Any) -> None:
+        """Скопить user-объекты из getHistory: там лежит accessHash собеседников,
+        упомянутых в сообщениях, — единственный способ написать мэтчу без @handle."""
+        try:
+            users = payload.get("users") or []
+        except AttributeError:
+            return
+        for user in users:
+            try:
+                user_id = user.get("id")
+            except AttributeError:
+                continue
+            if user_id is not None:
+                self._users_by_id[str(user_id)] = dict(user)
 
     async def _resolve_bot_peer(
         self, connector: CRMChatConnector, context: CRMChatBootstrapContext
@@ -670,6 +715,7 @@ class DaivinchikService:
                 limit=limit,
                 offset_id=offset_id,
             )
+            self._remember_users(payload)
             snapshots = normalize_messages_response(payload)
             if not snapshots:
                 break

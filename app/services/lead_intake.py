@@ -54,12 +54,22 @@ class LeadIntakeService:
         *,
         source: str,
         external_lead_id: str,
-        telegram_username: str,
+        telegram_username: str | None = None,
         payload: dict[str, Any] | None = None,
         campaign_id: str | None = None,
         account_id: str | None = None,
+        telegram_user_id: str | None = None,
+        telegram_access_hash: str | None = None,
     ) -> LeadIntakeResult:
-        normalized_username = normalize_username(telegram_username)
+        # Лида можно завести либо по @username, либо по прямому peer (id +
+        # accessHash из истории Telegram) — так захватываются мэтчи без
+        # публичного @handle, которым раньше физически нельзя было написать.
+        if telegram_username:
+            normalized_username = normalize_username(telegram_username)
+        elif telegram_user_id:
+            normalized_username = f"id:{telegram_user_id}"
+        else:
+            raise ValueError("telegram_username or telegram_user_id is required")
         repository = LeadIntakeEventRepository(self.session)
         duplicate = await repository.get_duplicate(
             source=source, external_lead_id=external_lead_id
@@ -114,7 +124,9 @@ class LeadIntakeService:
             account=account,
             source=source,
             external_lead_id=external_lead_id,
-            telegram_username=normalized_username,
+            telegram_username=normalized_username if telegram_username else None,
+            telegram_user_id=telegram_user_id,
+            telegram_access_hash=telegram_access_hash,
         )
         try:
             event.dialog_id = dialog.id
@@ -190,12 +202,18 @@ class LeadIntakeService:
 
         Returns the first_message (for the 'new lead' notification), or None.
         """
-        normalized_username = normalize_username(event.telegram_username)
+        payload = event.payload or {}
+        # Лид мог быть заведён без @handle (telegram_username = "id:<user_id>") —
+        # тогда канонический диалог строится по прямому peer из payload.
+        has_handle = bool(event.telegram_username) and not event.telegram_username.startswith("id:")
+        normalized_username = normalize_username(event.telegram_username) if has_handle else event.telegram_username
         dialog = await self._get_or_create_dialog(
             account=account,
             source=event.source,
             external_lead_id=event.external_lead_id,
-            telegram_username=normalized_username,
+            telegram_username=normalized_username if has_handle else None,
+            telegram_user_id=str(payload.get("telegram_user_id") or "") or None,
+            telegram_access_hash=str(payload.get("telegram_access_hash") or "") or None,
         )
         event.account_id = account.id
         event.dialog_id = dialog.id
@@ -249,18 +267,29 @@ class LeadIntakeService:
         account,
         source: str,
         external_lead_id: str,
-        telegram_username: str,
+        telegram_username: str | None,
+        telegram_user_id: str | None = None,
+        telegram_access_hash: str | None = None,
     ) -> Dialog:
         # Preferred path: resolve the real Telegram peer and bind the funnel to the
         # canonical telegram:<account>:user:<id> dialog (with peer), so the poller
         # reads her replies into the SAME dialog the funnel drives. See [[daivinchik-lead-binding]].
         if self.connector is not None:
             try:
-                canonical = await self._resolve_canonical_dialog(account, telegram_username)
+                canonical = await self._resolve_canonical_dialog(
+                    account,
+                    telegram_username,
+                    telegram_user_id=telegram_user_id,
+                    telegram_access_hash=telegram_access_hash,
+                )
                 if canonical is not None:
                     return canonical
             except Exception as exc:  # noqa: BLE001
-                logger.warning("peer resolve failed for %s; using placeholder: %s", telegram_username, exc)
+                logger.warning(
+                    "peer resolve failed for %s; using placeholder: %s",
+                    telegram_username or telegram_user_id,
+                    exc,
+                )
 
         # Legacy fallback (no connector / resolve failed): peerless placeholder.
         crmchat_dialog_id = f"intake:{source}:{external_lead_id}"
@@ -277,17 +306,35 @@ class LeadIntakeService:
         )
         return await repository.add(dialog)
 
-    async def _resolve_canonical_dialog(self, account, telegram_username: str) -> Dialog | None:
-        """Resolve @username -> Telegram peer and return the canonical dialog for it,
+    async def _resolve_canonical_dialog(
+        self,
+        account,
+        telegram_username: str | None,
+        *,
+        telegram_user_id: str | None = None,
+        telegram_access_hash: str | None = None,
+    ) -> Dialog | None:
+        """Return the canonical telegram:<account>:user:<id> dialog with a real peer,
         upgrading any existing placeholder/polled dialog with the peer so there is a
-        single dialog the poller and the funnel share."""
+        single dialog the poller and the funnel share.
+
+        The peer comes either directly (id + accessHash harvested from history —
+        works for leads WITHOUT a public @handle) or via resolveUsername."""
         context = await self.connector.bootstrap()
         workspace_id = context.workspace.id
         tg_account_id = context.telegram_account.id
-        resolved = await self.connector.resolve_username(workspace_id, tg_account_id, telegram_username)
-        peer = dict(build_input_peer_from_resolve_username(resolved))
-        user_id = str(peer.get("userId") or peer.get("user_id") or "")
-        access_hash = peer.get("accessHash") or peer.get("access_hash")
+        if telegram_user_id and telegram_access_hash:
+            user_id = str(telegram_user_id)
+            access_hash = telegram_access_hash
+        elif telegram_username:
+            resolved = await self.connector.resolve_username(
+                workspace_id, tg_account_id, telegram_username
+            )
+            peer = dict(build_input_peer_from_resolve_username(resolved))
+            user_id = str(peer.get("userId") or peer.get("user_id") or "")
+            access_hash = peer.get("accessHash") or peer.get("access_hash")
+        else:
+            return None
         if not user_id:
             return None
         canonical_id = f"telegram:{tg_account_id}:user:{user_id}"
