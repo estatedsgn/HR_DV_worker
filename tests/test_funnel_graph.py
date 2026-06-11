@@ -43,7 +43,8 @@ def test_funnel_starts_with_first_touch_message() -> None:
     variants = {normalize_reply_message_text(v) for v in StaticFunnelKnowledgeBase().first_touch_variants()}
     first_message = text_messages(state)[0]
     assert first_message in variants
-    assert "onlyfans" in first_message
+    # Каждый опенер обязан сразу снимать главный страх: «это не вебкам/онлифанс».
+    assert "вебкам" in first_message or "onlyfans" in first_message
     assert state["metadata"]["last_graph_node"] == "save_state"
 
 
@@ -175,6 +176,63 @@ def test_annotation_parser_supports_candidate_multiline_batches() -> None:
     assert runs[1]["messages"] == ["привет\nа как вы меня нашли?\nи почему я подошла?"]
     assert runs[2]["speaker"] == "recruiter"
     assert len(runs[2]["messages"]) == 1
+
+
+def test_bot_suspicion_is_handled_with_human_denial() -> None:
+    # «Ты фейк какой-то?» — реальный кейс из переписок 06-10: темы не было,
+    # бот отвечал невпопад. Теперь это возражение с человеческим ответом.
+    state = run_graph(initial_state(stage="interest_check"), "Ты бот какой-то? фейк?")
+
+    assert state["stage"] == "interest_check"
+    assert state["semantic_result"]["interrupt_topic"] == "bot_suspicion"
+    assert "жив" in (state["reply_text"] or "").lower()
+
+
+def test_bot_word_inside_rabota_does_not_trigger_bot_suspicion() -> None:
+    # Подстрока «бот» есть в слове «работа» — маркеры не должны на неё ложно
+    # срабатывать.
+    from app.services.funnel_graph.semantic import infer_topics
+
+    assert "bot_suspicion" not in infer_topics("что за работа? мне нужна работа")
+
+
+def test_already_in_industry_objection_compares_conditions() -> None:
+    # «я вот тут… тем же самым занимаюсь» (лид 75b27584) — раньше бот терялся.
+    state = run_graph(initial_state(stage="interest_check"), "да я уже этим занимаюсь вообще-то")
+
+    assert state["semantic_result"]["interrupt_topic"] == "already_in_industry"
+    assert "сравн" in (state["reply_text"] or "").lower() or "услови" in (state["reply_text"] or "").lower()
+
+
+def test_smalltalk_first_request_is_supported_not_pitched() -> None:
+    # «может не про работу пообщаемся для начала?» (лид 47539ca1) — раньше бот
+    # отвечал «если интересно — расскажу про работу 🙂». Теперь поддерживаем болтовню.
+    state = run_graph(initial_state(stage="interest_check"), "слушай, а может не про работу пообщаемся для начала?")
+
+    assert state["semantic_result"]["interrupt_topic"] == "wants_smalltalk_first"
+    reply = (state["reply_text"] or "").lower()
+    assert "расскажу, что за работа" not in reply
+
+
+def test_legal_and_need_to_think_topics_resolved() -> None:
+    from app.services.funnel_graph.semantic import infer_topics
+
+    assert "legal_concern" in infer_topics("а это вообще легально?")
+    assert "need_to_think" in infer_topics("мне надо подумать")
+
+
+def test_opener_pool_is_large_and_unique() -> None:
+    variants = StaticFunnelKnowledgeBase().first_touch_variants()
+    assert len(variants) >= 12
+    assert len(set(variants)) == len(variants)
+    # Каждый вариант сразу снимает страх «вебкам/онлифанс».
+    for variant in variants:
+        low = variant.lower()
+        assert "вебкам" in low or "onlyfans" in low
+    # Ротация по кандидату даёт разные опенеры разным лидам.
+    store = StaticFunnelKnowledgeBase()
+    picked = {store.first_touch(f"cand_{i}") for i in range(30)}
+    assert len(picked) >= 6
 
 
 def test_interest_question_is_interrupt_and_repeats_current_question() -> None:
