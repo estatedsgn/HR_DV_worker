@@ -19,14 +19,25 @@ class OutboundJobRepository(BaseRepository[OutboundJob]):
         limit: int = 50,
         lease_seconds: int = 60,
         account_id: str | None = None,
+        exclude_own_key_accounts: bool = False,
     ) -> list[OutboundJob]:
         now = datetime.now(UTC)
         lease_expires_at = now + timedelta(seconds=lease_seconds)
         # Per-account processes each own their own CRMchat key, so a worker must
         # only claim jobs for its own account — otherwise it would try to send
         # another account's message with the wrong key. account_id=None keeps the
-        # global behaviour (single shared worker claims everything).
+        # global behaviour (single shared worker claims everything), EXCEPT jobs of
+        # accounts that have their own key (exclude_own_key_accounts): those are
+        # served by their own scoped worker, and the global key can't even reach
+        # their workspace ("You do not have access to this workspace").
         account_filter = "AND account_id = :account_id" if account_id else ""
+        if not account_id and exclude_own_key_accounts:
+            account_filter = (
+                "AND account_id NOT IN ("
+                "SELECT id FROM accounts "
+                "WHERE crmchat_api_key IS NOT NULL AND crmchat_api_key <> ''"
+                ")"
+            )
         query = text(
             f"""
             WITH candidates AS (

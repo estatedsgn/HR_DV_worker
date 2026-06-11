@@ -20,7 +20,13 @@ class FakeOutboundRepository:
         self.jobs = jobs
 
     async def claim_ready_batch(
-        self, *, lease_owner: str, limit: int = 50, lease_seconds: int = 60, account_id=None
+        self,
+        *,
+        lease_owner: str,
+        limit: int = 50,
+        lease_seconds: int = 60,
+        account_id=None,
+        exclude_own_key_accounts: bool = False,
     ):
         for job in self.jobs[:limit]:
             job.lease_owner = lease_owner

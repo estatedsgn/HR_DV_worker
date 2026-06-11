@@ -117,6 +117,10 @@ class OutboundQueueWorker:
             limit=limit,
             lease_seconds=self.lease_seconds,
             account_id=self.account_id,
+            # Глобальный воркер (общий ключ) НЕ должен трогать джобы аккаунтов со
+            # своим ключом: их ведёт свой scoped-воркер, а общий ключ даже не
+            # достучится до их workspace («You do not have access to this workspace»).
+            exclude_own_key_accounts=self.account_id is None,
         )
         sent = blocked = retry = failed = dead_letter = rescheduled = cancelled = 0
 
