@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
@@ -18,11 +19,13 @@ from app.repositories.dialog import DialogRepository
 from app.repositories.message import MessageRepository
 from app.repositories.telegram_polling_run import TelegramPollingRunRepository
 from app.services.crmchat_connector import (
+    CRMChatAPIError,
     CRMChatBootstrapContext,
     CRMChatConnector,
     TelegramDialogSnapshot,
     TelegramFloodWaitError,
     TelegramMessageSnapshot,
+    TelegramPeer,
     normalize_dialogs_response,
     normalize_messages_response,
 )
@@ -132,29 +135,78 @@ class TelegramPollingService:
         run.crmchat_workspace_id = context.workspace.id
         run.crmchat_account_id = context.telegram_account.id
 
-        dialogs_payload = await self.connector.get_dialogs(
-            context.workspace.id,
-            context.telegram_account.id,
-            limit=self.settings.telegram_poll_dialogs_limit,
-        )
-        dialogs = normalize_dialogs_response(dialogs_payload)
-        run.dialogs_seen = len(dialogs)
-
-        for dialog_snapshot in dialogs:
-            if not should_sync_dialog(dialog_snapshot, self.only_username, self.only_usernames):
-                continue
-            synced, seen, created = await self._sync_dialog(
-                context, account, dialog_snapshot
+        try:
+            dialogs_payload = await self.connector.get_dialogs(
+                context.workspace.id,
+                context.telegram_account.id,
+                limit=self.settings.telegram_poll_dialogs_limit,
             )
-            run.dialogs_synced += int(synced)
-            run.messages_seen += seen
-            run.messages_created += created
+            dialogs = normalize_dialogs_response(dialogs_payload)
+        except httpx.TimeoutException:
+            # Под троттлингом аккаунта (массовые лайки Дайвинчика) каждый вызов идёт
+            # 15-20с, и getDialogs изредка перебивает read-таймаут. НЕ валим весь
+            # прогон: деградируем на уже известные диалоги из БД (их get_history тянем
+            # точечно по сохранённому peer), чтобы лиды продолжали обслуживаться, а
+            # новые диалоги подхватятся, как только getDialogs снова уложится в бюджет.
+            dialogs = await self._known_dialog_snapshots(account)
+        run.dialogs_seen = len(dialogs)
+        await self._sync_snapshots(context, account, dialogs, run)
 
         run.status = "completed"
         run.finished_at = datetime.now(UTC)
         run.next_run_at = run.finished_at + timedelta(
             seconds=self.settings.telegram_poll_interval_seconds
         )
+
+    async def _sync_snapshots(
+        self,
+        context: CRMChatBootstrapContext,
+        account: Account,
+        snapshots: list[TelegramDialogSnapshot],
+        run: TelegramPollingRun,
+    ) -> None:
+        """Синкаем диалоги по очереди, изолируя сбой ОТДЕЛЬНОГО диалога.
+
+        Под троттлингом аккаунта (массовые лайки Дайвинчика) каждый get_history
+        идёт 15-20с и иногда перебивает read-таймаут; у части диалогов бывает
+        протухший peer (PEER_ID_INVALID) — особенно на деградационном пути, где
+        access_hash берётся из БД. Раньше любой такой единичный сбой пробрасывался
+        из poll_once и ронял ВЕСЬ прогон (run='failed', heartbeat кричал «поллинг
+        сломался»), хотя остальные диалоги читались нормально. Теперь проблемный
+        диалог пропускается и добирается на следующем цикле (свежий access_hash
+        приедет со следующим успешным getDialogs).
+
+        Терпим и таймаут, и per-dialog CRMChatAPIError. НЕ маскируем системный
+        сбой: отзыв ключа/доступа упадёт раньше — в bootstrap/getDialogs (они вне
+        этой обёртки) и в account_sync. Flood-wait пробрасываем — это сигнал
+        уровня аккаунта, прогон должен встать на rate_limited.
+        """
+        for dialog_snapshot in snapshots:
+            if not should_sync_dialog(
+                dialog_snapshot, self.only_username, self.only_usernames
+            ):
+                continue
+            try:
+                synced, seen, created = await self._sync_dialog(
+                    context, account, dialog_snapshot
+                )
+            except TelegramFloodWaitError:
+                raise
+            except (httpx.TimeoutException, CRMChatAPIError):
+                continue
+            run.dialogs_synced += int(synced)
+            run.messages_seen += seen
+            run.messages_created += created
+
+    async def _known_dialog_snapshots(
+        self, account: Account
+    ) -> list[TelegramDialogSnapshot]:
+        rows = await DialogRepository(self.session).list_pollable_by_account(account.id)
+        return [
+            snapshot
+            for dialog in rows
+            if (snapshot := snapshot_from_dialog(dialog)) is not None
+        ]
 
     async def _sync_dialog(
         self,
@@ -421,6 +473,23 @@ def update_dialog_from_snapshot(
             dialog.memory_summary = (
                 f"Telegram dialog with {dialog_snapshot.peer.display_name}"
             )
+
+
+def snapshot_from_dialog(dialog: Dialog) -> TelegramDialogSnapshot | None:
+    """Собрать dialog-снапшот из сохранённого в БД peer (для поллинга без getDialogs).
+
+    Возвращает None, если у диалога нет пригодного peer (его get_history всё равно
+    нельзя построить — такой диалог пропускаем).
+    """
+    if not dialog.telegram_peer_type or not dialog.telegram_peer_id:
+        return None
+    peer = TelegramPeer(
+        peer_type=dialog.telegram_peer_type,
+        peer_id=dialog.telegram_peer_id,
+        access_hash=dialog.telegram_access_hash,
+        username=dialog.telegram_username,
+    )
+    return TelegramDialogSnapshot(peer=peer)
 
 
 def build_dialog_external_id(
