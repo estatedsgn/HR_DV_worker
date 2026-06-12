@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -32,17 +33,21 @@ from app.services.crmchat_connector import (
 from app.services.crmchat_diagnostics import build_input_peer, redact_value
 from app.services.inbound_pipeline import InboundPipelineService
 
+logger = logging.getLogger("telegram_polling")
+
 
 @dataclass(slots=True, frozen=True)
 class TelegramPollingResult:
     status: str
     dialogs_seen: int = 0
     dialogs_synced: int = 0
+    dialogs_skipped: int = 0
     messages_seen: int = 0
     messages_created: int = 0
     flood_wait_seconds: int | None = None
     next_run_at: datetime | None = None
     error_message: str | None = None
+    skip_details: str | None = None
 
 
 class TelegramPollingService:
@@ -180,7 +185,13 @@ class TelegramPollingService:
         сбой: отзыв ключа/доступа упадёт раньше — в bootstrap/getDialogs (они вне
         этой обёртки) и в account_sync. Flood-wait пробрасываем — это сигнал
         уровня аккаунта, прогон должен встать на rate_limited.
+
+        Пропуск не должен быть невидимым: вечно битый диалог (протухший peer)
+        иначе молча выпадает из обслуживания каждый цикл. Каждый skip логируем
+        и пишем в run.dialogs_skipped / run.skip_details — heartbeat показывает
+        их как WARN, не роняя статус прогона.
         """
+        skips: list[str] = []
         for dialog_snapshot in snapshots:
             if not should_sync_dialog(
                 dialog_snapshot, self.only_username, self.only_usernames
@@ -192,11 +203,19 @@ class TelegramPollingService:
                 )
             except TelegramFloodWaitError:
                 raise
-            except (httpx.TimeoutException, CRMChatAPIError):
+            except (httpx.TimeoutException, CRMChatAPIError) as exc:
+                who = dialog_snapshot.peer.username or f"id:{dialog_snapshot.peer.peer_id}"
+                reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+                logger.warning("поллинг: диалог %s пропущен (%s)", who, reason)
+                skips.append(f"{who} ({reason})")
                 continue
             run.dialogs_synced += int(synced)
             run.messages_seen += seen
             run.messages_created += created
+        if skips:
+            # (or 0) — до flush у свежего run колоночный default ещё не применён.
+            run.dialogs_skipped = (run.dialogs_skipped or 0) + len(skips)
+            run.skip_details = "; ".join(skips)[:1000]
 
     async def _known_dialog_snapshots(
         self, account: Account
@@ -527,11 +546,13 @@ def result_from_run(run: TelegramPollingRun) -> TelegramPollingResult:
         status=run.status,
         dialogs_seen=run.dialogs_seen,
         dialogs_synced=run.dialogs_synced,
+        dialogs_skipped=run.dialogs_skipped,
         messages_seen=run.messages_seen,
         messages_created=run.messages_created,
         flood_wait_seconds=run.flood_wait_seconds,
         next_run_at=run.next_run_at,
         error_message=run.error_message,
+        skip_details=run.skip_details,
     )
 
 
@@ -543,9 +564,12 @@ def merge_polling_results(
         status=status,
         dialogs_seen=left.dialogs_seen + right.dialogs_seen,
         dialogs_synced=left.dialogs_synced + right.dialogs_synced,
+        dialogs_skipped=left.dialogs_skipped + right.dialogs_skipped,
         messages_seen=left.messages_seen + right.messages_seen,
         messages_created=left.messages_created + right.messages_created,
         flood_wait_seconds=right.flood_wait_seconds or left.flood_wait_seconds,
         next_run_at=right.next_run_at or left.next_run_at,
         error_message=right.error_message or left.error_message,
+        skip_details="; ".join(s for s in (left.skip_details, right.skip_details) if s)
+        or None,
     )

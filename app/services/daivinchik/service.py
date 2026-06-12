@@ -661,6 +661,11 @@ class DaivinchikService:
             lead = replace(lead, telegram_username=f"@{username}")
         return lead, (str(access_hash) if access_hash is not None else None)
 
+    # Кэш живёт в 24/7-процессе и без потолка растёт бесконечно. accessHash нужен
+    # только в окне «мэтч → первое сообщение» (тот же или соседний цикл), поэтому
+    # держим последних N и вытесняем самых старых (dict сохраняет порядок вставки).
+    _USERS_CACHE_MAX = 500
+
     def _remember_users(self, payload: Any) -> None:
         """Скопить user-объекты из getHistory: там лежит accessHash собеседников,
         упомянутых в сообщениях, — единственный способ написать мэтчу без @handle."""
@@ -668,13 +673,19 @@ class DaivinchikService:
             users = payload.get("users") or []
         except AttributeError:
             return
+        if not users:
+            return
         for user in users:
             try:
                 user_id = user.get("id")
             except AttributeError:
                 continue
             if user_id is not None:
-                self._users_by_id[str(user_id)] = dict(user)
+                key = str(user_id)
+                self._users_by_id.pop(key, None)
+                self._users_by_id[key] = dict(user)
+        while len(self._users_by_id) > self._USERS_CACHE_MAX:
+            self._users_by_id.pop(next(iter(self._users_by_id)))
 
     async def _resolve_bot_peer(
         self, connector: CRMChatConnector, context: CRMChatBootstrapContext

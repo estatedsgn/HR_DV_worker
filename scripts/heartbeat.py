@@ -126,7 +126,8 @@ async def _db_checks(in_hours: bool) -> list[tuple[int, str]]:
             row = (
                 await s.execute(
                     text(
-                        "select status, error_message, finished_at, started_at "
+                        "select status, error_message, finished_at, started_at, "
+                        "dialogs_skipped, skip_details "
                         "from telegram_polling_runs order by created_at desc limit 1"
                     )
                 )
@@ -136,7 +137,7 @@ async def _db_checks(in_hours: bool) -> list[tuple[int, str]]:
             elif row is None:
                 findings.append((WARN, "поллинг: прогонов ещё не было"))
             else:
-                status, err, finished_at, started_at = row
+                status, err, finished_at, started_at, skipped, skip_details = row
                 last = finished_at or started_at
                 age_min = (now - last).total_seconds() / 60 if last else 1e9
                 if err or status not in ("completed", "running"):
@@ -151,6 +152,14 @@ async def _db_checks(in_hours: bool) -> list[tuple[int, str]]:
                 elif age_min > POLL_STALE_MINUTES:
                     findings.append(
                         (FAIL, f"поллинг: не было прогонов {age_min:.0f} мин — похоже, встал")
+                    )
+                elif skipped:
+                    # Прогон прошёл, но часть диалогов не синкнулась (протухший
+                    # peer / таймаут). Разово — не страшно; повторяющийся WARN по
+                    # одному и тому же диалогу = он выпал из обслуживания.
+                    findings.append(
+                        (WARN, f"поллинг: ок, но пропущено диалогов: {skipped}"
+                               + (f" — {skip_details}" if skip_details else ""))
                     )
                 else:
                     findings.append(

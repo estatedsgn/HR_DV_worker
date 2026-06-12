@@ -47,6 +47,29 @@ def test_remember_keyboard_records_latest_reply_keyboard() -> None:
     assert svc.state.last_keyboard == [["❤️", "👎", "жалоба", "💤"]]
 
 
+def test_remember_users_caps_cache_and_keeps_freshest() -> None:
+    # Кэш живёт в 24/7-процессе: без потолка он растёт бесконечно.
+    svc = DaivinchikService.__new__(DaivinchikService)
+    svc._users_by_id = {}
+    cap = DaivinchikService._USERS_CACHE_MAX
+    for i in range(cap + 50):
+        svc._remember_users({"users": [{"id": i, "accessHash": f"h{i}"}]})
+    assert len(svc._users_by_id) == cap
+    # Вытеснены самые старые, свежие — на месте.
+    assert "0" not in svc._users_by_id
+    assert str(cap + 49) in svc._users_by_id
+
+
+def test_remember_users_refreshes_existing_entry() -> None:
+    # Повторная встреча юзера обновляет данные и его «свежесть» в кэше.
+    svc = DaivinchikService.__new__(DaivinchikService)
+    svc._users_by_id = {}
+    svc._remember_users({"users": [{"id": 1, "accessHash": "old"}, {"id": 2}]})
+    svc._remember_users({"users": [{"id": 1, "accessHash": "new"}]})
+    assert svc._users_by_id["1"]["accessHash"] == "new"
+    assert list(svc._users_by_id) == ["2", "1"]
+
+
 class _BurstConnector:
     """Фейковый коннектор: эмулирует messages.getHistory с пагинацией.
 
