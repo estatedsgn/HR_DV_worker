@@ -273,6 +273,64 @@ def test_worker_sends_allowlisted_job_and_updates_message() -> None:
     assert session.committed is True
 
 
+def test_worker_enforces_min_dialog_gap() -> None:
+    """Анти-залп: вторая джоба того же диалога в одном батче сдвигается на
+    last_sent + gap, не отправляется и не тратит attempt."""
+    account = make_account()
+    account.send_interval_seconds = 0  # изолируем per-dialog gap от per-account пейсинга
+    dialog_id = uuid.uuid4()
+
+    def make_job(text: str) -> OutboundJob:
+        return OutboundJob(
+            id=uuid.uuid4(),
+            account_id=account.id,
+            dialog_id=dialog_id,
+            target_username="@iamnekiy",
+            peer={"_": "inputPeerUser", "userId": 1, "accessHash": "hash"},
+            text=text,
+            status="queued",
+            scheduled_at=datetime.now(UTC),
+            max_attempts=3,
+        )
+
+    first, second = make_job("первое"), make_job("второе")
+    worker = OutboundQueueWorker(
+        FakeSession(account),
+        connector=FakeConnector(),
+        settings=Settings(
+            OUTBOUND_ALLOWED_USERNAMES="@iamnekiy",
+            OUTBOUND_TYPING_MIN_DELAY_SECONDS=0,
+            OUTBOUND_MIN_DIALOG_GAP_SECONDS=30,
+        ),
+        allow_real_send=True,
+        typing_delay_seconds=0.001,
+    )
+    worker.repository = FakeOutboundRepository([first, second])
+
+    result = asyncio.run(worker.process_queued_batch(limit=2))
+
+    assert result.sent == 1
+    assert result.rescheduled == 1
+    assert first.status == "sent"
+    assert second.status == "queued"  # статус не тронут, attempt не израсходован
+    assert second.attempt_count is None or second.attempt_count == 0
+    assert second.scheduled_at >= first.sent_at + timedelta(seconds=30)
+
+
+def test_claim_ready_batch_sql_orders_groups_and_gates_dialog_fifo() -> None:
+    """Контракт claim-запроса: детерминированный тайбрейкер по reply_group_index
+    (created_at у джоб одной транзакции идентичен) и per-dialog FIFO-гейт."""
+    import inspect
+
+    from app.repositories.outbound_job import OutboundJobRepository
+
+    source = inspect.getsource(OutboundJobRepository.claim_ready_batch)
+    assert source.count("reply_group_index") >= 3  # ORDER BY + обе стороны NOT EXISTS
+    assert "NOT EXISTS" in source
+    assert "prior.dialog_id = outbound_jobs.dialog_id" in source
+    assert "prior.status IN ('queued', 'retry')" in source
+
+
 def test_worker_sends_voice_job_with_recording_action() -> None:
     account = make_account()
     message = Message(

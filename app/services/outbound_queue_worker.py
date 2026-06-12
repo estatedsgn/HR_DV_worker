@@ -123,6 +123,9 @@ class OutboundQueueWorker:
             exclude_own_key_accounts=self.account_id is None,
         )
         sent = blocked = retry = failed = dead_letter = rescheduled = cancelled = 0
+        # Кэш «когда в этот диалог отправляли последний раз» на время батча:
+        # первый джоб диалога стоит один запрос, его собственный send обновляет кэш.
+        last_sent_by_dialog: dict[Any, datetime | None] = {}
 
         for job in jobs:
             if job.lease_owner != self.lease_owner:
@@ -133,6 +136,15 @@ class OutboundQueueWorker:
                     raise RuntimeError(f"Account not found: {job.account_id}")
                 if self._account_not_ready(account):
                     self._reschedule_for_account(job, account)
+                    rescheduled += 1
+                    continue
+                gap_until = await self._dialog_gap_until(job, last_sent_by_dialog)
+                if gap_until is not None:
+                    # Анти-залп: сдвигаем, НЕ расходуя attempt и не меняя статус —
+                    # FIFO-гейт claim-запроса сохранит этот джоб первым в диалоге.
+                    job.scheduled_at = max(job.scheduled_at, gap_until)
+                    if job.next_attempt_at is not None:
+                        job.next_attempt_at = max(job.next_attempt_at, gap_until)
                     rescheduled += 1
                     continue
 
@@ -179,6 +191,7 @@ class OutboundQueueWorker:
                 failed += 1
             else:
                 sent += 1
+                last_sent_by_dialog[job.dialog_id] = job.sent_at or datetime.now(UTC)
             finally:
                 job.lease_owner = None
                 job.lease_expires_at = None
@@ -203,6 +216,8 @@ class OutboundQueueWorker:
         )
 
     def _reschedule_for_account(self, job: OutboundJob, account: Account) -> None:
+        # Несколько джоб одной группы коллапсируют на общий next_time — порядок
+        # при этом сохраняется: claim-запрос тайбрейкает по reply_group_index.
         candidates = [
             value
             for value in (account.flood_wait_until, account.next_available_at)
@@ -212,6 +227,31 @@ class OutboundQueueWorker:
         job.status = "retry"
         job.next_attempt_at = next_time
         job.scheduled_at = max(job.scheduled_at, next_time)
+
+    async def _dialog_gap_until(
+        self, job: OutboundJob, cache: dict[Any, datetime | None]
+    ) -> datetime | None:
+        """Момент, раньше которого в этот диалог слать нельзя (None — можно сейчас)."""
+        gap_seconds = float(self.settings.outbound_min_dialog_gap_seconds or 0)
+        if gap_seconds <= 0 or job.dialog_id is None:
+            return None
+        if job.dialog_id not in cache:
+            result = await self.session.execute(
+                select(func.max(OutboundJob.sent_at)).where(
+                    OutboundJob.dialog_id == job.dialog_id,
+                    OutboundJob.status == "sent",
+                )
+            )
+            cache[job.dialog_id] = result.scalar_one_or_none()
+        last_sent = cache[job.dialog_id]
+        if last_sent is None:
+            return None
+        if last_sent.tzinfo is None:
+            last_sent = last_sent.replace(tzinfo=UTC)
+        not_before = last_sent + timedelta(seconds=gap_seconds)
+        if datetime.now(UTC) >= not_before:
+            return None
+        return not_before
 
     async def _assert_send_allowed(self, job: OutboundJob) -> None:
         # Аутрич разрешён, только если выполнено хотя бы одно:

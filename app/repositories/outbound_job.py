@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import bindparam, select, text
+from sqlalchemy import Integer, bindparam, func, select, text
 
 from app.models.outbound_job import OutboundJob
 from app.repositories.base import BaseRepository
@@ -38,6 +38,15 @@ class OutboundJobRepository(BaseRepository[OutboundJob]):
                 "WHERE crmchat_api_key IS NOT NULL AND crmchat_api_key <> ''"
                 ")"
             )
+        # Все джобы одного ответа пишутся в одной транзакции: created_at у них
+        # ИДЕНТИЧЕН (now() = время начала транзакции), а PK — случайный UUID.
+        # Без третьего члена сортировки порядок внутри группы решал heap order.
+        # reply_group_index монотонно растёт внутри группы (metadata_for_action),
+        # у не-funnel джоб его нет -> COALESCE 0 и старый порядок по created_at.
+        # NOT EXISTS — per-dialog FIFO: джоба N+1 не уйдёт раньше N (ретрай N
+        # сознательно блокирует N+1: порядок в чате важнее латентности).
+        # Гейтим только queued/retry: processing шлёт этот же воркер прямо сейчас
+        # (последовательно), cancelled/dead_letter блокировать не должны.
         query = text(
             f"""
             WITH candidates AS (
@@ -50,8 +59,27 @@ class OutboundJobRepository(BaseRepository[OutboundJob]):
                     )
                     AND scheduled_at <= :now
                     AND (lease_expires_at IS NULL OR lease_expires_at <= :now)
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM outbound_jobs prior
+                        WHERE prior.dialog_id = outbound_jobs.dialog_id
+                          AND prior.id <> outbound_jobs.id
+                          AND prior.status IN ('queued', 'retry')
+                          AND (
+                                prior.scheduled_at,
+                                prior.created_at,
+                                COALESCE((prior.media_metadata->>'reply_group_index')::int, 0)
+                              ) < (
+                                outbound_jobs.scheduled_at,
+                                outbound_jobs.created_at,
+                                COALESCE((outbound_jobs.media_metadata->>'reply_group_index')::int, 0)
+                              )
+                    )
                     {account_filter}
-                ORDER BY scheduled_at ASC, created_at ASC
+                ORDER BY
+                    scheduled_at ASC,
+                    created_at ASC,
+                    COALESCE((media_metadata->>'reply_group_index')::int, 0) ASC
                 LIMIT :limit
                 FOR UPDATE SKIP LOCKED
             )
@@ -86,7 +114,13 @@ class OutboundJobRepository(BaseRepository[OutboundJob]):
         claimed = await self.session.execute(
             select(OutboundJob)
             .where(OutboundJob.id.in_(ids))
-            .order_by(OutboundJob.scheduled_at.asc(), OutboundJob.created_at.asc())
+            .order_by(
+                OutboundJob.scheduled_at.asc(),
+                OutboundJob.created_at.asc(),
+                func.coalesce(
+                    OutboundJob.media_metadata.op("->>")("reply_group_index").cast(Integer), 0
+                ).asc(),
+            )
         )
         return list(claimed.scalars().all())
 

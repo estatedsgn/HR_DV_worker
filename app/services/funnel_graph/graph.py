@@ -20,7 +20,14 @@ from app.services.funnel_graph.funnel_policy import (
     stage_requirement_met,
 )
 from app.services.funnel_graph.knowledge import StaticFunnelKnowledgeBase
-from app.services.funnel_graph.reply import ReplyOrchestrator, ReplyResult, natural_timeout_followup
+from app.services.funnel_graph.reply import (
+    INBOUND_WARMUP_PITCH,
+    PROFILE_BRIDGE,
+    ReplyOrchestrator,
+    ReplyResult,
+    natural_timeout_followup,
+    unknown_interrupt_reply,
+)
 from app.services.funnel_graph.semantic import SemanticAnalyzer, SemanticResult
 from app.services.funnel_graph.state import (
     FunnelGraphState,
@@ -32,14 +39,11 @@ from app.services.funnel_graph.state import (
 
 # Short acknowledgement/bridge lines sent as their own message right before the
 # next stage question, so a stage transition feels human instead of abrupt.
-# Питч про стриминг для написавших ПЕРВЫМИ: роняем его не сразу, а когда беседа
-# затихнет (см. inbound_warmup в funnel_policy + state_controller). Фраза заодно
-# служит вопросом интереса — дальше идёт обычный interest_check на её «да/нет».
-INBOUND_WARMUP_PITCH = "кстати ты очень фотогеничная) есть предложение по работе в стриминге, если интересно — расскажу"
-
+# INBOUND_WARMUP_PITCH (питч для написавших первыми) и PROFILE_BRIDGE живут в
+# reply.py рядом со своими вариантами в QUESTION_VARIANTS.
 TRANSITION_BRIDGES: dict[tuple[str, str], str] = {
     ("inbound_warmup", "interest_check"): INBOUND_WARMUP_PITCH,
-    ("post_equipment_questions_check", "profile_theme_check"): "давай я уточню у тебя несколько деталей, и далее мы с тобой запишемся на собеседование",
+    ("post_equipment_questions_check", "profile_theme_check"): PROFILE_BRIDGE,
     ("room_available_check", "equipment_phone_check"): "супер",
     ("equipment_phone_check", "interview_offer"): "нам подходит",
 }
@@ -437,8 +441,34 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
         invalid_reason = f"stage_requirement_not_met:{current_stage}"
         target_stage = current_stage
 
+    def _exhausted_recently(text: str) -> bool:
+        # Все формулировки этой фразы недавно отстреляны (см. exhausted_questions):
+        # регенерить её = снова молча дропнуть в дедупе. Молчим по этой цели,
+        # пока cooldown не пройдёт; молчуна потом поднимет reengage.
+        from app.services.funnel_graph.reply import canonical_question
+
+        entries = dict((state.get("metadata") or {}).get("exhausted_questions") or {})
+        return canonical_question(str(text)) in entries
+
     if invalid_reason:
-        outgoing = [{"type": "text", "text": policy.current_question, "voice_pack_id": None}] if policy.current_question else []
+        # Interrupt-first: посреди неотвеченного вопроса лида нельзя заменять
+        # ответ на анкетный вопрос — это и был главный источник отвалов
+        # («в каком стриминге?» -> «сколько тебе лет?»). Оставляем ответ
+        # оркестратора, а если его нет — честный ack; вопрос стадии догонит
+        # отложенный interrupt-followup (взводится ниже).
+        if semantic.has_unresolved_interrupt:
+            if not outgoing:
+                outgoing = [{
+                    "type": "text",
+                    "text": unknown_interrupt_reply(current_stage, policy.current_question or ""),
+                    "voice_pack_id": None,
+                }]
+        else:
+            outgoing = (
+                [{"type": "text", "text": policy.current_question, "voice_pack_id": None}]
+                if policy.current_question and not _exhausted_recently(policy.current_question)
+                else []
+            )
         send_reply = True
     elif target_stage == "lost" and not outgoing:
         outgoing = [{"type": "text", "text": template_from_state(state, "lost_message") or "поняла, не буду отвлекать) хорошего дня", "voice_pack_id": None}]
@@ -461,16 +491,32 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
         if completed_by_fields:
             outgoing = []
         bridge = TRANSITION_BRIDGES.get((current_stage, target_stage))
-        if bridge and not outgoing_contains(outgoing, bridge):
+        if bridge and not outgoing_contains(outgoing, bridge) and not _exhausted_recently(bridge):
             outgoing.append({"type": "text", "text": bridge, "voice_pack_id": None})
         next_question = get_stage_policy(target_stage).current_question
         # Питч-бридж warmup→interest_check уже содержит вопрос интереса
         # («если интересно — расскажу»), поэтому канонный вопрос стадии не дублируем.
         suppress_next_question = (current_stage, target_stage) == ("inbound_warmup", "interest_check")
-        if next_question and not suppress_next_question and not outgoing_contains(outgoing, next_question):
+        if (
+            next_question
+            and not suppress_next_question
+            and not outgoing_contains(outgoing, next_question)
+            and not _exhausted_recently(next_question)
+        ):
             outgoing.append({"type": "text", "text": next_question, "voice_pack_id": None})
-    elif send_reply and not outgoing and policy.current_question and semantic.message_type != "empty":
-        outgoing.append({"type": "text", "text": policy.current_question, "voice_pack_id": None})
+    elif send_reply and not outgoing and semantic.message_type != "empty":
+        if semantic.has_unresolved_interrupt:
+            # Лид задал вопрос, а знание/LLM не дали ответа. Подставить вместо
+            # ответа вопрос стадии = проигнорить человека (главная причина
+            # застревания на interest_check). Всегда отвечаем хотя бы ack'ом;
+            # вопрос стадии вернёт отложенный interrupt-followup (120с ниже).
+            outgoing.append({
+                "type": "text",
+                "text": unknown_interrupt_reply(current_stage, policy.current_question or ""),
+                "voice_pack_id": None,
+            })
+        elif policy.current_question and not _exhausted_recently(policy.current_question):
+            outgoing.append({"type": "text", "text": policy.current_question, "voice_pack_id": None})
 
     metadata = dict(state.get("metadata") or {})
     # Счётчик ходов warmup живёт, пока мы в нём; при выходе — чистим.
@@ -482,6 +528,21 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
         metadata["controller_invalid_transition"] = invalid_reason
     metadata["previous_state"] = current_stage if target_stage != current_stage else state.get("previous_state")
     metadata["last_user_message"] = state.get("last_user_message")
+    # Анти-повтор: исчерпанные формулировки «остывают» ~3 хода лида; при смене
+    # стадии забываем всё (другая стадия = другие фразы). Свежие записи добавляет
+    # dedupe_against_recent_outbound ниже.
+    if target_stage != current_stage:
+        metadata.pop("exhausted_questions", None)
+    elif semantic.message_type != "empty":
+        cooled: dict[str, Any] = {}
+        for canon, info in dict(metadata.get("exhausted_questions") or {}).items():
+            turns = int(((info if isinstance(info, dict) else {}) or {}).get("turns") or 0) + 1
+            if turns < 3:
+                cooled[canon] = {**(info if isinstance(info, dict) else {}), "turns": turns}
+        if cooled:
+            metadata["exhausted_questions"] = cooled
+        else:
+            metadata.pop("exhausted_questions", None)
     if semantic.has_unresolved_interrupt:
         metadata["last_interrupt_type"] = semantic.interrupt_type
         metadata["last_interrupt_topic"] = semantic.interrupt_topic
@@ -526,7 +587,8 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
     outgoing = dedupe_cross_turn_questions(outgoing, metadata)
     # Жёсткое правило «никаких одинаковых сообщений»: ловит и не-вопросные повторы
     # (канонный вопрос стадии, мостики), которые фильтры выше пропускали.
-    outgoing = dedupe_against_recent_outbound(outgoing, state)
+    # metadata передаём, чтобы исчерпание вариантов записывалось персистентно.
+    outgoing = dedupe_against_recent_outbound(outgoing, state, metadata)
 
     controller_decision = {
         "stage_before": current_stage,
@@ -894,7 +956,9 @@ def _norm_reply_text(text: Any) -> str:
 
 
 def dedupe_against_recent_outbound(
-    outgoing: list[dict[str, Any]], state: FunnelGraphState
+    outgoing: list[dict[str, Any]],
+    state: FunnelGraphState,
+    metadata: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Жёсткое правило: НЕ отправлять текст, который мы уже слали недавно.
 
@@ -942,7 +1006,18 @@ def dedupe_against_recent_outbound(
         if text in seen_this_turn or text in recent_bot:
             replacement = _fresh_variant(raw)
             if replacement is None:
-                continue  # нечего сказать нового — не дублим
+                # Нечего сказать нового — не дублим. Записываем исчерпание
+                # ПЕРСИСТЕНТНО, чтобы контроллер не регенерил ту же канонику
+                # следующий ход (иначе цикл «дроп -> та же фраза -> дроп»).
+                if metadata is not None:
+                    exhausted = metadata.setdefault("exhausted_questions", {})
+                    exhausted[canonical_question(raw)] = {
+                        "at": datetime.now(UTC).isoformat(),
+                        "turns": 0,
+                    }
+                continue
+            if metadata is not None:
+                (metadata.get("exhausted_questions") or {}).pop(canonical_question(raw), None)
             message = {**norm, "text": replacement}
             text = _norm_reply_text(replacement)
         seen_this_turn.add(text)
@@ -1052,7 +1127,10 @@ def pending_actions_from_outgoing(state: FunnelGraphState, outgoing: list[dict[s
         delay_seconds = message.get("delay_seconds")
         if delay_seconds is None:
             delay_seconds = cumulative_delay_seconds
-        typing_min, typing_max = text_typing_delay_range(state)
+        # Следующее сообщение ответа уходит ПОЗЖЕ этого: иначе все тексты хода
+        # получают один scheduled_at и порядок отправки решает гонка в claim-запросе.
+        cumulative_delay_seconds = int(delay_seconds) + _inter_message_gap_seconds(str(message["text"]))
+        typing_min, typing_max = text_typing_delay_range(state, str(message["text"]))
         actions.append(
             {
                 "type": "send_text",
@@ -1109,13 +1187,26 @@ def voice_pack_action_items(state: FunnelGraphState, voice_pack_id: str) -> list
     return [{"id": voice_pack_id, "caption": ""}]
 
 
-def text_typing_delay_range(state: FunnelGraphState) -> tuple[float, float]:
+def _inter_message_gap_seconds(text: str) -> int:
+    """Пауза перед СЛЕДУЮЩИМ сообщением: ~2с «подумать» + ~1с на 15 символов
+    «печати» этого. Детерминированная (без random) — idempotency-ключи и тесты
+    стабильны; человеческий диапазон 3..12с."""
+    return max(3, min(12, 2 + len(text) // 15))
+
+
+def text_typing_delay_range(state: FunnelGraphState, text: str = "") -> tuple[float, float]:
     semantic = dict(state.get("semantic_result") or {})
     if semantic.get("has_unresolved_interrupt") or semantic.get("message_type") in {"interrupt_question", "objection", "mixed"}:
-        return (6.0, 10.0)
-    if semantic.get("current_goal_satisfied") or semantic.get("message_type") in {"stage_answer", "partial_answer"}:
-        return (2.0, 4.0)
-    return (4.0, 7.0)
+        base = (6.0, 10.0)
+    elif semantic.get("current_goal_satisfied") or semantic.get("message_type") in {"stage_answer", "partial_answer"}:
+        base = (2.0, 4.0)
+    else:
+        base = (4.0, 7.0)
+    if not text:
+        return base
+    # Короткое «супер» не должно «печататься» 10 секунд: масштабируем по длине.
+    scale = max(0.3, min(1.0, len(text) / 80))
+    return (max(1.5, base[0] * scale), max(2.5, base[1] * scale))
 
 
 def build_reply_group_id(state: FunnelGraphState, outgoing: list[dict[str, Any]]) -> str:

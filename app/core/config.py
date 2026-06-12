@@ -184,6 +184,12 @@ class Settings(BaseSettings):
     outbound_voice_recording_delay_seconds: float = Field(
         default=40.0, alias="OUTBOUND_VOICE_RECORDING_DELAY_SECONDS"
     )
+    # Минимальная пауза между ДВУМЯ отправками в ОДИН диалог (анти-залп):
+    # per-account интервал выше не мешает выстрелить 4 сообщения одного ответа
+    # одним батчем. Джоба, попавшая под гейт, сдвигается без расхода attempt.
+    outbound_min_dialog_gap_seconds: float = Field(
+        default=5.0, alias="OUTBOUND_MIN_DIALOG_GAP_SECONDS"
+    )
 
     # --- Supervisor / remote control pult ---
     control_bot_token: str | None = Field(default=None, alias="CONTROL_BOT_TOKEN")

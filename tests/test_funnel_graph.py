@@ -250,7 +250,12 @@ def test_interest_question_is_interrupt_and_repeats_current_question() -> None:
     delayed = delayed_followup_actions(state)
     assert len(delayed) == 1
     assert delayed[0]["delay_seconds"] == 120
-    assert delayed[0]["text"] == "если интересно — расскажу, что за работа и как всё устроено 🙂"
+    # Followup возвращает к цели стадии СВЕЖЕЙ формулировкой (канон сам по себе
+    # больше не входит в варианты — иначе бот повторял его дословно).
+    from app.services.funnel_graph.reply import canonical_question
+
+    assert canonical_question(delayed[0]["text"]) == "если интересно — расскажу, что за работа и как всё устроено 🙂"
+    assert delayed[0]["text"] != "если интересно — расскажу, что за работа и как всё устроено 🙂"
 
 
 def test_interest_job_question_does_not_move_to_age() -> None:
@@ -1101,6 +1106,163 @@ def test_dedupe_against_recent_outbound_keeps_new_and_drops_in_turn_dup() -> Non
         state,
     )
     assert [m.get("text") for m in out] == ["спасибо", "новое по делу"]
+
+
+def test_pending_actions_stagger_text_delays() -> None:
+    """Тексты одного ответа уходят с РАЗНЫМ delay (строго возрастающим): иначе
+    у всех джоб одинаковый scheduled_at и порядок отправки решает гонка."""
+    state = initial_state(stage="post_equipment_questions_check")
+    outgoing = [
+        {"type": "text", "text": "Короткий."},
+        {"type": "text", "text": "Это сообщение заметно длиннее, в нём существенно больше символов для набора."},
+        {"type": "text", "text": "Третье."},
+    ]
+
+    actions = pending_actions_from_outgoing(state | {"send_reply": True}, outgoing)
+    delays = [action["delay_seconds"] for action in actions[:3]]
+
+    assert delays[0] == 0
+    assert delays[0] < delays[1] < delays[2]
+    gaps = [delays[1] - delays[0], delays[2] - delays[1]]
+    assert all(3 <= gap <= 12 for gap in gaps)
+    # Пауза пропорциональна длине предыдущего сообщения (длиннее «печатали» дольше).
+    assert gaps[1] > gaps[0]
+
+
+def test_voice_pack_items_keep_single_base_delay() -> None:
+    """Контракт пака не сломан стаггером: все голосовые + хвостовой текст — на
+    одном base delay, паузу между ними имитирует воркер (recording_delay)."""
+    state = initial_state(stage="salary_schedule_delivery")
+    state["voice_packs"] = {
+        "salary_schedule": [
+            {"id": "s1", "media_path": "data/v1.ogg", "caption": "", "recording_delay_seconds": 40},
+            {"id": "s2", "media_path": "data/v2.ogg", "caption": "", "recording_delay_seconds": 40},
+        ]
+    }
+    outgoing = [
+        {"type": "voice_pack", "voice_pack_id": "salary_schedule"},
+        {"type": "text", "text": "Остались вопросы?"},
+    ]
+
+    actions = pending_actions_from_outgoing(state | {"send_reply": True}, outgoing)
+
+    assert [action["delay_seconds"] for action in actions[:3]] == [0, 0, 0]
+
+
+def test_interrupt_without_answer_gets_ack_not_stage_question() -> None:
+    """Лид задал вопрос, оркестратор не дал ответа: бот обязан хотя бы признать
+    вопрос (ack), а НЕ подставлять анкетный вопрос стадии — игнор прямого вопроса
+    и был главной причиной отвалов на interest_check."""
+    state = initial_state(stage="interest_check")
+    state.update(
+        {
+            "incoming_message": "а в каком стриминге? ссылочку дашь?",
+            "semantic_result": {
+                "message_type": "interrupt_question",
+                "current_goal_satisfied": False,
+                "has_unresolved_interrupt": True,
+                "interrupt_type": "question",
+                "interrupt_topic": "platform_details",
+                "facts": {},
+            },
+            "reply_result": {"send_reply": True, "outgoing_messages": []},
+        }
+    )
+
+    result_state = asyncio.run(state_controller(state))
+    texts = text_messages(result_state)
+
+    assert result_state["stage"] == "interest_check"
+    assert len(texts) == 1
+    assert "точных данных" in texts[0]  # ack из unknown_interrupt_reply
+    assert "если интересно — расскажу, что за работа и как всё устроено 🙂" not in texts
+    # Вопрос стадии вернётся отложенным followup'ом, а не вместо ответа.
+    assert result_state["metadata"]["awaiting_interrupt_followup"] is True
+
+
+def test_exhausted_question_is_recorded_and_not_regenerated_next_turn() -> None:
+    """Все формулировки канонного вопроса уже отправлены: дедуп дропает повтор и
+    пишет исчерпание в metadata; следующий ход контроллер НЕ регенерит ту же
+    фразу (раньше цикл «дроп -> та же фраза -> дроп» крутился бесконечно)."""
+    from app.services.funnel_graph.reply import QUESTION_VARIANTS
+
+    canned = "если интересно — расскажу, что за работа и как всё устроено 🙂"
+    sent_all = [{"direction": "outbound", "body": canned}] + [
+        {"direction": "outbound", "body": variant} for variant in QUESTION_VARIANTS[canned]
+    ]
+
+    state = initial_state(stage="interest_check")
+    state["recent_messages"] = state["recent_messages"] + sent_all
+    state.update(
+        {
+            "incoming_message": "ну не знаю",
+            "semantic_result": {
+                "message_type": "unclear",
+                "current_goal_satisfied": False,
+                "has_unresolved_interrupt": False,
+                "facts": {},
+            },
+            "reply_result": {"send_reply": True, "outgoing_messages": []},
+        }
+    )
+
+    first = asyncio.run(state_controller(state))
+
+    # Ход 1: повтор дропнут, исчерпание записано персистентно.
+    assert text_messages(first) == []
+    assert canned in (first["metadata"].get("exhausted_questions") or {})
+
+    # Ход 2: контроллер видит запись и не генерит ту же канонику заново.
+    # state_controller возвращает частичный апдейт — накатываем его на state.
+    follow = {**state, **first}
+    follow.update(
+        {
+            "incoming_message": "хм",
+            "semantic_result": {
+                "message_type": "unclear",
+                "current_goal_satisfied": False,
+                "has_unresolved_interrupt": False,
+                "facts": {},
+            },
+            "reply_result": {"send_reply": True, "outgoing_messages": []},
+        }
+    )
+    second = asyncio.run(state_controller(follow))
+    assert text_messages(second) == []
+
+    # Смена стадии чистит исчерпание (новая стадия — новые фразы).
+    moved = {**follow, **second}
+    moved.update(
+        {
+            "incoming_message": "да, интересно!",
+            "semantic_result": {
+                "message_type": "stage_answer",
+                "current_goal_satisfied": True,
+                "has_unresolved_interrupt": False,
+                "facts": {"interest_confirmed": True, "interest_status": "interested"},
+            },
+            "reply_result": {"send_reply": True, "outgoing_messages": []},
+        }
+    )
+    third = asyncio.run(state_controller(moved))
+    assert third["stage"] != "interest_check"
+    assert "exhausted_questions" not in (third["metadata"] or {})
+
+
+def test_warmup_pitch_and_profile_bridge_have_variants() -> None:
+    from app.services.funnel_graph.reply import (
+        INBOUND_WARMUP_PITCH,
+        PROFILE_BRIDGE,
+        QUESTION_VARIANTS,
+        canonical_question,
+    )
+
+    for canned in (INBOUND_WARMUP_PITCH, PROFILE_BRIDGE):
+        variants = QUESTION_VARIANTS[canned]
+        assert len(variants) >= 2
+        assert canned not in variants  # канон не дублируется в вариантах
+        for variant in variants:
+            assert canonical_question(variant) == canned
 
 
 def test_reply_idempotency_key_is_independent_of_generated_text() -> None:
