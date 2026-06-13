@@ -39,6 +39,12 @@ class Settings(BaseSettings):
     telegram_poll_dialogs_limit: int = Field(
         default=20, alias="TELEGRAM_POLL_DIALOGS_LIMIT"
     )
+    # How long to back an account off after a polling cycle looks throttled
+    # (saw dialogs, synced none, several timed out). During the window polling
+    # and the swiper skip the account so Telegram's flood can clear.
+    telegram_throttle_backoff_seconds: int = Field(
+        default=300, alias="TELEGRAM_THROTTLE_BACKOFF_SECONDS"
+    )
     telegram_poll_history_limit: int = Field(
         default=20, alias="TELEGRAM_POLL_HISTORY_LIMIT"
     )

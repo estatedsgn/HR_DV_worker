@@ -359,6 +359,17 @@ class DaivinchikService:
             logger.info("outside working window; sleeping %ds", min(wait, 600))
             await asyncio.sleep(min(wait, 600))
             return "sleep"
+        backoff_until = await self._account_backed_off()
+        if backoff_until is not None:
+            remaining = (backoff_until - datetime.now(UTC)).total_seconds()
+            logger.info(
+                "account throttled (flood backoff) %.0fs more — pausing swipes so the flood can clear",
+                remaining,
+            )
+            # Don't even watch passively: every call hits the same throttled
+            # account and prolongs the flood. Fully back off until it clears.
+            await asyncio.sleep(min(max(remaining, 5.0), 120.0))
+            return "sleep"
         if self.state.paused_until and now < self.state.paused_until.astimezone(self.tz):
             remaining = (self.state.paused_until.astimezone(self.tz) - now).total_seconds()
             logger.info("paused (like-limit) for %.0fs more — watching for incoming likes/matches", remaining)
@@ -367,6 +378,28 @@ class DaivinchikService:
             await asyncio.sleep(min(remaining, 60.0))
             return "passive"
         return "go"
+
+    async def _account_backed_off(self) -> datetime | None:
+        """Flood-backoff deadline for this swiper's account, if currently set.
+
+        The poller trips account.flood_wait_until when it detects a throttle
+        (see telegram_polling._apply_throttle_backoff). The swiper honours the
+        same flag so it stops hammering a flooded account — otherwise the swiper
+        alone keeps the flood alive even while polling backs off.
+        """
+        if self.account is None:
+            return None
+        from app.models.account import Account
+
+        try:
+            async with AsyncSessionLocal() as session:
+                acc = await session.get(Account, self.account.id)
+                deadline = getattr(acc, "flood_wait_until", None) if acc else None
+        except Exception:  # noqa: BLE001 — never let a DB blip crash the swiper
+            return None
+        if deadline and deadline > datetime.now(UTC):
+            return deadline
+        return None
 
     def _within_working_hours(self, now: datetime) -> bool:
         start = self.cfg.daivinchik_active_hours_start

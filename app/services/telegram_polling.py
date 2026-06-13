@@ -35,6 +35,10 @@ from app.services.inbound_pipeline import InboundPipelineService
 
 logger = logging.getLogger("telegram_polling")
 
+# Minimum dialogs skipped-on-timeout (with zero synced) to call a cycle an
+# account-level throttle rather than one flaky dialog.
+_THROTTLE_SKIP_THRESHOLD = 3
+
 
 @dataclass(slots=True, frozen=True)
 class TelegramPollingResult:
@@ -140,6 +144,22 @@ class TelegramPollingService:
         run.crmchat_workspace_id = context.workspace.id
         run.crmchat_account_id = context.telegram_account.id
 
+        now = datetime.now(UTC)
+        # Account-level throttle circuit breaker. When Telegram floods an account
+        # (typically after the swiper's mass-likes) every get_history hangs to a
+        # ReadTimeout. Hammering all dialogs each cycle PROLONGS the flood and
+        # burns ~30-min cycles. While the account is backed off we skip the heavy
+        # poll entirely so the flood window can clear; account_sync / the next
+        # eligible cycle resumes once it expires. Outbound already honours
+        # flood_wait_until (it defers sends), so one flag pauses the whole account.
+        if account.flood_wait_until and account.flood_wait_until > now:
+            run.status = "rate_limited"
+            run.dialogs_seen = 0
+            run.error_message = "account backed off (throttle); skipping heavy poll"
+            run.finished_at = now
+            run.next_run_at = account.flood_wait_until
+            return
+
         try:
             dialogs_payload = await self.connector.get_dialogs(
                 context.workspace.id,
@@ -157,11 +177,49 @@ class TelegramPollingService:
         run.dialogs_seen = len(dialogs)
         await self._sync_snapshots(context, account, dialogs, run)
 
-        run.status = "completed"
-        run.finished_at = datetime.now(UTC)
-        run.next_run_at = run.finished_at + timedelta(
-            seconds=self.settings.telegram_poll_interval_seconds
+        now = datetime.now(UTC)
+        self._apply_throttle_backoff(account, run, now)
+        if run.status != "rate_limited":
+            run.status = "completed"
+        run.finished_at = now
+        run.next_run_at = (
+            account.flood_wait_until
+            if account.flood_wait_until and account.flood_wait_until > now
+            else now + timedelta(seconds=self.settings.telegram_poll_interval_seconds)
         )
+
+    def _apply_throttle_backoff(
+        self, account: Account, run: TelegramPollingRun, now: datetime
+    ) -> None:
+        """Trip / clear the account-level throttle breaker from poll results.
+
+        A cycle that saw dialogs but synced none while skipping several on
+        timeout is the account-level throttle signal that a plain ReadTimeout
+        (unlike a clean FLOOD_WAIT) never surfaces. Treat it like a flood: set
+        flood_wait_until so polling, outbound and the swiper all back off, and
+        the flood can actually clear. A cycle that synced anything clears it.
+        """
+        throttled = (
+            run.dialogs_seen > 0
+            and run.dialogs_synced == 0
+            and (run.dialogs_skipped or 0) >= _THROTTLE_SKIP_THRESHOLD
+        )
+        if throttled:
+            backoff = max(
+                self.settings.telegram_throttle_backoff_seconds,
+                self.settings.telegram_poll_interval_seconds,
+            )
+            account.flood_wait_until = now + timedelta(seconds=backoff)
+            account.health_status = "rate_limited"
+            account.last_error_message = (
+                f"polling throttle: seen={run.dialogs_seen} synced=0 "
+                f"skipped={run.dialogs_skipped}"
+            )
+            run.status = "rate_limited"
+        elif run.dialogs_synced > 0 and account.health_status == "rate_limited":
+            account.flood_wait_until = None
+            account.health_status = "healthy"
+            account.last_error_message = None
 
     async def _sync_snapshots(
         self,

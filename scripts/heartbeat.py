@@ -166,6 +166,32 @@ async def _db_checks(in_hours: bool) -> list[tuple[int, str]]:
                         (OK, f"поллинг: ок ({_fmt_ago(last, now)})")
                     )
 
+            # --- per-account read-health («пишем, но не читаем») ------------
+            # Проверка выше берёт ПОСЛЕДНИЙ прогон по всем аккаунтам — его
+            # доминирует самый частый поллер, и застрявший аккаунт (видит
+            # диалоги, но get_history виснет → синкает 0) остаётся незамеченным.
+            # Ловим это явно по последнему прогону КАЖДОГО аккаунта.
+            if in_hours:
+                per_acct = (
+                    await s.execute(
+                        text(
+                            "select distinct on (p.crmchat_account_id) "
+                            "coalesce(a.telegram_username, p.crmchat_account_id) name, "
+                            "p.dialogs_seen, p.dialogs_synced "
+                            "from telegram_polling_runs p "
+                            "left join accounts a on a.crmchat_account_id = p.crmchat_account_id "
+                            "where p.created_at > now() - interval '90 minutes' "
+                            "order by p.crmchat_account_id, p.created_at desc"
+                        )
+                    )
+                ).all()
+                for name, seen, synced in per_acct:
+                    if (seen or 0) > 0 and (synced or 0) == 0:
+                        findings.append(
+                            (FAIL, f"аккаунт {name}: видит {seen} диалогов, читает 0 — "
+                                   f"поллинг не работает (троттл/сессия)")
+                        )
+
             # --- аккаунты: flood-wait / health ------------------------------
             accs = (
                 await s.execute(

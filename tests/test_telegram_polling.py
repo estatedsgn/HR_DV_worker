@@ -1,7 +1,10 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import httpx
 import pytest
+
+from app.core.config import Settings
 
 from app.models.telegram_polling_run import TelegramPollingRun
 from app.services.crmchat_connector import (
@@ -223,6 +226,49 @@ async def test_sync_snapshots_tolerates_per_dialog_api_errors() -> None:
     # НЕ бросаем: системный сбой (отзыв ключа) упал бы раньше в bootstrap/getDialogs.
     await svc._sync_snapshots(None, None, _snaps(3), run)
     assert run.dialogs_synced == 0
+
+
+def _throttle_account():
+    return SimpleNamespace(flood_wait_until=None, health_status="healthy", last_error_message=None)
+
+
+def test_throttle_backoff_trips_when_seen_but_zero_synced() -> None:
+    svc = _bare_service()
+    svc.settings = Settings()
+    run = _fresh_run()
+    run.dialogs_seen, run.dialogs_synced, run.dialogs_skipped = 75, 0, 75
+    acc = _throttle_account()
+    now = datetime.now(UTC)
+    svc._apply_throttle_backoff(acc, run, now)
+    assert acc.flood_wait_until is not None and acc.flood_wait_until > now
+    assert acc.health_status == "rate_limited"
+    assert run.status == "rate_limited"
+
+
+def test_throttle_backoff_clears_on_recovery() -> None:
+    svc = _bare_service()
+    svc.settings = Settings()
+    run = _fresh_run()
+    run.dialogs_seen, run.dialogs_synced, run.dialogs_skipped = 20, 20, 0
+    acc = SimpleNamespace(
+        flood_wait_until=datetime.now(UTC) + timedelta(seconds=300),
+        health_status="rate_limited",
+        last_error_message="polling throttle",
+    )
+    svc._apply_throttle_backoff(acc, run, datetime.now(UTC))
+    assert acc.flood_wait_until is None
+    assert acc.health_status == "healthy"
+
+
+def test_throttle_backoff_ignores_single_flaky_dialog() -> None:
+    svc = _bare_service()
+    svc.settings = Settings()
+    run = _fresh_run()
+    run.dialogs_seen, run.dialogs_synced, run.dialogs_skipped = 5, 0, 1  # below threshold
+    acc = _throttle_account()
+    svc._apply_throttle_backoff(acc, run, datetime.now(UTC))
+    assert acc.flood_wait_until is None
+    assert run.status != "rate_limited"
 
 
 @pytest.mark.asyncio
