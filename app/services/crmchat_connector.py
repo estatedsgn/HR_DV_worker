@@ -81,6 +81,7 @@ class TelegramMessageSnapshot:
     text: str | None = None
     date: str | None = None
     outgoing: bool = False
+    reply_to_message_id: str | None = None
     raw: Mapping[str, Any] | None = None
 
 
@@ -760,10 +761,27 @@ def normalize_messages_response(
                 ),
                 date=optional_str(raw_message.get("date")),
                 outgoing=bool(raw_message.get("out") or raw_message.get("outgoing")),
+                reply_to_message_id=extract_reply_to_message_id(raw_message),
                 raw=raw_message,
             )
         )
     return snapshots
+
+
+def extract_reply_to_message_id(raw_message: Mapping[str, Any]) -> str | None:
+    """Telegram message id this message is a reply/quote to, if any.
+
+    Raw shape (MTProto via CRMChat):
+        {"replyTo": {"_": "messageReplyHeader", "replyToMsgId": 2720}}
+    """
+    reply_to = raw_message.get("replyTo") or raw_message.get("reply_to")
+    if isinstance(reply_to, Mapping):
+        return optional_str(
+            reply_to.get("replyToMsgId")
+            or reply_to.get("reply_to_msg_id")
+            or reply_to.get("replyToTopId")
+        )
+    return None
 
 
 def build_input_peer_from_resolve_username(payload: Mapping[str, Any]) -> Mapping[str, Any]:

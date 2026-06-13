@@ -394,6 +394,17 @@ class TelegramPollingService:
             "body": message_snapshot.text or "",
             "status": "synced",
         }
+        if message_snapshot.reply_to_message_id:
+            # Store the quoted message's external id (same shape as
+            # crmchat_message_id) so the funnel can resolve what a short reply
+            # like "." or "да" is actually answering.
+            message_kwargs["reply_to_message_id"] = build_message_external_id(
+                context.workspace.id,
+                context.telegram_account.id,
+                dialog.telegram_peer_type or "unknown",
+                dialog.telegram_peer_id or "unknown",
+                message_snapshot.reply_to_message_id,
+            )
         sent_at = parse_telegram_datetime(message_snapshot.date)
         if sent_at is not None:
             message_kwargs["sent_at"] = sent_at

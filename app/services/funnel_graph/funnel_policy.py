@@ -38,6 +38,8 @@ CANDIDATE_PROFILE_FIELDS: tuple[str, ...] = (
     "room_note",
     "equipment_available",
     "phone_model",
+    "phone_eligible",
+    "pc_webcam_available",
     "interview_interest",
     "candidate_name",
     "phone_number",
@@ -184,11 +186,20 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     ),
     "equipment_phone_check": StagePolicy(
         name="equipment_phone_check",
-        goal="Уточнить модель телефона кандидатки.",
+        goal="Уточнить модель телефона кандидатки и подходит ли он для стрима.",
         current_question="какая у тебя моделька телефончика?",
         required_fields=("phone_model",),
         next_stage_if_completed="interview_offer",
-        allowed_transitions=("equipment_phone_check", "interview_offer", "lost", "do_not_contact", "human_handoff"),
+        allowed_transitions=("equipment_phone_check", "equipment_pc_fallback_check", "interview_offer", "lost", "do_not_contact", "human_handoff"),
+        stage_type="waiting",
+    ),
+    "equipment_pc_fallback_check": StagePolicy(
+        name="equipment_pc_fallback_check",
+        goal="Телефон не подходит — выяснить, есть ли ПК/ноут с веб-камерой как альтернатива.",
+        current_question="для стрима с телефона нужен айфон 11+ или android посвежее (примерно с 2023, либо флагман с 2022). твой под это не проходит( а есть пк или ноут с веб-камерой?",
+        required_fields=("pc_webcam_available",),
+        next_stage_if_completed="interview_offer",
+        allowed_transitions=("equipment_pc_fallback_check", "interview_offer", "lost", "do_not_contact", "human_handoff"),
         stage_type="waiting",
     ),
     "interview_offer": StagePolicy(
@@ -366,6 +377,8 @@ def stage_requirement_met(stage: str, profile: dict[str, Any]) -> bool:
         return profile.get("room_available") is True
     if stage == "equipment_phone_check":
         return bool(profile.get("phone_model"))
+    if stage == "equipment_pc_fallback_check":
+        return profile.get("pc_webcam_available") is True
     if stage == "interview_offer":
         return profile.get("interview_interest") is True
     if stage == "contact_collection":

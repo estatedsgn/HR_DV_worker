@@ -46,6 +46,7 @@ TRANSITION_BRIDGES: dict[tuple[str, str], str] = {
     ("post_equipment_questions_check", "profile_theme_check"): PROFILE_BRIDGE,
     ("room_available_check", "equipment_phone_check"): "супер",
     ("equipment_phone_check", "interview_offer"): "нам подходит",
+    ("equipment_pc_fallback_check", "interview_offer"): "супер, с пк и веб-камерой тоже отлично заходит",
 }
 
 # Переходы сценария «скоро 18», которые НЕ обязаны проходить обычный gate
@@ -403,6 +404,20 @@ async def state_controller(state: FunnelGraphState) -> FunnelGraphState:
             target_stage = "scheduled_until_18"
             send_reply = False
             outgoing = []
+
+    # --- Телефон не подходит для стрима → предложить ПК с веб-камерой --------
+    # Модель распознана, но не проходит по правилу (iPhone 11+, Android 2023+,
+    # флагман 2022+). Вместо записи спрашиваем про ПК/ноут с веб-камерой.
+    # Непонятная/нераспознанная модель сюда НЕ попадает (phone_eligible=None) —
+    # она трактуется как «подходит», чтобы не зацикливать переспрос.
+    if current_stage == "equipment_phone_check" and profile.get("phone_eligible") is False:
+        target_stage = "equipment_pc_fallback_check"
+    elif current_stage == "equipment_pc_fallback_check":
+        if profile.get("pc_webcam_available") is True:
+            target_stage = "interview_offer"
+        elif profile.get("pc_webcam_available") is False:
+            # Ни подходящего телефона, ни ПК с камерой — мягко закрываем.
+            target_stage = "lost"
 
     if offer_deliver_voices:
         profile["salary_schedule_interest"] = True

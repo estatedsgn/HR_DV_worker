@@ -13,6 +13,10 @@ class Message(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     dialog_id: Mapped[str] = mapped_column(UUID(as_uuid=True), ForeignKey("dialogs.id"), index=True, nullable=False)
     crmchat_message_id: Mapped[str | None] = mapped_column(String(255), unique=True, index=True)
+    # External id (same shape as crmchat_message_id) of the message this one
+    # replies to / quotes, when the lead used Telegram's reply feature. Lets the
+    # funnel read a short reply like "." or "да" against the quoted message.
+    reply_to_message_id: Mapped[str | None] = mapped_column(String(255), index=True)
     direction: Mapped[str] = mapped_column(String(20), nullable=False)
     sender_type: Mapped[str] = mapped_column(String(50), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)

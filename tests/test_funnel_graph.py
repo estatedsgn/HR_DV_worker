@@ -13,7 +13,11 @@ from app.models.lead import Lead
 from app.models.outbound_job import OutboundJob
 from app.services.funnel_graph.actions import FunnelActionExecutor
 from app.services.funnel_graph.checkpoint import psycopg_conn_string
-from app.services.funnel_graph.gateway import LangGraphFunnelGateway, _collapse_outbound_duplicates
+from app.services.funnel_graph.gateway import (
+    LangGraphFunnelGateway,
+    _collapse_outbound_duplicates,
+    apply_reply_context,
+)
 from app.services.funnel_graph.graph import build_funnel_graph, pending_actions_from_outgoing, state_controller
 from app.services.funnel_graph.knowledge import StaticFunnelKnowledgeBase
 from app.services.funnel_graph.reply import (
@@ -27,8 +31,10 @@ from app.services.funnel_graph.reply import (
 )
 from app.services.funnel_graph.semantic import (
     SemanticResult,
+    assess_phone_eligibility,
     deterministic_semantic,
     extract_birthday_18_at,
+    extract_pc_webcam_available,
     is_turning_18_soon,
     merge_deterministic_facts,
 )
@@ -695,6 +701,91 @@ def test_phone_model_moves_to_interview_offer() -> None:
     assert state["stage"] == "interview_offer"
     assert state["candidate_profile"]["phone_model"] == "Samsung S25 Ultra"
     assert text_messages(state) == ["нам подходит", "тогда можем записаться на собеседование?"]
+
+
+def test_cyrillic_poco_model_does_not_loop_and_advances() -> None:
+    # Regression: «Поко м6 про» (Cyrillic brand) was not recognized, so the
+    # funnel re-asked the phone question forever (lead @durabi2li5).
+    state = run_graph(initial_state(stage="equipment_phone_check"), "Поко м6 про")
+
+    assert state["stage"] == "interview_offer"
+    assert state["candidate_profile"]["phone_model"] == "Поко м6 про"
+
+
+def test_unspecified_phone_is_assumed_fit_and_advances() -> None:
+    # "это мой телефон" without a model => assume fit, do not loop.
+    state = run_graph(initial_state(stage="equipment_phone_check"), "это мой телефон, обычный")
+
+    assert state["stage"] == "interview_offer"
+    assert state["candidate_profile"]["phone_eligible"] is True
+
+
+def test_unfit_iphone_branches_to_pc_webcam_fallback() -> None:
+    state = run_graph(initial_state(stage="equipment_phone_check"), "айфон 8")
+
+    assert state["stage"] == "equipment_pc_fallback_check"
+    assert state["candidate_profile"]["phone_eligible"] is False
+    joined = " ".join(text_messages(state)).lower()
+    assert "веб-камер" in joined or "пк" in joined
+
+
+def test_pc_webcam_yes_advances_to_interview_offer() -> None:
+    state = run_graph(
+        initial_state(stage="equipment_pc_fallback_check"),
+        "да, есть ноут с веб-камерой",
+    )
+
+    assert state["stage"] == "interview_offer"
+    assert state["candidate_profile"]["pc_webcam_available"] is True
+
+
+def test_pc_webcam_no_closes_lead_as_lost() -> None:
+    state = run_graph(
+        initial_state(stage="equipment_pc_fallback_check"),
+        "нет, только этот телефон",
+    )
+
+    assert state["stage"] == "lost"
+    assert state["candidate_profile"]["pc_webcam_available"] is False
+
+
+def test_assess_phone_eligibility_rule() -> None:
+    assert assess_phone_eligibility("айфон 11") is True
+    assert assess_phone_eligibility("iPhone 13 pro") is True
+    assert assess_phone_eligibility("айфон 8") is False
+    assert assess_phone_eligibility("iphone x") is False
+    # Android / unknown year => undecidable here, judged by LLM (None == fit).
+    assert assess_phone_eligibility("Поко м6 про") is None
+    assert assess_phone_eligibility("Samsung S25 Ultra") is None
+
+
+def test_apply_reply_context() -> None:
+    # A bare "." reply surfaces the quoted message as the effective text.
+    assert apply_reply_context(".", "Поко м6 про") == "Поко м6 про"
+    assert apply_reply_context("👍", "у тебя poco m6 pro?") == "у тебя poco m6 pro?"
+    # A substantive reply keeps its body and appends the quote as context.
+    assert apply_reply_context("да это он", "Поко м6 про") == "да это он (в ответ на: «Поко м6 про»)"
+    # No quote -> body unchanged.
+    assert apply_reply_context(".", "") == "."
+
+
+def test_reply_to_a_phone_model_advances_via_quote() -> None:
+    # Lead replies "." quoting her own "Поко м6 про" -> funnel reads the quote
+    # and advances instead of looping on the unparseable ".".
+    state = initial_state(stage="equipment_phone_check")
+    state["message_batch"] = [
+        {"direction": "inbound", "sender_type": "lead", "body": "Поко м6 про"}
+    ]
+    state["incoming_message"] = "Поко м6 про"
+    result = run_graph(state)
+    assert result["stage"] == "interview_offer"
+
+
+def test_extract_pc_webcam_available() -> None:
+    assert extract_pc_webcam_available("да, есть ноутбук с камерой") is True
+    assert extract_pc_webcam_available("есть пк") is True
+    assert extract_pc_webcam_available("нет, только телефон") is False
+    assert extract_pc_webcam_available("не знаю что сказать") is None
 
 
 def test_interview_offer_accepts_go_zapishimsya_and_asks_contact() -> None:

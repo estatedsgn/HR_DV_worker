@@ -9,9 +9,31 @@ from app.services.crmchat_connector import (
     CRMChatConnector,
     CRMChatMethodNotAllowedError,
     TelegramFloodWaitError,
+    extract_reply_to_message_id,
     normalize_dialogs_response,
+    normalize_messages_response,
     parse_flood_wait_seconds,
 )
+
+
+def test_extract_reply_to_message_id() -> None:
+    assert extract_reply_to_message_id(
+        {"id": 2736, "message": ".", "replyTo": {"_": "messageReplyHeader", "replyToMsgId": 2720}}
+    ) == "2720"
+    assert extract_reply_to_message_id({"id": 2730, "message": "hi"}) is None
+    assert extract_reply_to_message_id({"id": 2730, "replyTo": {"_": "messageReplyHeader"}}) is None
+
+
+def test_normalize_messages_response_captures_reply_to() -> None:
+    payload = {
+        "messages": [
+            {"id": 2736, "message": ".", "replyTo": {"_": "messageReplyHeader", "replyToMsgId": 2720}},
+            {"id": 2720, "message": "Поко м6 про"},
+        ]
+    }
+    snaps = {s.message_id: s for s in normalize_messages_response(payload)}
+    assert snaps["2736"].reply_to_message_id == "2720"
+    assert snaps["2720"].reply_to_message_id is None
 
 
 @pytest.mark.asyncio

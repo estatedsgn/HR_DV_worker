@@ -54,6 +54,8 @@ class SemanticFacts(BaseModel):
     room_note: str | None = None
     equipment_available: bool | None = None
     phone_model: str | None = None
+    phone_eligible: bool | None = None
+    pc_webcam_available: bool | None = None
     interview_interest: bool | None = None
     candidate_name: str | None = None
     phone_number: str | None = None
@@ -738,11 +740,36 @@ def deterministic_semantic(state: FunnelGraphState) -> SemanticResult:
         phone_model = extract_phone_model(text)
         if phone_model:
             facts["phone_model"] = phone_model
+            eligible = assess_phone_eligibility(phone_model)
+            if eligible is not None:
+                facts["phone_eligible"] = eligible
             return stage_answer(text, facts, "phone model provided")
         if mentions_phone_brand(normalized) and not has_question:
             return partial_answer(text, facts, ["phone_requirements"])
+        # Не называет конкретную модель, но утверждает, что телефон есть/обычный
+        # ("это мой телефон", "обычный", "норм", "пользуюсь им"). Не зацикливаем
+        # переспрос — по решению: непонятная модель = считаем, что подходит.
+        if (
+            contains_any(
+                normalized,
+                ("мой телефон", "это мой", "обычный", "обычн", "нормальн", "норм", "пользуюсь", "современн", "новый", "свежий"),
+            )
+            and not has_question
+            and not has_objection
+        ):
+            facts["phone_model"] = (text.strip()[:80] or "не уточнила")
+            facts["phone_eligible"] = True
+            return stage_answer(text, facts, "model unspecified, assumed fit")
         if facts.get("equipment_available"):
             return partial_answer(text, facts, ["equipment"])
+        if booking_intent and not has_question and not has_objection:
+            facts["interview_interest"] = True
+            return partial_answer(text, facts, [])
+    elif stage == "equipment_pc_fallback_check":
+        pc = extract_pc_webcam_available(text)
+        if pc is not None:
+            facts["pc_webcam_available"] = pc
+            return stage_answer(text, facts, "pc/webcam availability answered")
         if booking_intent and not has_question and not has_objection:
             facts["interview_interest"] = True
             return partial_answer(text, facts, [])
@@ -1438,20 +1465,41 @@ def mentions_equipment(text: str) -> bool:
 PHONE_MODEL_MARKERS = (
     "iphone",
     "айфон",
+    "айфончик",
     "samsung",
     "самсунг",
+    "галакси",
+    "galaxy",
     "xiaomi",
+    "сяоми",
+    "ксиоми",
     "redmi",
+    "редми",
     "poco",
+    "поко",
     "honor",
+    "хонор",
     "huawei",
+    "хуавей",
+    "хуавэй",
     "oneplus",
+    "ванплюс",
     "pixel",
+    "пиксель",
+    "пиксел",
     "realme",
+    "реалми",
     "vivo",
+    "виво",
     "oppo",
+    "оппо",
     "tecno",
+    "техно",
     "infinix",
+    "инфиникс",
+    "nothing phone",
+    "нубия",
+    "nubia",
 )
 
 
@@ -1478,6 +1526,51 @@ def extract_phone_model(text: str) -> str | None:
     if cleaned_normalized in PHONE_MODEL_MARKERS:
         return None
     return cleaned.strip(" .,!?:;")[:80] or None
+
+
+_IPHONE_NUM_RE = re.compile(r"(?:iphone|айфон\w*)\s*(\d{1,2})")
+
+
+def assess_phone_eligibility(model_text: str) -> bool | None:
+    """Deterministic safety net for the recording-device rule.
+
+    Rule (for booking): iPhone 11+, Android released 2023+, flagship 2022+.
+    We can only judge *numbered iPhones* with certainty here (iPhone 11+ = fit,
+    iPhone X/8 and below = unfit). For Android the release year almost never
+    lives in the model string and varies wildly, so we return None and let the
+    LLM judge — and an undecidable model is treated as fit upstream (per spec:
+    "непонятно какой телефон = считаем, что подходит", do not loop).
+    """
+    norm = normalize_text(model_text)
+    match = _IPHONE_NUM_RE.search(norm)
+    if match:
+        try:
+            num = int(match.group(1))
+        except ValueError:
+            num = None
+        if num is not None and 1 <= num <= 20:
+            return num >= 11
+    if contains_any(norm, ("айфон икс", "айфон x", "iphone x", "айфон 10", "iphone 10")):
+        return False  # iPhone X == 10, below the cutoff
+    return None
+
+
+def extract_pc_webcam_available(text: str) -> bool | None:
+    """yes/no for the 'do you have a PC/laptop with a webcam?' fallback stage."""
+    norm = normalize_text(text)
+    mentions_pc = contains_any(
+        norm,
+        ("пк", "комп", "компьютер", "ноут", "ноутбук", "макбук", "macbook", "моноблок", "laptop"),
+    )
+    if contains_any(text, ("нет", "неа", "нету", "не могу", "отсутств", "к сожалению")) and not contains_any(
+        text, ("да", "есть", "имеется")
+    ):
+        return False
+    if mentions_pc and not is_negative(text):
+        return True
+    if contains_any(text, ("да", "есть", "имеется", "конечно", "ага")) and not is_negative(text):
+        return True
+    return None
 
 
 def extract_phone_number(text: str) -> str | None:
