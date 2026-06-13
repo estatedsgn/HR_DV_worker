@@ -922,7 +922,13 @@ def dedupe_cross_turn_questions(
     """
     from app.services.funnel_graph.reply import canonical_question
 
-    last_canon = metadata.get("last_asked_question_canonical")
+    # Канонизируем и сохранённое значение: диалог, которому ДО деплоя задали
+    # вопрос в старой формулировке, держит в meta старый канон. После деплоя
+    # старая фраза стала вариантом нового канона — без приведения через
+    # canonical_question старый и новый канон не совпали бы и вопрос
+    # переспросился бы (то самое палево, ради которого варианты и оставлены).
+    last_canon_raw = metadata.get("last_asked_question_canonical")
+    last_canon = canonical_question(last_canon_raw) if last_canon_raw else last_canon_raw
     norm = [normalize_outgoing_message(m) for m in outgoing]
 
     def _is_substantive(n: dict[str, Any]) -> bool:

@@ -273,7 +273,9 @@ def test_interest_agreement_moves_to_age_check() -> None:
 
     assert state["stage"] == "age_check"
     assert state["candidate_profile"]["interest_confirmed"] is True
-    assert text_messages(state) == ["давай для начала уточним небольшую формальность, сколько тебе лет?"]
+    assert text_messages(state) == [
+        "если коротко — это разговорные стримы про то, что тебе самой нравится, оплата сдельная, выплаты каждую неделю 🐬 давай только закрою формальность: сколько тебе лет?"
+    ]
 
 
 def test_phone_model_number_at_age_check_is_not_read_as_underage() -> None:
@@ -352,7 +354,7 @@ def test_age_answer_sends_both_voice_packs_and_digest_without_gate() -> None:
     # Мостик-предупреждение перед войсами, дайджест после, вопрос в конце.
     assert any("голосовых" in t for t in texts)
     assert any("выплаты на карту" in t for t in texts)
-    assert texts[-1] == "остались ли у тебя какие-нибудь ещё вопросики?"
+    assert texts[-1] == "ну что, как тебе условия — есть вопросики, или рассказать, что нужно для старта?"
     # Гейта про «расскажу про зп» больше нет.
     assert all("давай расскажу про зп" not in t for t in texts)
 
@@ -523,7 +525,7 @@ def test_salary_agreement_sends_salary_pack_and_asks_any_questions() -> None:
     texts = text_messages(state)
     # Дайджест условий текстом (на случай, если голосовые не слушает) + вопрос.
     assert any("выплаты на карту" in t for t in texts)
-    assert texts[-1] == "остались ли у тебя какие-нибудь ещё вопросики?"
+    assert texts[-1] == "ну что, как тебе условия — есть вопросики, или рассказать, что нужно для старта?"
 
 
 def _salary_offer_awaiting_state():
@@ -559,7 +561,7 @@ def test_salary_offer_no_more_questions_sends_pack() -> None:
     assert state["stage"] == "post_equipment_questions_check"
     assert state["candidate_profile"]["salary_schedule_interest"] is True
     assert voice_packs(state) == ["salary_schedule"]
-    assert text_messages(state)[-1] == "остались ли у тебя какие-нибудь ещё вопросики?"
+    assert text_messages(state)[-1] == "ну что, как тебе условия — есть вопросики, или рассказать, что нужно для старта?"
     assert not state["metadata"].get("awaiting_interrupt_followup")
 
 
@@ -592,7 +594,7 @@ def test_action_stage_sends_voice_even_when_llm_reply_send_is_false() -> None:
     assert voice_packs(state) == ["salary_schedule"]
     texts = text_messages(state)
     assert any("выплаты на карту" in t for t in texts)
-    assert texts[-1] == "остались ли у тебя какие-нибудь ещё вопросики?"
+    assert texts[-1] == "ну что, как тебе условия — есть вопросики, или рассказать, что нужно для старта?"
 
 
 def test_equipment_does_not_close_phone_model_requirement() -> None:
@@ -720,9 +722,9 @@ def test_post_equipment_short_faq_topic_answers_before_repeating_question() -> N
     assert state["stage"] == "post_equipment_questions_check"
     assert state["candidate_profile"]["questions_resolved"] is None
     assert "стажировочных днях" in state["reply_text"]
-    assert "остались ли у тебя какие-нибудь ещё вопросики?" not in state["reply_text"]
+    assert "ну что, как тебе условия — есть вопросики, или рассказать, что нужно для старта?" not in state["reply_text"]
     assert state["metadata"]["awaiting_interrupt_followup"] is True
-    assert state["metadata"]["interrupt_followup_question"] == "остались ли у тебя какие-нибудь ещё вопросики?"
+    assert state["metadata"]["interrupt_followup_question"] == "ну что, как тебе условия — есть вопросики, или рассказать, что нужно для старта?"
 
 
 def test_booking_intent_after_materials_moves_to_next_required_question() -> None:
@@ -768,7 +770,7 @@ def test_english_question_gets_short_relevant_answer() -> None:
     assert state["stage"] == "post_equipment_questions_check"
     assert "английский не обязателен" in state["reply_text"]
     assert "переводчиком" in state["reply_text"]
-    assert "остались ли у тебя какие-нибудь ещё вопросики?" not in state["reply_text"]
+    assert "ну что, как тебе условия — есть вопросики, или рассказать, что нужно для старта?" not in state["reply_text"]
     assert state["metadata"]["awaiting_interrupt_followup"] is True
 
 
@@ -879,7 +881,7 @@ def test_multi_topic_question_batch_answers_all_relevant_knowledge() -> None:
     assert "оборудование" in state["reply_text"]
     assert "стажировочных днях" in state["reply_text"]
     assert "ГПХ" in state["reply_text"]
-    assert "остались ли у тебя какие-нибудь ещё вопросики?" not in state["reply_text"]
+    assert "ну что, как тебе условия — есть вопросики, или рассказать, что нужно для старта?" not in state["reply_text"]
 
 
 def test_friend_and_platform_batch_is_question_not_objection() -> None:
@@ -1488,7 +1490,7 @@ def test_new_message_during_interrupt_wait_is_processed_without_timeout_repeat()
 
     assert state["stage"] == "post_equipment_questions_check"
     assert "ГПХ" in state["reply_text"]
-    assert "остались ли у тебя какие-нибудь ещё вопросики?" not in state["reply_text"]
+    assert "ну что, как тебе условия — есть вопросики, или рассказать, что нужно для старта?" not in state["reply_text"]
     assert state["metadata"]["awaiting_interrupt_followup"] is True
 
 

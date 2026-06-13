@@ -74,10 +74,13 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
         allowed_transitions=("interest_check", "age_check", "lost", "do_not_contact", "human_handoff"),
         stage_type="waiting",
     ),
+    # Вопрос несёт микро-ценность ПЕРЕД формальностью: голый гейт «сколько тебе
+    # лет?» в ответ на «расскажи подробнее» терял лидов (уходили молча или
+    # переспрашивали «подожди, насчёт чего?») — см. транскрипты 06-08.
     "age_check": StagePolicy(
         name="age_check",
         goal="Узнать полный возраст кандидатки.",
-        current_question="давай для начала уточним небольшую формальность, сколько тебе лет?",
+        current_question="если коротко — это разговорные стримы про то, что тебе самой нравится, оплата сдельная, выплаты каждую неделю 🐬 давай только закрою формальность: сколько тебе лет?",
         required_fields=("age_confirmed",),
         next_stage_if_completed="work_intro_delivery",
         allowed_transitions=("age_check", "work_intro_delivery", "age_pending_18", "lost", "do_not_contact", "human_handoff"),
@@ -140,10 +143,13 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
         voice_pack_id="salary_schedule",
         template_id="salary_digest_message",
     ),
+    # После пака голосовых открытое «остались вопросики?» приглашало молчать —
+    # обе собеседницы 06-08 замолкали ровно здесь. Вопрос-вилка даёт конкретный
+    # следующий шаг и повод ответить даже без вопросов.
     "post_equipment_questions_check": StagePolicy(
         name="post_equipment_questions_check",
         goal="Понять, остались ли у кандидатки вопросы после вводных материалов.",
-        current_question="остались ли у тебя какие-нибудь ещё вопросики?",
+        current_question="ну что, как тебе условия — есть вопросики, или рассказать, что нужно для старта?",
         required_fields=("questions_resolved",),
         next_stage_if_completed="profile_theme_check",
         allowed_transitions=("post_equipment_questions_check", "profile_theme_check", "lost", "do_not_contact", "human_handoff"),
