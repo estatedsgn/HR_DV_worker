@@ -214,6 +214,26 @@ async def test_sync_snapshots_tolerates_all_timeouts() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sync_snapshots_aborts_cycle_on_account_throttle() -> None:
+    from app.services.telegram_polling import _THROTTLE_ABORT_TIMEOUTS
+
+    svc = _bare_service()
+    run = _fresh_run()
+    calls = {"n": 0}
+
+    async def fake_sync(_ctx, _acc, _snap):
+        calls["n"] += 1
+        raise httpx.ReadTimeout("")
+
+    svc._sync_dialog = fake_sync  # type: ignore[assignment]
+    # 20 диалогов, всё таймаутит: НЕ долбим все 20 (это часы), обрываем рано.
+    await svc._sync_snapshots(None, None, _snaps(20), run)
+    assert calls["n"] == _THROTTLE_ABORT_TIMEOUTS
+    assert run.dialogs_synced == 0
+    assert run.dialogs_skipped == _THROTTLE_ABORT_TIMEOUTS
+
+
+@pytest.mark.asyncio
 async def test_sync_snapshots_tolerates_per_dialog_api_errors() -> None:
     svc = _bare_service()
     run = _fresh_run()

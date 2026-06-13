@@ -38,6 +38,10 @@ logger = logging.getLogger("telegram_polling")
 # Minimum dialogs skipped-on-timeout (with zero synced) to call a cycle an
 # account-level throttle rather than one flaky dialog.
 _THROTTLE_SKIP_THRESHOLD = 3
+# Consecutive get_history timeouts (with nothing synced) that abort a cycle
+# early — a fully throttled account would otherwise hammer every dialog (25s
+# each) and never reach the end-of-cycle backoff check.
+_THROTTLE_ABORT_TIMEOUTS = 4
 
 
 @dataclass(slots=True, frozen=True)
@@ -250,6 +254,7 @@ class TelegramPollingService:
         их как WARN, не роняя статус прогона.
         """
         skips: list[str] = []
+        consecutive_timeouts = 0
         for dialog_snapshot in snapshots:
             if not should_sync_dialog(
                 dialog_snapshot, self.only_username, self.only_usernames
@@ -266,7 +271,25 @@ class TelegramPollingService:
                 reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
                 logger.warning("поллинг: диалог %s пропущен (%s)", who, reason)
                 skips.append(f"{who} ({reason})")
+                if isinstance(exc, httpx.TimeoutException):
+                    consecutive_timeouts += 1
+                    # Account-level throttle: many get_history calls in a row time
+                    # out and nothing synced. STOP hammering the rest of the dialogs
+                    # this cycle — otherwise a fully-throttled account never finishes
+                    # a cycle, so the backoff breaker (which trips at cycle end) never
+                    # engages and we hammer for hours, prolonging the flood.
+                    if (
+                        consecutive_timeouts >= _THROTTLE_ABORT_TIMEOUTS
+                        and run.dialogs_synced == 0
+                    ):
+                        logger.warning(
+                            "поллинг: %d таймаутов подряд без синка — обрываю цикл "
+                            "(троттл аккаунта), включаю backoff",
+                            consecutive_timeouts,
+                        )
+                        break
                 continue
+            consecutive_timeouts = 0
             run.dialogs_synced += int(synced)
             run.messages_seen += seen
             run.messages_created += created
