@@ -21,10 +21,13 @@ class StagePolicy:
 
 
 CANDIDATE_PROFILE_FIELDS: tuple[str, ...] = (
+    "warmup_pitched",
     "interest_confirmed",
     "interest_status",
     "age",
     "age_confirmed",
+    "birthday",
+    "birthday_18_at",
     "salary_schedule_interest",
     "questions_resolved",
     "profile_info",
@@ -35,6 +38,8 @@ CANDIDATE_PROFILE_FIELDS: tuple[str, ...] = (
     "room_note",
     "equipment_available",
     "phone_model",
+    "phone_eligible",
+    "pc_webcam_available",
     "interview_interest",
     "candidate_name",
     "phone_number",
@@ -49,38 +54,81 @@ CANDIDATE_PROFILE_FIELDS: tuple[str, ...] = (
 
 
 STAGE_POLICIES: dict[str, StagePolicy] = {
+    # Девочка написала ПЕРВОЙ (мэтч с Дайвинчика / сама постучалась) и о чём-то
+    # спрашивает. Не вываливаем сразу опенер-предложение: сначала тёплый разговор —
+    # поздороваться, ответить по-человечески, поддержать беседу. Питч про стриминг
+    # роняем позже (контроллер), когда беседа затихнет. См. [[inbound-first-warmup]].
+    "inbound_warmup": StagePolicy(
+        name="inbound_warmup",
+        goal="Тёплый разговор с написавшей первой: поздороваться, ответить на вопросы, поддержать беседу. Про работу/стриминг пока НЕ упоминать.",
+        current_question=None,
+        required_fields=("warmup_pitched",),
+        next_stage_if_completed="interest_check",
+        allowed_transitions=("inbound_warmup", "interest_check", "lost", "do_not_contact", "human_handoff"),
+        stage_type="waiting",
+    ),
     "interest_check": StagePolicy(
         name="interest_check",
         goal="Понять, есть ли у кандидатки интерес узнать подробности.",
-        current_question="Рассказать подробнее?",
+        current_question="если интересно — расскажу, что за работа и как всё устроено 🙂",
         required_fields=("interest_confirmed",),
         next_stage_if_completed="age_check",
         allowed_transitions=("interest_check", "age_check", "lost", "do_not_contact", "human_handoff"),
         stage_type="waiting",
     ),
+    # Вопрос несёт микро-ценность ПЕРЕД формальностью: голый гейт «сколько тебе
+    # лет?» в ответ на «расскажи подробнее» терял лидов (уходили молча или
+    # переспрашивали «подожди, насчёт чего?») — см. транскрипты 06-08.
     "age_check": StagePolicy(
         name="age_check",
         goal="Узнать полный возраст кандидатки.",
-        current_question="Для начала скажи, сколько тебе лет?",
+        current_question="если коротко — это разговорные стримы про то, что тебе самой нравится, оплата сдельная, выплаты каждую неделю 🐬 давай только закрою формальность: сколько тебе лет?",
         required_fields=("age_confirmed",),
         next_stage_if_completed="work_intro_delivery",
-        allowed_transitions=("age_check", "work_intro_delivery", "lost", "do_not_contact", "human_handoff"),
+        allowed_transitions=("age_check", "work_intro_delivery", "age_pending_18", "lost", "do_not_contact", "human_handoff"),
         stage_type="waiting",
     ),
+    # Кандидатке ещё нет 18, но скоро исполнится — не теряем её, а спрашиваем дату
+    # рождения, чтобы вернуться с поздравлением и предложением в день 18-летия.
+    "age_pending_18": StagePolicy(
+        name="age_pending_18",
+        goal="Узнать дату рождения, чтобы вернуться в день 18-летия.",
+        current_question="оо, ну тогда тебе ещё нет 18) но это вообще не проблема — напишу тебе сразу, как только можно будет 🎂 подскажи, когда у тебя день рождения?",
+        required_fields=("birthday_18_at",),
+        next_stage_if_completed="scheduled_until_18",
+        allowed_transitions=("age_pending_18", "scheduled_until_18", "lost", "do_not_contact", "human_handoff"),
+        stage_type="waiting",
+    ),
+    # Пауза до 18-летия: отложенные сообщения (поздравление в др + работа на след.
+    # день) уже запланированы. Возобновляемся, когда кандидатка пишет после др.
+    "scheduled_until_18": StagePolicy(
+        name="scheduled_until_18",
+        goal="Ждём 18-летия кандидатки; поздравление и оффер запланированы.",
+        current_question=None,
+        required_fields=(),
+        next_stage_if_completed=None,
+        allowed_transitions=("scheduled_until_18", "work_intro_delivery", "age_check", "lost", "do_not_contact", "human_handoff"),
+        stage_type="waiting",
+    ),
+    # После возраста СРАЗУ выдаём всё: голосовые о работе + голосовые про ЗП/график
+    # одним паком, без промежуточного вопроса-разрешения. Каждый лишний гейт-вопрос
+    # терял часть лидов (см. docs/CHANGELOG_AGENT.md, конверсионный пакет №1).
     "work_intro_delivery": StagePolicy(
         name="work_intro_delivery",
         goal="Отправить готовые голосовые о работе.",
         current_question=None,
         required_fields=(),
-        next_stage_if_completed="salary_schedule_offer",
-        allowed_transitions=("salary_schedule_offer",),
+        next_stage_if_completed="salary_schedule_delivery",
+        allowed_transitions=("salary_schedule_delivery",),
         stage_type="action",
         voice_pack_id="work_intro",
     ),
+    # Совместимость: лиды, уже стоящие на этом гейте, доезжают через
+    # offer_deliver_voices (state_controller). Новые лиды сюда не попадают.
     "salary_schedule_offer": StagePolicy(
         name="salary_schedule_offer",
         goal="Получить согласие кандидатки узнать про зарплату и график.",
-        current_question="Если интересна наша сфера, давай расскажу про зп и график",
+        current_question="если интересна наша сфера, давай расскажу про зп и график 🐬",
         required_fields=("salary_schedule_interest",),
         next_stage_if_completed="salary_schedule_delivery",
         allowed_transitions=("salary_schedule_offer", "salary_schedule_delivery", "lost", "do_not_contact", "human_handoff"),
@@ -95,11 +143,15 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
         allowed_transitions=("post_equipment_questions_check",),
         stage_type="action",
         voice_pack_id="salary_schedule",
+        template_id="salary_digest_message",
     ),
+    # После пака голосовых открытое «остались вопросики?» приглашало молчать —
+    # обе собеседницы 06-08 замолкали ровно здесь. Вопрос-вилка даёт конкретный
+    # следующий шаг и повод ответить даже без вопросов.
     "post_equipment_questions_check": StagePolicy(
         name="post_equipment_questions_check",
         goal="Понять, остались ли у кандидатки вопросы после вводных материалов.",
-        current_question="Остались ли у тебя какие-нибудь ещё вопросы?",
+        current_question="ну что, как тебе условия — есть вопросики, или рассказать, что нужно для старта?",
         required_fields=("questions_resolved",),
         next_stage_if_completed="profile_theme_check",
         allowed_transitions=("post_equipment_questions_check", "profile_theme_check", "lost", "do_not_contact", "human_handoff"),
@@ -108,7 +160,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "profile_theme_check": StagePolicy(
         name="profile_theme_check",
         goal="Собрать базовую информацию: учёба, работа, интересы.",
-        current_question="Расскажи немного о себе: учишься/работаешь? Чем любишь заниматься в свободное время?",
+        current_question="расскажи немного о себе, учишься/работаешь? чем любишь заниматься в свободное время? помогу подобрать тематику для стримов 🐬",
         required_fields=("profile_info",),
         next_stage_if_completed="support_smalltalk",
         allowed_transitions=("profile_theme_check", "support_smalltalk", "lost", "do_not_contact", "human_handoff"),
@@ -126,7 +178,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "room_available_check": StagePolicy(
         name="room_available_check",
         goal="Уточнить, есть ли место/комната, где кандидатке никто не помешает.",
-        current_question="Есть ли у тебя комната или место, где никто не будет мешать во время стримов?",
+        current_question="скажи, у тебя есть комната, в которой тебе никто не будет мешать?",
         required_fields=("room_available",),
         next_stage_if_completed="equipment_phone_check",
         allowed_transitions=("room_available_check", "equipment_phone_check", "lost", "do_not_contact", "human_handoff"),
@@ -134,17 +186,26 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     ),
     "equipment_phone_check": StagePolicy(
         name="equipment_phone_check",
-        goal="Уточнить модель телефона кандидатки.",
-        current_question="Какая у тебя модель телефона?",
+        goal="Уточнить модель телефона кандидатки и подходит ли он для стрима.",
+        current_question="какая у тебя моделька телефончика?",
         required_fields=("phone_model",),
         next_stage_if_completed="interview_offer",
-        allowed_transitions=("equipment_phone_check", "interview_offer", "lost", "do_not_contact", "human_handoff"),
+        allowed_transitions=("equipment_phone_check", "equipment_pc_fallback_check", "interview_offer", "lost", "do_not_contact", "human_handoff"),
+        stage_type="waiting",
+    ),
+    "equipment_pc_fallback_check": StagePolicy(
+        name="equipment_pc_fallback_check",
+        goal="Телефон не подходит — выяснить, есть ли ПК/ноут с веб-камерой как альтернатива.",
+        current_question="для стрима с телефона нужен айфон 11+ или android посвежее (примерно с 2023, либо флагман с 2022). твой под это не проходит( а есть пк или ноут с веб-камерой?",
+        required_fields=("pc_webcam_available",),
+        next_stage_if_completed="interview_offer",
+        allowed_transitions=("equipment_pc_fallback_check", "interview_offer", "lost", "do_not_contact", "human_handoff"),
         stage_type="waiting",
     ),
     "interview_offer": StagePolicy(
         name="interview_offer",
         goal="Предложить записаться на собеседование.",
-        current_question="Можем записаться на собеседование?",
+        current_question="тогда можем записаться на собеседование?",
         required_fields=("interview_interest",),
         next_stage_if_completed="contact_collection",
         allowed_transitions=("interview_offer", "contact_collection", "lost", "do_not_contact", "human_handoff"),
@@ -153,7 +214,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "contact_collection": StagePolicy(
         name="contact_collection",
         goal="Собрать имя и номер телефона для записи.",
-        current_question="Для записи мне нужен твой номер телефона и имя",
+        current_question="для записи мне нужно твоё имя и номер телефончика",
         required_fields=("candidate_name", "phone_number"),
         next_stage_if_completed="interview_day_check",
         allowed_transitions=("contact_collection", "interview_day_check", "lost", "do_not_contact", "human_handoff"),
@@ -162,7 +223,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "interview_day_check": StagePolicy(
         name="interview_day_check",
         goal="Уточнить, удобно ли провести собеседование завтра.",
-        current_question="Завтра будет удобно провести собеседование?",
+        current_question="завтра будет удобно провести собеседование?",
         required_fields=("interview_day_confirmed",),
         next_stage_if_completed="interview_time_check",
         allowed_transitions=("interview_day_check", "interview_time_check", "interview_custom_time", "lost", "do_not_contact", "human_handoff"),
@@ -171,7 +232,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "interview_time_check": StagePolicy(
         name="interview_time_check",
         goal="Выбрать время собеседования завтра в диапазоне 11:00-18:00.",
-        current_question="С 11:00 по 18:00 в какое время будет удобнее?",
+        current_question="с 11:00 по 18:00 по мск, в какое время будет удобнее?",
         required_fields=("interview_time",),
         next_stage_if_completed="human_handoff",
         allowed_transitions=("interview_time_check", "human_handoff", "lost", "do_not_contact"),
@@ -180,7 +241,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "interview_custom_time": StagePolicy(
         name="interview_custom_time",
         goal="Уточнить удобные дату и время, если завтра неудобно.",
-        current_question="Хорошо, когда тебе будет удобно пройти собеседование?",
+        current_question="хорошо, когда тебе будет удобно пройти собеседование?",
         required_fields=("custom_interview_datetime",),
         next_stage_if_completed="human_handoff",
         allowed_transitions=("interview_custom_time", "human_handoff", "lost", "do_not_contact"),
@@ -227,7 +288,7 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
     "try_interest_check": StagePolicy(
         name="try_interest_check",
         goal="Совместимый waiting-state старой воронки.",
-        current_question="Желаешь попробовать нашу сферу?",
+        current_question="желаешь попробовать нашу сферу?",
         required_fields=("interest_confirmed",),
         next_stage_if_completed="profile_theme_check",
         allowed_transitions=("try_interest_check", "profile_theme_check", "lost", "do_not_contact", "human_handoff"),
@@ -245,8 +306,10 @@ STAGE_POLICIES: dict[str, StagePolicy] = {
 }
 
 
+# Куда «хопает» action-стадия после выполнения. Цепочки action→action разрешены:
+# executor проходит их подряд за один ход (work_intro → salary_schedule → вопрос).
 ACTION_STAGE_TO_WAITING_STAGE = {
-    "work_intro_delivery": "salary_schedule_offer",
+    "work_intro_delivery": "salary_schedule_delivery",
     "salary_schedule_delivery": "post_equipment_questions_check",
     "support_smalltalk": "room_available_check",
     "company_intro": "profile_theme_check",
@@ -293,10 +356,17 @@ def can_transition(current_stage: str, target_stage: str) -> bool:
 
 
 def stage_requirement_met(stage: str, profile: dict[str, Any]) -> bool:
+    if stage == "inbound_warmup":
+        return profile.get("warmup_pitched") is True
     if stage == "interest_check":
         return profile.get("interest_confirmed") is True
     if stage == "age_check":
         return profile.get("age_confirmed") is True and int(profile.get("age") or 0) >= 18
+    if stage == "age_pending_18":
+        return bool(profile.get("birthday_18_at"))
+    if stage == "scheduled_until_18":
+        # Возобновление управляется контроллером по дате 18-летия, не авто-переходом.
+        return False
     if stage == "salary_schedule_offer":
         return profile.get("salary_schedule_interest") is True
     if stage == "post_equipment_questions_check":
@@ -307,6 +377,8 @@ def stage_requirement_met(stage: str, profile: dict[str, Any]) -> bool:
         return profile.get("room_available") is True
     if stage == "equipment_phone_check":
         return bool(profile.get("phone_model"))
+    if stage == "equipment_pc_fallback_check":
+        return profile.get("pc_webcam_available") is True
     if stage == "interview_offer":
         return profile.get("interview_interest") is True
     if stage == "contact_collection":

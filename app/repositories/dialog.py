@@ -1,3 +1,5 @@
+from uuid import UUID
+
 from sqlalchemy import case, func, or_, select
 
 from app.models.dialog import Dialog
@@ -8,6 +10,25 @@ from app.repositories.base import BaseRepository
 
 class DialogRepository(BaseRepository[Dialog]):
     model = Dialog
+
+    async def list_pollable_by_account(self, account_id: UUID) -> list[Dialog]:
+        """Известные telegram-диалоги аккаунта, годные для прямого get_history.
+
+        Деградационный путь, когда getDialogs виснет под троттлингом: историю можно
+        тянуть точечно по сохранённому peer/accessHash, не обходя список диалогов.
+        Свежие первыми — под троттлингом цикл длинный, живые переписки важнее.
+        """
+        result = await self.session.execute(
+            select(Dialog)
+            .where(
+                Dialog.account_id == account_id,
+                Dialog.crmchat_dialog_id.like("telegram:%"),
+                Dialog.status != "ignored",
+                Dialog.telegram_peer_id.isnot(None),
+            )
+            .order_by(Dialog.updated_at.desc())
+        )
+        return list(result.scalars().all())
 
     async def get_by_crmchat_dialog_id(self, crmchat_dialog_id: str) -> Dialog | None:
         result = await self.session.execute(

@@ -1,0 +1,17 @@
+[Unit]
+Description=HR_DV_worker — Postgres (docker compose), brought up on boot
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+User=hrdv
+Group=hrdv
+WorkingDirectory=/opt/HR_DV_worker
+ExecStart=/usr/bin/docker compose up -d postgres
+ExecStop=/usr/bin/docker compose stop postgres
+
+[Install]
+WantedBy=multi-user.target

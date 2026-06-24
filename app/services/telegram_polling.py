@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
@@ -18,16 +20,28 @@ from app.repositories.dialog import DialogRepository
 from app.repositories.message import MessageRepository
 from app.repositories.telegram_polling_run import TelegramPollingRunRepository
 from app.services.crmchat_connector import (
+    CRMChatAPIError,
     CRMChatBootstrapContext,
     CRMChatConnector,
     TelegramDialogSnapshot,
     TelegramFloodWaitError,
     TelegramMessageSnapshot,
+    TelegramPeer,
     normalize_dialogs_response,
     normalize_messages_response,
 )
 from app.services.crmchat_diagnostics import build_input_peer, redact_value
 from app.services.inbound_pipeline import InboundPipelineService
+
+logger = logging.getLogger("telegram_polling")
+
+# Minimum dialogs skipped-on-timeout (with zero synced) to call a cycle an
+# account-level throttle rather than one flaky dialog.
+_THROTTLE_SKIP_THRESHOLD = 3
+# Consecutive get_history timeouts (with nothing synced) that abort a cycle
+# early — a fully throttled account would otherwise hammer every dialog (25s
+# each) and never reach the end-of-cycle backoff check.
+_THROTTLE_ABORT_TIMEOUTS = 4
 
 
 @dataclass(slots=True, frozen=True)
@@ -35,11 +49,13 @@ class TelegramPollingResult:
     status: str
     dialogs_seen: int = 0
     dialogs_synced: int = 0
+    dialogs_skipped: int = 0
     messages_seen: int = 0
     messages_created: int = 0
     flood_wait_seconds: int | None = None
     next_run_at: datetime | None = None
     error_message: str | None = None
+    skip_details: str | None = None
 
 
 class TelegramPollingService:
@@ -57,6 +73,7 @@ class TelegramPollingService:
         connector: CRMChatConnector | None = None,
         settings: Settings | None = None,
         only_username: str | None = None,
+        only_usernames: set[str] | None = None,
         mark_read: bool | None = None,
     ) -> None:
         self.session = session
@@ -64,6 +81,14 @@ class TelegramPollingService:
         self.connector = connector or CRMChatConnector(settings=self.settings)
         self.inbound_pipeline = InboundPipelineService(session)
         self.only_username = normalize_username(only_username) if only_username else None
+        # Множество юзернеймов, которые разрешено поллить (скоуп на лидов воронки).
+        # Если задано — историю тянем ТОЛЬКО по этим диалогам, не обходя все 20+
+        # чужих/мусорных диалогов аккаунта (каждый = отдельный get_history-вызов).
+        self.only_usernames = (
+            {u for u in (normalize_username(v) for v in only_usernames) if u}
+            if only_usernames
+            else None
+        )
         self.mark_read = (
             self.settings.telegram_mark_read_after_poll
             if mark_read is None
@@ -123,29 +148,165 @@ class TelegramPollingService:
         run.crmchat_workspace_id = context.workspace.id
         run.crmchat_account_id = context.telegram_account.id
 
-        dialogs_payload = await self.connector.get_dialogs(
-            context.workspace.id,
-            context.telegram_account.id,
-            limit=self.settings.telegram_poll_dialogs_limit,
-        )
-        dialogs = normalize_dialogs_response(dialogs_payload)
-        run.dialogs_seen = len(dialogs)
+        now = datetime.now(UTC)
+        # Account-level throttle circuit breaker. When Telegram floods an account
+        # (typically after the swiper's mass-likes) every get_history hangs to a
+        # ReadTimeout. Hammering all dialogs each cycle PROLONGS the flood and
+        # burns ~30-min cycles. While the account is backed off we skip the heavy
+        # poll entirely so the flood window can clear; account_sync / the next
+        # eligible cycle resumes once it expires. Outbound already honours
+        # flood_wait_until (it defers sends), so one flag pauses the whole account.
+        if account.flood_wait_until and account.flood_wait_until > now:
+            run.status = "rate_limited"
+            run.dialogs_seen = 0
+            run.error_message = "account backed off (throttle); skipping heavy poll"
+            run.finished_at = now
+            run.next_run_at = account.flood_wait_until
+            return
 
-        for dialog_snapshot in dialogs:
-            if not should_sync_dialog(dialog_snapshot, self.only_username):
-                continue
-            synced, seen, created = await self._sync_dialog(
-                context, account, dialog_snapshot
+        try:
+            dialogs_payload = await self.connector.get_dialogs(
+                context.workspace.id,
+                context.telegram_account.id,
+                limit=self.settings.telegram_poll_dialogs_limit,
             )
+            dialogs = normalize_dialogs_response(dialogs_payload)
+        except httpx.TimeoutException:
+            # Под троттлингом аккаунта (массовые лайки Дайвинчика) каждый вызов идёт
+            # 15-20с, и getDialogs изредка перебивает read-таймаут. НЕ валим весь
+            # прогон: деградируем на уже известные диалоги из БД (их get_history тянем
+            # точечно по сохранённому peer), чтобы лиды продолжали обслуживаться, а
+            # новые диалоги подхватятся, как только getDialogs снова уложится в бюджет.
+            dialogs = await self._known_dialog_snapshots(account)
+        run.dialogs_seen = len(dialogs)
+        await self._sync_snapshots(context, account, dialogs, run)
+
+        now = datetime.now(UTC)
+        self._apply_throttle_backoff(account, run, now)
+        if run.status != "rate_limited":
+            run.status = "completed"
+        run.finished_at = now
+        run.next_run_at = (
+            account.flood_wait_until
+            if account.flood_wait_until and account.flood_wait_until > now
+            else now + timedelta(seconds=self.settings.telegram_poll_interval_seconds)
+        )
+
+    def _apply_throttle_backoff(
+        self, account: Account, run: TelegramPollingRun, now: datetime
+    ) -> None:
+        """Trip / clear the account-level throttle breaker from poll results.
+
+        A cycle that saw dialogs but synced none while skipping several on
+        timeout is the account-level throttle signal that a plain ReadTimeout
+        (unlike a clean FLOOD_WAIT) never surfaces. Treat it like a flood: set
+        flood_wait_until so polling, outbound and the swiper all back off, and
+        the flood can actually clear. A cycle that synced anything clears it.
+        """
+        throttled = (
+            run.dialogs_seen > 0
+            and run.dialogs_synced == 0
+            and (run.dialogs_skipped or 0) >= _THROTTLE_SKIP_THRESHOLD
+        )
+        if throttled:
+            backoff = max(
+                self.settings.telegram_throttle_backoff_seconds,
+                self.settings.telegram_poll_interval_seconds,
+            )
+            account.flood_wait_until = now + timedelta(seconds=backoff)
+            account.health_status = "rate_limited"
+            account.last_error_message = (
+                f"polling throttle: seen={run.dialogs_seen} synced=0 "
+                f"skipped={run.dialogs_skipped}"
+            )
+            run.status = "rate_limited"
+        elif run.dialogs_synced > 0 and account.health_status == "rate_limited":
+            account.flood_wait_until = None
+            account.health_status = "healthy"
+            account.last_error_message = None
+
+    async def _sync_snapshots(
+        self,
+        context: CRMChatBootstrapContext,
+        account: Account,
+        snapshots: list[TelegramDialogSnapshot],
+        run: TelegramPollingRun,
+    ) -> None:
+        """Синкаем диалоги по очереди, изолируя сбой ОТДЕЛЬНОГО диалога.
+
+        Под троттлингом аккаунта (массовые лайки Дайвинчика) каждый get_history
+        идёт 15-20с и иногда перебивает read-таймаут; у части диалогов бывает
+        протухший peer (PEER_ID_INVALID) — особенно на деградационном пути, где
+        access_hash берётся из БД. Раньше любой такой единичный сбой пробрасывался
+        из poll_once и ронял ВЕСЬ прогон (run='failed', heartbeat кричал «поллинг
+        сломался»), хотя остальные диалоги читались нормально. Теперь проблемный
+        диалог пропускается и добирается на следующем цикле (свежий access_hash
+        приедет со следующим успешным getDialogs).
+
+        Терпим и таймаут, и per-dialog CRMChatAPIError. НЕ маскируем системный
+        сбой: отзыв ключа/доступа упадёт раньше — в bootstrap/getDialogs (они вне
+        этой обёртки) и в account_sync. Flood-wait пробрасываем — это сигнал
+        уровня аккаунта, прогон должен встать на rate_limited.
+
+        Пропуск не должен быть невидимым: вечно битый диалог (протухший peer)
+        иначе молча выпадает из обслуживания каждый цикл. Каждый skip логируем
+        и пишем в run.dialogs_skipped / run.skip_details — heartbeat показывает
+        их как WARN, не роняя статус прогона.
+        """
+        skips: list[str] = []
+        consecutive_timeouts = 0
+        for dialog_snapshot in snapshots:
+            if not should_sync_dialog(
+                dialog_snapshot, self.only_username, self.only_usernames
+            ):
+                continue
+            try:
+                synced, seen, created = await self._sync_dialog(
+                    context, account, dialog_snapshot
+                )
+            except TelegramFloodWaitError:
+                raise
+            except (httpx.TimeoutException, CRMChatAPIError) as exc:
+                who = dialog_snapshot.peer.username or f"id:{dialog_snapshot.peer.peer_id}"
+                reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+                logger.warning("поллинг: диалог %s пропущен (%s)", who, reason)
+                skips.append(f"{who} ({reason})")
+                if isinstance(exc, httpx.TimeoutException):
+                    consecutive_timeouts += 1
+                    # Account-level throttle: many get_history calls in a row time
+                    # out and nothing synced. STOP hammering the rest of the dialogs
+                    # this cycle — otherwise a fully-throttled account never finishes
+                    # a cycle, so the backoff breaker (which trips at cycle end) never
+                    # engages and we hammer for hours, prolonging the flood.
+                    if (
+                        consecutive_timeouts >= _THROTTLE_ABORT_TIMEOUTS
+                        and run.dialogs_synced == 0
+                    ):
+                        logger.warning(
+                            "поллинг: %d таймаутов подряд без синка — обрываю цикл "
+                            "(троттл аккаунта), включаю backoff",
+                            consecutive_timeouts,
+                        )
+                        break
+                continue
+            consecutive_timeouts = 0
             run.dialogs_synced += int(synced)
             run.messages_seen += seen
             run.messages_created += created
+        if skips:
+            # (or 0) — до flush у свежего run колоночный default ещё не применён.
+            run.dialogs_skipped = (run.dialogs_skipped or 0) + len(skips)
+            run.skip_details = "; ".join(skips)[:1000]
 
-        run.status = "completed"
-        run.finished_at = datetime.now(UTC)
-        run.next_run_at = run.finished_at + timedelta(
-            seconds=self.settings.telegram_poll_interval_seconds
-        )
+    async def _known_dialog_snapshots(
+        self, account: Account
+    ) -> list[TelegramDialogSnapshot]:
+        rows = await DialogRepository(self.session).list_pollable_by_account(account.id)
+        return [
+            snapshot
+            for dialog in rows
+            if (snapshot := snapshot_from_dialog(dialog)) is not None
+        ]
 
     async def _sync_dialog(
         self,
@@ -294,6 +455,18 @@ class TelegramPollingService:
         if await repository.get_by_crmchat_message_id(external_message_id):
             return False
 
+        # Перечитанное НАШЕ исходящее: не плодим вторую запись — привязываем
+        # crmchat_message_id к существующей записи отправки. Иначе бот видел бы своё
+        # сообщение в истории дважды и извинялся, что написал дважды.
+        if message_snapshot.outgoing:
+            adopted = await repository.adopt_outbound_readback(
+                dialog.id,
+                message_snapshot.text or "",
+                external_message_id,
+            )
+            if adopted is not None:
+                return False
+
         message_kwargs = {
             "dialog_id": dialog.id,
             "crmchat_message_id": external_message_id,
@@ -302,6 +475,17 @@ class TelegramPollingService:
             "body": message_snapshot.text or "",
             "status": "synced",
         }
+        if message_snapshot.reply_to_message_id:
+            # Store the quoted message's external id (same shape as
+            # crmchat_message_id) so the funnel can resolve what a short reply
+            # like "." or "да" is actually answering.
+            message_kwargs["reply_to_message_id"] = build_message_external_id(
+                context.workspace.id,
+                context.telegram_account.id,
+                dialog.telegram_peer_type or "unknown",
+                dialog.telegram_peer_id or "unknown",
+                message_snapshot.reply_to_message_id,
+            )
         sent_at = parse_telegram_datetime(message_snapshot.date)
         if sent_at is not None:
             message_kwargs["sent_at"] = sent_at
@@ -366,11 +550,16 @@ def initial_dialog_status(dialog_snapshot: TelegramDialogSnapshot) -> str:
 
 
 def should_sync_dialog(
-    dialog_snapshot: TelegramDialogSnapshot, only_username: str | None = None
+    dialog_snapshot: TelegramDialogSnapshot,
+    only_username: str | None = None,
+    only_usernames: set[str] | None = None,
 ) -> bool:
+    username = normalize_username(dialog_snapshot.peer.username)
+    if only_usernames is not None:
+        return username is not None and username in only_usernames
     if only_username is None:
         return True
-    return normalize_username(dialog_snapshot.peer.username) == normalize_username(only_username)
+    return username == normalize_username(only_username)
 
 
 def normalize_username(value: str | None) -> str | None:
@@ -395,6 +584,23 @@ def update_dialog_from_snapshot(
             dialog.memory_summary = (
                 f"Telegram dialog with {dialog_snapshot.peer.display_name}"
             )
+
+
+def snapshot_from_dialog(dialog: Dialog) -> TelegramDialogSnapshot | None:
+    """Собрать dialog-снапшот из сохранённого в БД peer (для поллинга без getDialogs).
+
+    Возвращает None, если у диалога нет пригодного peer (его get_history всё равно
+    нельзя построить — такой диалог пропускаем).
+    """
+    if not dialog.telegram_peer_type or not dialog.telegram_peer_id:
+        return None
+    peer = TelegramPeer(
+        peer_type=dialog.telegram_peer_type,
+        peer_id=dialog.telegram_peer_id,
+        access_hash=dialog.telegram_access_hash,
+        username=dialog.telegram_username,
+    )
+    return TelegramDialogSnapshot(peer=peer)
 
 
 def build_dialog_external_id(
@@ -432,11 +638,13 @@ def result_from_run(run: TelegramPollingRun) -> TelegramPollingResult:
         status=run.status,
         dialogs_seen=run.dialogs_seen,
         dialogs_synced=run.dialogs_synced,
+        dialogs_skipped=run.dialogs_skipped,
         messages_seen=run.messages_seen,
         messages_created=run.messages_created,
         flood_wait_seconds=run.flood_wait_seconds,
         next_run_at=run.next_run_at,
         error_message=run.error_message,
+        skip_details=run.skip_details,
     )
 
 
@@ -448,9 +656,12 @@ def merge_polling_results(
         status=status,
         dialogs_seen=left.dialogs_seen + right.dialogs_seen,
         dialogs_synced=left.dialogs_synced + right.dialogs_synced,
+        dialogs_skipped=left.dialogs_skipped + right.dialogs_skipped,
         messages_seen=left.messages_seen + right.messages_seen,
         messages_created=left.messages_created + right.messages_created,
         flood_wait_seconds=right.flood_wait_seconds or left.flood_wait_seconds,
         next_run_at=right.next_run_at or left.next_run_at,
         error_message=right.error_message or left.error_message,
+        skip_details="; ".join(s for s in (left.skip_details, right.skip_details) if s)
+        or None,
     )

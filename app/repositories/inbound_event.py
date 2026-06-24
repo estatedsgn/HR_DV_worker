@@ -25,18 +25,29 @@ class InboundEventRepository(BaseRepository[InboundEvent]):
         return result.scalar_one_or_none()
 
     async def claim_ready_batch(
-        self, *, lease_owner: str, limit: int = 100, lease_seconds: int = 60
+        self,
+        *,
+        lease_owner: str,
+        limit: int = 100,
+        lease_seconds: int = 60,
+        dialog_ids: list[str] | None = None,
     ) -> list[InboundEvent]:
         now = datetime.now(UTC)
         lease_expires_at = now + timedelta(seconds=lease_seconds)
+        # Опциональный скоуп по диалогам: узкий автопилот читает только свои
+        # диалоги и не вычитывает чужую очередь.
+        dialog_clause = ""
+        if dialog_ids:
+            dialog_clause = "AND ie_c.dialog_id::text = ANY(:dialog_ids)"
         query = text(
-            """
+            f"""
             WITH candidates AS (
                 SELECT id
-                FROM inbound_events
+                FROM inbound_events AS ie_c
                 WHERE
                     (status = 'queued' OR (status = 'retry' AND next_attempt_at IS NOT NULL AND next_attempt_at <= :now))
                     AND (lease_expires_at IS NULL OR lease_expires_at <= :now)
+                    {dialog_clause}
                 ORDER BY created_at ASC
                 LIMIT :limit
                 FOR UPDATE SKIP LOCKED
@@ -54,15 +65,16 @@ class InboundEventRepository(BaseRepository[InboundEvent]):
             bindparam("lease_owner"),
             bindparam("lease_expires_at"),
         )
-        result = await self.session.execute(
-            query,
-            {
-                "now": now,
-                "limit": limit,
-                "lease_owner": lease_owner,
-                "lease_expires_at": lease_expires_at,
-            },
-        )
+        params = {
+            "now": now,
+            "limit": limit,
+            "lease_owner": lease_owner,
+            "lease_expires_at": lease_expires_at,
+        }
+        if dialog_ids:
+            query = query.bindparams(bindparam("dialog_ids"))
+            params["dialog_ids"] = [str(d) for d in dialog_ids]
+        result = await self.session.execute(query, params)
         ids = [row[0] for row in result.fetchall()]
         if not ids:
             return []

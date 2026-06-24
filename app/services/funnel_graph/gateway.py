@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -41,6 +42,13 @@ class LangGraphFunnelGateway:
             return None
         lead = await self._get_or_create_lead(dialog)
         runtime = await self.get_or_create_runtime(lead=lead, dialog=dialog)
+        # A human has taken over this dialog (handoff or explicit pause): the bot
+        # must stay COMPLETELY silent — no graph run, no reply — until a human
+        # explicitly resumes it (scripts/resume_funnel_dialog.py). Otherwise the
+        # funnel keeps answering the lead's messages and "interjects" right in the
+        # middle of the recruiter's own conversation.
+        if is_bot_silenced(runtime):
+            return None
         message = await self.session.get(Message, message_id) if message_id else None
         if message is None:
             message = await self._latest_inbound(dialog.id)
@@ -49,12 +57,14 @@ class LangGraphFunnelGateway:
         recent_messages = await self._recent_messages(dialog.id)
         message_batch = await self._inbound_batch_since_last_outbound(dialog.id) or [message]
         processed_message = latest_message_from_batch(message_batch) or message
+        reply_context = await self._reply_context_map(message_batch)
         initial_state = self._initial_state(
             lead=lead,
             dialog=dialog,
             runtime=runtime,
             recent_messages=recent_messages,
             message_batch=message_batch,
+            reply_context=reply_context,
         )
         async with configured_checkpointer(self.settings, self.checkpointer) as checkpointer:
             graph = build_funnel_graph(
@@ -265,12 +275,32 @@ class LangGraphFunnelGateway:
         )
         messages = list(result.scalars().all())
         messages.reverse()
-        return messages
+        return _collapse_outbound_duplicates(messages)
 
     async def _inbound_batch_since_last_outbound(self, dialog_id) -> list[Message]:
         from app.services.funnel_graph.turn_buffer import FunnelTurnBufferService
 
         return await FunnelTurnBufferService(self.session, debounce_seconds=0).inbound_batch_since_last_outbound(dialog_id)
+
+    async def _reply_context_map(self, messages: list[Message]) -> dict[str, str]:
+        """For messages that quote/reply to another, map message.id -> quoted body."""
+        wanted = {m.reply_to_message_id for m in messages if getattr(m, "reply_to_message_id", None)}
+        if not wanted:
+            return {}
+        rows = (
+            await self.session.execute(
+                select(Message.crmchat_message_id, Message.body).where(
+                    Message.crmchat_message_id.in_(wanted)
+                )
+            )
+        ).all()
+        by_external = {ext: body for ext, body in rows if body}
+        context: dict[str, str] = {}
+        for m in messages:
+            quoted = by_external.get(getattr(m, "reply_to_message_id", None))
+            if quoted:
+                context[str(m.id)] = quoted
+        return context
 
     async def _has_newer_inbound(self, dialog_id, baseline: Message | None) -> bool:
         if baseline is None:
@@ -306,10 +336,20 @@ class LangGraphFunnelGateway:
         runtime: LeadFunnelRuntime,
         recent_messages: list[Message],
         message_batch: list[Message],
+        reply_context: dict[str, str] | None = None,
     ) -> FunnelGraphState:
         metadata = dict(runtime.metadata_json or {})
         metadata["telegram_username"] = dialog.telegram_username
         profile = dict(metadata.get("candidate_profile") or metadata.get("slots") or {})
+        reply_context = reply_context or {}
+
+        def _funnel_msg(item: Message) -> dict:
+            data = message_to_funnel_message(item).model_dump()
+            quoted = reply_context.get(str(item.id))
+            if quoted:
+                data["body"] = apply_reply_context(data.get("body") or "", quoted)
+            return data
+
         return {
             "candidate_id": str(lead.id),
             "lead_id": str(lead.id),
@@ -322,7 +362,7 @@ class LangGraphFunnelGateway:
             "slots": profile,
             "sent_voice_packs": list(metadata.get("sent_voice_packs") or []),
             "sent_templates": list(metadata.get("sent_templates") or []),
-            "message_batch": [message_to_funnel_message(item).model_dump() for item in message_batch],
+            "message_batch": [_funnel_msg(item) for item in message_batch],
             "recent_messages": [message_to_funnel_message(item).model_dump() for item in recent_messages],
             "retrieved_cards": [],
             "pending_actions": [],
@@ -352,6 +392,65 @@ class LangGraphFunnelGateway:
         if message is not None:
             runtime.last_processed_message_id = message.id
         await self.session.flush()
+
+
+def is_bot_silenced(runtime: LeadFunnelRuntime) -> bool:
+    """True when the dialog is human-controlled and the bot must not write.
+
+    Triggered by a human handoff (``status == "handoff"`` / ``stage ==
+    "human_handoff"``) or by an explicit manual pause flag in the runtime
+    metadata (``bot_paused``). ``scripts/resume_funnel_dialog.py`` clears all of
+    these to hand the conversation back to the bot.
+    """
+    if str(runtime.status or "") == "handoff":
+        return True
+    if str(runtime.stage or "") == "human_handoff":
+        return True
+    metadata = runtime.metadata_json or {}
+    return bool(metadata.get("bot_paused"))
+
+
+def _collapse_outbound_duplicates(messages: list[Message]) -> list[Message]:
+    """Свернуть дубли исходящих, оставшиеся от readback-копий (sent + synced).
+
+    Даже после фикса на стороне поллинга в БД могут лежать ранее накопленные пары
+    «то же исходящее дважды». Если скормить их LLM, она решит, что написала дважды,
+    и извинится. Поэтому соседние исходящие с одинаковым текстом схлопываем в одно.
+    """
+    collapsed: list[Message] = []
+    for message in messages:
+        if (
+            message.direction == "outbound"
+            and collapsed
+            and collapsed[-1].direction == "outbound"
+            and _norm_body(collapsed[-1].body) == _norm_body(message.body)
+            and _norm_body(message.body) != ""
+        ):
+            continue
+        collapsed.append(message)
+    return collapsed
+
+
+def _norm_body(body: str | None) -> str:
+    return " ".join((body or "").split()).lower()
+
+
+def apply_reply_context(body: str, quoted: str) -> str:
+    """Fold a quoted (replied-to) message into the inbound text the funnel reads.
+
+    A bare reply like "." or "👍" carries its meaning entirely in the quoted
+    message, so we surface the quote as the effective text. A substantive reply
+    keeps its body and gets the quote appended as context.
+    """
+    quoted = (quoted or "").strip()
+    if not quoted:
+        return body
+    # Trivial reply = no letters/digits at all (bare ".", emoji reaction, etc.):
+    # its meaning lives in the quote, so use the quote as the effective text.
+    core = re.sub(r"\W+", "", body or "", flags=re.UNICODE)
+    if not core:
+        return quoted
+    return f"{body} (в ответ на: «{quoted}»)"
 
 
 def message_to_funnel_message(message: Message) -> FunnelMessage:

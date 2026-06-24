@@ -21,6 +21,10 @@ facts заполняй только из нового incoming_message. Не к�
 
 partial_answer используй, когда кандидатка дала часть required_fields или часть обязательной информации текущего stage, но не все данные для закрытия этапа. В этом случае current_goal_satisfied=false, has_unresolved_interrupt=false, если она не задала вопрос/возражение. Примеры: “айфон” без модели, “могу завтра” без времени, имя без телефона или телефон без имени. Если на вопрос про тихую комнату ответила “да, есть”, этого достаточно: room stage закрыт.
 
+Правило пригодности телефона (только на stage equipment_phone_check, когда кандидатка назвала модель). Для записи телефон подходит, если: iPhone 11 и новее; Android, выпущенный примерно с 2023 года и новее; флагман (топовая линейка — Galaxy S/Note/Ultra, Pixel Pro, и т.п.) с 2022 года и новее. Если по названной модели можешь уверенно судить — ставь facts.phone_eligible=true (подходит) или false (не подходит, например iPhone 8/X, бюджетный Android до 2023). Если модель названа, но год/класс однозначно не определить — оставь phone_eligible=null (это будет трактоваться как «подходит», переспрашивать не нужно). Если модель вообще не названа («это мой телефон», «обычный») — phone_model можно заполнить её формулировкой, phone_eligible=null. phone_model всё равно извлекай как обычно.
+
+pc_webcam_available заполняй только на stage equipment_pc_fallback_check: true если у неё есть ПК/ноут с веб-камерой, false если нет.
+
 retrieval_topics возвращай только из канонического списка:
 - contact_source
 - why_selected
@@ -112,6 +116,8 @@ retrieval_query формируй как короткий смысловой за
     "room_note": null,
     "equipment_available": null,
     "phone_model": null,
+    "phone_eligible": null,
+    "pc_webcam_available": null,
     "interview_interest": null,
     "candidate_name": null,
     "phone_number": null,

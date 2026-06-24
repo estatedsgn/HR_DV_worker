@@ -17,6 +17,7 @@ from app.core.config import Settings, get_settings
 from app.models.account import Account
 from app.models.brain_v2 import LeadBrainState
 from app.models.dialog import Dialog
+from app.models.lead_intake_event import LeadIntakeEvent
 from app.models.message import Message
 from app.models.outbound_job import OutboundJob
 from app.models.outbound_send_log import OutboundSendLog
@@ -30,6 +31,22 @@ from app.services.crmchat_connector import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Telegram-side errors that can NEVER succeed by retrying: the recipient's own
+# privacy settings forbid this account from messaging them at all (e.g. a girl who
+# only accepts messages from Telegram Premium accounts). Retrying just burns cycles
+# and dead-letters anyway, so we fail such jobs immediately and flag the dialog as
+# uncontactable instead of churning through the full retry ladder.
+_PERMANENT_SEND_ERROR_MARKERS = (
+    "PRIVACY_PREMIUM_REQUIRED",
+    "USER_PRIVACY_RESTRICTED",
+    "YOU_BLOCKED_USER",
+    "USER_IS_BLOCKED",
+    "PEER_ID_INVALID",
+    "USER_DEACTIVATED",
+    "INPUT_USER_DEACTIVATED",
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -67,6 +84,7 @@ class OutboundQueueWorker:
         lease_seconds: int = 300,
         allow_real_send: bool | None = None,
         typing_delay_seconds: float | None = None,
+        account_id: str | None = None,
     ) -> None:
         self.session = session
         self.repository = OutboundJobRepository(session)
@@ -75,6 +93,9 @@ class OutboundQueueWorker:
         self._owns_connector = connector is None
         self.lease_owner = lease_owner
         self.lease_seconds = lease_seconds
+        # When set, only claim/send jobs belonging to this account (per-account
+        # process with its own CRMchat key). None = claim across all accounts.
+        self.account_id = account_id
         self.allow_real_send = (
             self.settings.outbound_real_send_enabled
             if allow_real_send is None
@@ -95,8 +116,16 @@ class OutboundQueueWorker:
             lease_owner=self.lease_owner,
             limit=limit,
             lease_seconds=self.lease_seconds,
+            account_id=self.account_id,
+            # Глобальный воркер (общий ключ) НЕ должен трогать джобы аккаунтов со
+            # своим ключом: их ведёт свой scoped-воркер, а общий ключ даже не
+            # достучится до их workspace («You do not have access to this workspace»).
+            exclude_own_key_accounts=self.account_id is None,
         )
         sent = blocked = retry = failed = dead_letter = rescheduled = cancelled = 0
+        # Кэш «когда в этот диалог отправляли последний раз» на время батча:
+        # первый джоб диалога стоит один запрос, его собственный send обновляет кэш.
+        last_sent_by_dialog: dict[Any, datetime | None] = {}
 
         for job in jobs:
             if job.lease_owner != self.lease_owner:
@@ -109,8 +138,17 @@ class OutboundQueueWorker:
                     self._reschedule_for_account(job, account)
                     rescheduled += 1
                     continue
+                gap_until = await self._dialog_gap_until(job, last_sent_by_dialog)
+                if gap_until is not None:
+                    # Анти-залп: сдвигаем, НЕ расходуя attempt и не меняя статус —
+                    # FIFO-гейт claim-запроса сохранит этот джоб первым в диалоге.
+                    job.scheduled_at = max(job.scheduled_at, gap_until)
+                    if job.next_attempt_at is not None:
+                        job.next_attempt_at = max(job.next_attempt_at, gap_until)
+                    rescheduled += 1
+                    continue
 
-                self._assert_send_allowed(job)
+                await self._assert_send_allowed(job)
                 job.status = "processing"
                 job.attempt_count = (job.attempt_count or 0) + 1
                 await self.session.flush()
@@ -125,7 +163,10 @@ class OutboundQueueWorker:
                 self._mark_flood_wait(job, account, exc)
                 retry += 1
             except CRMChatAPIError as exc:
-                if self._can_retry(job):
+                if self._is_permanent_send_error(exc):
+                    await self._mark_uncontactable(job, exc)
+                    failed += 1
+                elif self._can_retry(job):
                     self._mark_retry(job, exc)
                     retry += 1
                 else:
@@ -150,6 +191,7 @@ class OutboundQueueWorker:
                 failed += 1
             else:
                 sent += 1
+                last_sent_by_dialog[job.dialog_id] = job.sent_at or datetime.now(UTC)
             finally:
                 job.lease_owner = None
                 job.lease_expires_at = None
@@ -174,6 +216,8 @@ class OutboundQueueWorker:
         )
 
     def _reschedule_for_account(self, job: OutboundJob, account: Account) -> None:
+        # Несколько джоб одной группы коллапсируют на общий next_time — порядок
+        # при этом сохраняется: claim-запрос тайбрейкает по reply_group_index.
         candidates = [
             value
             for value in (account.flood_wait_until, account.next_available_at)
@@ -184,24 +228,121 @@ class OutboundQueueWorker:
         job.next_attempt_at = next_time
         job.scheduled_at = max(job.scheduled_at, next_time)
 
-    def _assert_send_allowed(self, job: OutboundJob) -> None:
-        username = normalize_username(job.target_username or "")
-        allowed = {normalize_username(item) for item in self.settings.outbound_allowed_usernames.split(",") if item.strip()}
-        if username not in allowed:
-            raise OutboundSendBlockedError(f"Target username is not allowlisted: {username}")
+    async def _dialog_gap_until(
+        self, job: OutboundJob, cache: dict[Any, datetime | None]
+    ) -> datetime | None:
+        """Момент, раньше которого в этот диалог слать нельзя (None — можно сейчас)."""
+        gap_seconds = float(self.settings.outbound_min_dialog_gap_seconds or 0)
+        if gap_seconds <= 0 or job.dialog_id is None:
+            return None
+        if job.dialog_id not in cache:
+            result = await self.session.execute(
+                select(func.max(OutboundJob.sent_at)).where(
+                    OutboundJob.dialog_id == job.dialog_id,
+                    OutboundJob.status == "sent",
+                )
+            )
+            cache[job.dialog_id] = result.scalar_one_or_none()
+        last_sent = cache[job.dialog_id]
+        if last_sent is None:
+            return None
+        if last_sent.tzinfo is None:
+            last_sent = last_sent.replace(tzinfo=UTC)
+        not_before = last_sent + timedelta(seconds=gap_seconds)
+        if datetime.now(UTC) >= not_before:
+            return None
+        return not_before
+
+    async def _assert_send_allowed(self, job: OutboundJob) -> None:
+        # Аутрич разрешён, только если выполнено хотя бы одно:
+        #   1) диалог лида заведён интейком из разрешённого источника (daivinchik) —
+        #      разрешает ПРОАКТИВНЫЙ first-touch такому лиду;
+        #   2) в диалоге есть входящие от собеседника — значит человек сам написал
+        #      нам / уже идёт переписка, и воронка имеет право ОТВЕЧАТЬ;
+        #   3) target_username явно в username-allowlist (ручной тест-аккаунт).
+        # Блокируется только холодная проактивная рассылка в молчащие диалоги
+        # (ни интейка, ни входящих) — ровно тот баг, ради которого гейт и нужен.
+        if (
+            not await self._dialog_from_allowed_source(job)
+            and not await self._dialog_has_inbound(job)
+            and not self._username_allowlisted(job)
+        ):
+            raise OutboundSendBlockedError(
+                f"Cold proactive send blocked (no allowed-source intake, no inbound, "
+                f"not allowlisted): {job.target_username or job.dialog_id}"
+            )
         if not self.allow_real_send:
             raise OutboundSendBlockedError("Real outbound send is disabled")
+
+    async def _dialog_has_inbound(self, job: OutboundJob) -> bool:
+        """True if the candidate has sent at least one inbound message in this
+        dialog — i.e. they wrote to us / a real conversation is underway, so the
+        funnel is allowed to reply (covers inbound-first leads like 'привет')."""
+        if job.dialog_id is None:
+            return False
+        result = await self.session.execute(
+            select(Message.id)
+            .where(Message.dialog_id == job.dialog_id, Message.direction == "inbound")
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def _dialog_from_allowed_source(self, job: OutboundJob) -> bool:
+        sources = [
+            item.strip()
+            for item in self.settings.outbound_allowed_intake_sources.split(",")
+            if item.strip()
+        ]
+        if not sources:
+            return False
+        dialog = await self.session.get(Dialog, job.dialog_id)
+        # 1) Synthetic intake dialog (crmchat_dialog_id == "intake:<source>:...").
+        if dialog is not None and dialog.crmchat_dialog_id and any(
+            dialog.crmchat_dialog_id.startswith(f"intake:{source}:") for source in sources
+        ):
+            return True
+        # 2) Real telegram: dialog whose candidate was captured by an allowed-source
+        #    intake (same @username). The funnel runs on the real telegram dialog, so
+        #    its replies to a Дайвинчик lead must pass even though its id is telegram:*.
+        username = normalize_username(
+            (dialog.telegram_username if dialog is not None else None) or job.target_username or ""
+        )
+        if not username or username == "@":
+            return False
+        result = await self.session.execute(
+            select(LeadIntakeEvent.id)
+            .where(
+                LeadIntakeEvent.source.in_(sources),
+                func.lower(LeadIntakeEvent.telegram_username) == username.lower(),
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
+
+    def _username_allowlisted(self, job: OutboundJob) -> bool:
+        raw_items = [
+            item.strip()
+            for item in self.settings.outbound_allowed_usernames.split(",")
+            if item.strip()
+        ]
+        if not raw_items:
+            return False
+        username = normalize_username(job.target_username or "")
+        if not username or username == "@":
+            return False
+        allowed = {normalize_username(item) for item in raw_items}
+        return username in allowed
 
     async def _send_job(self, job: OutboundJob, account: Account) -> None:
         if not account.crmchat_workspace_id:
             raise RetryableOutboundJobError("Account has no CRMchat workspace id")
-        if self.settings.brain_cancel_outbound_on_inbound and await self._has_newer_candidate_activity(job):
+        if job.job_type != "voice" and not _is_scheduled_followup(job) and self.settings.brain_cancel_outbound_on_inbound and await self._has_newer_candidate_activity(job):
             raise StaleOutboundJobError("New candidate activity arrived before outbound send")
         peer = job.peer or await self._resolve_peer(job, account)
         random_id = str(job.telegram_random_id or random.getrandbits(63))
         job.telegram_random_id = random_id
         await self._simulate_typing(job, account, peer)
-        if self.settings.brain_cancel_outbound_on_inbound and await self._has_newer_candidate_activity(job):
+        if job.job_type != "voice" and not _is_scheduled_followup(job) and self.settings.brain_cancel_outbound_on_inbound and await self._has_newer_candidate_activity(job):
             raise StaleOutboundJobError("New candidate activity arrived during outbound typing delay")
         if job.job_type == "voice":
             result = await self._send_voice_job(job, account, peer, random_id)
@@ -470,6 +611,24 @@ class OutboundQueueWorker:
     def _can_retry(self, job: OutboundJob) -> bool:
         return (job.attempt_count or 0) < (job.max_attempts or 5)
 
+    @staticmethod
+    def _is_permanent_send_error(exc: Exception) -> bool:
+        message = str(exc).upper()
+        return any(marker in message for marker in _PERMANENT_SEND_ERROR_MARKERS)
+
+    async def _mark_uncontactable(self, job: OutboundJob, exc: Exception) -> None:
+        """Permanent Telegram-side rejection (recipient privacy / blocked / gone):
+        fail the job without retrying and flag the dialog so it stops being worked."""
+        await self._mark_terminal(job, "failed", exc)
+        if job.dialog_id is not None:
+            dialog = await self.session.get(Dialog, job.dialog_id)
+            if dialog is not None:
+                dialog.status = "uncontactable"
+        logger.info(
+            "outbound job permanently undeliverable; flagged uncontactable",
+            extra={"job_id": str(job.id), "error": str(exc)},
+        )
+
     def _compute_backoff_seconds(self, attempt_count: int) -> int:
         base_seconds = min(900, 10 * (2 ** max(0, attempt_count - 1)))
         return max(1, int(base_seconds * random.uniform(0.8, 1.2)))
@@ -503,6 +662,12 @@ class OutboundQueueWorker:
             .limit(1)
         )
         return state_result.scalar_one_or_none() is not None
+
+
+def _is_scheduled_followup(job: OutboundJob) -> bool:
+    """Отложенное сообщение к 18-летию: его нельзя гасить как «устаревшее» при
+    новой активности кандидатки — оно намеренно ждёт своей даты."""
+    return bool((job.media_metadata or {}).get("scheduled_followup"))
 
 
 def normalize_username(value: str) -> str:

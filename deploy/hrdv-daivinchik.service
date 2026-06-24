@@ -1,0 +1,22 @@
+[Unit]
+Description=HR_DV_worker — Daivinchik auto-swiper (feeds leads; self-throttles to active hours)
+# Order after account-sync so the accounts table is populated BEFORE the swiper
+# starts enqueuing leads — otherwise every caught match fails with "no account".
+After=network-online.target docker.service hrdv-postgres.service hrdv-account-sync.service
+Wants=network-online.target hrdv-postgres.service hrdv-account-sync.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=hrdv
+Group=hrdv
+WorkingDirectory=/opt/HR_DV_worker
+# pydantic-settings reads ./.env from WorkingDirectory.
+ExecStart=/opt/HR_DV_worker/.venv/bin/python -m app.services.daivinchik
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/HR_DV_worker/runtime_logs/daivinchik.log
+StandardError=append:/opt/HR_DV_worker/runtime_logs/daivinchik.log
+
+[Install]
+WantedBy=multi-user.target

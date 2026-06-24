@@ -36,3 +36,17 @@ docs/samples/*.local.*.json
 runtime_logs/
 tmp_debug_*.py
 pochemu.py
+
+# Дайвинчик per-account state / durable logs (never commit — may carry leads/keys context)
+daivinchik_state*.json
+daivinchik_leads*.jsonl
+daivinchik_review*.jsonl
+daivinchik_run*.log
+
+# Telegram / client session files (never commit — full account access)
+*.session
+*.session-journal
+
+# Server-side deploy artifacts (generated on the host)
+backups/
+*.local.env

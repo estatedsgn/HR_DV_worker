@@ -1,0 +1,25 @@
+[Unit]
+Description=HR_DV_worker — autonomous recruiter (Daivinchik swiper + funnel autopilot)
+# Postgres runs in Docker; wait for the docker engine to be up first.
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=hrdv
+Group=hrdv
+WorkingDirectory=/opt/HR_DV_worker
+# pydantic-settings reads ./.env from WorkingDirectory — no EnvironmentFile needed
+# (the .env contains a JSON value that systemd's EnvironmentFile parser would mangle).
+ExecStart=/opt/HR_DV_worker/.venv/bin/python /opt/HR_DV_worker/scripts/run_autonomous.py
+Restart=always
+RestartSec=10
+# Give child processes (daivinchik + autopilot) time to shut down cleanly on stop.
+TimeoutStopSec=30
+KillSignal=SIGINT
+StandardOutput=append:/opt/HR_DV_worker/runtime_logs/autopilot.log
+StandardError=append:/opt/HR_DV_worker/runtime_logs/autopilot.log
+
+[Install]
+WantedBy=multi-user.target

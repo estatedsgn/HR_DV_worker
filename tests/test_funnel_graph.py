@@ -8,11 +8,16 @@ from langgraph.checkpoint.memory import MemorySaver
 from app.core.config import Settings
 from app.models.dialog import Dialog
 from app.models.funnel_graph import LeadFunnelRuntime
+from app.models.human_handoff import HumanHandoff
 from app.models.lead import Lead
 from app.models.outbound_job import OutboundJob
 from app.services.funnel_graph.actions import FunnelActionExecutor
 from app.services.funnel_graph.checkpoint import psycopg_conn_string
-from app.services.funnel_graph.gateway import LangGraphFunnelGateway
+from app.services.funnel_graph.gateway import (
+    LangGraphFunnelGateway,
+    _collapse_outbound_duplicates,
+    apply_reply_context,
+)
 from app.services.funnel_graph.graph import build_funnel_graph, pending_actions_from_outgoing, state_controller
 from app.services.funnel_graph.knowledge import StaticFunnelKnowledgeBase
 from app.services.funnel_graph.reply import (
@@ -20,10 +25,19 @@ from app.services.funnel_graph.reply import (
     ReplyResult,
     deterministic_reply,
     guard_reply_with_policy,
+    normalize_reply_message_text,
     reply_llm_payload,
     sanitize_reply_result,
 )
-from app.services.funnel_graph.semantic import SemanticResult, deterministic_semantic, merge_deterministic_facts
+from app.services.funnel_graph.semantic import (
+    SemanticResult,
+    assess_phone_eligibility,
+    deterministic_semantic,
+    extract_birthday_18_at,
+    extract_pc_webcam_available,
+    is_turning_18_soon,
+    merge_deterministic_facts,
+)
 from app.services.funnel_graph.turn_buffer import FunnelTurnBufferService, is_before_reset_baseline
 from scripts.annotate_dialogue_examples import parse_dialogues
 
@@ -32,10 +46,117 @@ def test_funnel_starts_with_first_touch_message() -> None:
     state = run_graph(initial_state())
 
     assert state["stage"] == "interest_check"
-    assert text_messages(state) == [
-        "привет! ты просто потрясающая! 🤩 у меня есть интересное предложение о работе стриминге на платформах подобных twitch. это не имеет отношения к вебкам или onlyfans"
-    ]
+    variants = {normalize_reply_message_text(v) for v in StaticFunnelKnowledgeBase().first_touch_variants()}
+    first_message = text_messages(state)[0]
+    assert first_message in variants
+    # Каждый опенер обязан сразу снимать главный страх: «это не вебкам/онлифанс».
+    assert "вебкам" in first_message or "onlyfans" in first_message
     assert state["metadata"]["last_graph_node"] == "save_state"
+
+
+def test_inbound_first_question_enters_warmup_not_opener() -> None:
+    # Девочка написала ПЕРВОЙ и спрашивает — не вываливаем опенер-предложение,
+    # а заходим в тёплый разговор (inbound_warmup).
+    state = initial_state(stage="interest_check")
+    state["recent_messages"] = []  # мы ещё ни разу не писали
+    result = run_graph(state, "привет, а как вы меня нашли?")
+
+    assert result["stage"] == "inbound_warmup"
+    opener_variants = {
+        normalize_reply_message_text(v) for v in StaticFunnelKnowledgeBase().first_touch_variants()
+    }
+    assert not (set(text_messages(result)) & opener_variants)
+
+
+def test_inbound_warmup_pitches_when_chat_lulls() -> None:
+    # После нескольких ходов тёплой беседы (кап = 4 хода) роняем питч про стриминг
+    # и переходим в interest_check; канонный вопрос стадии при этом подавлен.
+    state = initial_state(stage="inbound_warmup")
+    state["recent_messages"] = [{"direction": "outbound", "sender_type": "agent", "body": "привет)"}]
+    state["metadata"] = {"warmup_turns": 3}
+    result = run_graph(state, "ага, поняла")
+
+    assert result["stage"] == "interest_check"
+    assert result["candidate_profile"]["warmup_pitched"] is True
+    joined = " ".join(text_messages(result))
+    assert "стриминге" in joined
+    assert "если интересно — расскажу, что за работа и как всё устроено 🙂" not in joined
+
+
+def test_collapse_redundant_questions_keeps_one_question_no_dupes() -> None:
+    from app.services.funnel_graph.graph import collapse_redundant_questions
+
+    # Воспроизводит баг @springvood: мостик + две версии вопроса про возраст подряд.
+    outgoing = [
+        {"type": "text", "text": "расскажу всё подробно, но давай сначала эту формальность закроем)"},
+        {"type": "text", "text": "сколько тебе лет?"},
+        {"type": "text", "text": "давай для начала уточним небольшую формальность, сколько тебе лет?"},
+    ]
+    result = collapse_redundant_questions(outgoing)
+    texts = [m["text"] for m in result]
+    # Мостик (не вопрос) остаётся, вопрос ровно один — первый.
+    assert texts == [
+        "расскажу всё подробно, но давай сначала эту формальность закроем)",
+        "сколько тебе лет?",
+    ]
+    # Точные повторы и второй вопрос вычищены.
+    assert sum(1 for t in texts if t.rstrip().endswith("?")) == 1
+
+
+def test_collapse_redundant_questions_preserves_voice_and_dedupes_text() -> None:
+    from app.services.funnel_graph.graph import collapse_redundant_questions
+
+    outgoing = [
+        {"type": "voice_pack", "voice_pack_id": "vp1"},
+        {"type": "text", "text": "да, общаешься с людьми и за это деньги 💖"},
+        {"type": "text", "text": "да, общаешься с людьми и за это деньги 💖"},  # точный повтор
+        {"type": "text", "text": "если интересна наша сфера, рассказать про зп?"},
+    ]
+    result = collapse_redundant_questions(outgoing)
+    assert result[0]["type"] == "voice_pack"
+    texts = [m["text"] for m in result if m.get("type") == "text"]
+    assert texts == [
+        "да, общаешься с людьми и за это деньги 💖",
+        "если интересна наша сфера, рассказать про зп?",
+    ]
+
+
+def test_dedupe_cross_turn_drops_repeated_stage_question_after_answer() -> None:
+    from app.services.funnel_graph.graph import dedupe_cross_turn_questions
+
+    # Прошлый ход уже спрашивали этот вопрос (канон). В этот ход ответили по делу и
+    # снова тянем его ВАРИАНТ — должен выпасть (баг @hunt_pavluck: «что-то ещё?» ×10).
+    meta = {"last_asked_question_canonical": "остались ли у тебя какие-нибудь ещё вопросики?"}
+    outgoing = [
+        {"type": "text", "text": "работа удалённая, можно стримить из дома)"},
+        {"type": "text", "text": "что-то ещё осталось непонятным?"},
+    ]
+    result = dedupe_cross_turn_questions(outgoing, meta)
+    assert [m["text"] for m in result] == ["работа удалённая, можно стримить из дома)"]
+
+
+def test_dedupe_cross_turn_keeps_question_when_nothing_else_to_say() -> None:
+    from app.services.funnel_graph.graph import dedupe_cross_turn_questions
+
+    # Содержательного ответа нет — значит модель не ответила, переспросить МОЖНО.
+    meta = {"last_asked_question_canonical": "остались ли у тебя какие-нибудь ещё вопросики?"}
+    outgoing = [{"type": "text", "text": "что-то ещё осталось непонятным?"}]
+    result = dedupe_cross_turn_questions(outgoing, meta)
+    assert [m["text"] for m in result] == ["что-то ещё осталось непонятным?"]
+
+
+def test_dedupe_cross_turn_keeps_new_stage_question() -> None:
+    from app.services.funnel_graph.graph import dedupe_cross_turn_questions
+
+    # Новый вопрос (другая стадия) — задаём, даже если есть содержательный текст.
+    meta = {"last_asked_question_canonical": "остались ли у тебя какие-нибудь ещё вопросики?"}
+    outgoing = [
+        {"type": "text", "text": "супер"},
+        {"type": "text", "text": "какая у тебя моделька телефончика?"},
+    ]
+    result = dedupe_cross_turn_questions(outgoing, meta)
+    assert [m["text"] for m in result] == ["супер", "какая у тебя моделька телефончика?"]
+    assert meta["last_asked_question_canonical"] == "какая у тебя моделька телефончика?"
 
 
 def test_annotation_parser_supports_candidate_multiline_batches() -> None:
@@ -63,6 +184,63 @@ def test_annotation_parser_supports_candidate_multiline_batches() -> None:
     assert len(runs[2]["messages"]) == 1
 
 
+def test_bot_suspicion_is_handled_with_human_denial() -> None:
+    # «Ты фейк какой-то?» — реальный кейс из переписок 06-10: темы не было,
+    # бот отвечал невпопад. Теперь это возражение с человеческим ответом.
+    state = run_graph(initial_state(stage="interest_check"), "Ты бот какой-то? фейк?")
+
+    assert state["stage"] == "interest_check"
+    assert state["semantic_result"]["interrupt_topic"] == "bot_suspicion"
+    assert "жив" in (state["reply_text"] or "").lower()
+
+
+def test_bot_word_inside_rabota_does_not_trigger_bot_suspicion() -> None:
+    # Подстрока «бот» есть в слове «работа» — маркеры не должны на неё ложно
+    # срабатывать.
+    from app.services.funnel_graph.semantic import infer_topics
+
+    assert "bot_suspicion" not in infer_topics("что за работа? мне нужна работа")
+
+
+def test_already_in_industry_objection_compares_conditions() -> None:
+    # «я вот тут… тем же самым занимаюсь» (лид 75b27584) — раньше бот терялся.
+    state = run_graph(initial_state(stage="interest_check"), "да я уже этим занимаюсь вообще-то")
+
+    assert state["semantic_result"]["interrupt_topic"] == "already_in_industry"
+    assert "сравн" in (state["reply_text"] or "").lower() or "услови" in (state["reply_text"] or "").lower()
+
+
+def test_smalltalk_first_request_is_supported_not_pitched() -> None:
+    # «может не про работу пообщаемся для начала?» (лид 47539ca1) — раньше бот
+    # отвечал «если интересно — расскажу про работу 🙂». Теперь поддерживаем болтовню.
+    state = run_graph(initial_state(stage="interest_check"), "слушай, а может не про работу пообщаемся для начала?")
+
+    assert state["semantic_result"]["interrupt_topic"] == "wants_smalltalk_first"
+    reply = (state["reply_text"] or "").lower()
+    assert "расскажу, что за работа" not in reply
+
+
+def test_legal_and_need_to_think_topics_resolved() -> None:
+    from app.services.funnel_graph.semantic import infer_topics
+
+    assert "legal_concern" in infer_topics("а это вообще легально?")
+    assert "need_to_think" in infer_topics("мне надо подумать")
+
+
+def test_opener_pool_is_large_and_unique() -> None:
+    variants = StaticFunnelKnowledgeBase().first_touch_variants()
+    assert len(variants) >= 12
+    assert len(set(variants)) == len(variants)
+    # Каждый вариант сразу снимает страх «вебкам/онлифанс».
+    for variant in variants:
+        low = variant.lower()
+        assert "вебкам" in low or "onlyfans" in low
+    # Ротация по кандидату даёт разные опенеры разным лидам.
+    store = StaticFunnelKnowledgeBase()
+    picked = {store.first_touch(f"cand_{i}") for i in range(30)}
+    assert len(picked) >= 6
+
+
 def test_interest_question_is_interrupt_and_repeats_current_question() -> None:
     state = run_graph(
         initial_state(stage="interest_check"),
@@ -72,13 +250,18 @@ def test_interest_question_is_interrupt_and_repeats_current_question() -> None:
     assert state["stage"] == "interest_check"
     assert state["candidate_profile"]["interest_confirmed"] is None
     assert "Контакт мог" in state["reply_text"]
-    assert "Рассказать подробнее?" not in state["reply_text"]
+    assert "если интересно — расскажу, что за работа и как всё устроено 🙂" not in state["reply_text"]
     assert state["metadata"]["awaiting_interrupt_followup"] is True
-    assert state["metadata"]["interrupt_followup_question"] == "Рассказать подробнее?"
+    assert state["metadata"]["interrupt_followup_question"] == "если интересно — расскажу, что за работа и как всё устроено 🙂"
     delayed = delayed_followup_actions(state)
     assert len(delayed) == 1
-    assert delayed[0]["delay_seconds"] == 60
-    assert delayed[0]["text"] == "Хочешь, расскажу подробнее?"
+    assert delayed[0]["delay_seconds"] == 120
+    # Followup возвращает к цели стадии СВЕЖЕЙ формулировкой (канон сам по себе
+    # больше не входит в варианты — иначе бот повторял его дословно).
+    from app.services.funnel_graph.reply import canonical_question
+
+    assert canonical_question(delayed[0]["text"]) == "если интересно — расскажу, что за работа и как всё устроено 🙂"
+    assert delayed[0]["text"] != "если интересно — расскажу, что за работа и как всё устроено 🙂"
 
 
 def test_interest_job_question_does_not_move_to_age() -> None:
@@ -87,7 +270,7 @@ def test_interest_job_question_does_not_move_to_age() -> None:
     assert state["stage"] == "interest_check"
     assert state["candidate_profile"]["interest_confirmed"] is None
     assert "Сколько тебе лет?" not in state["reply_text"]
-    assert "Рассказать подробнее?" not in state["reply_text"]
+    assert "если интересно — расскажу, что за работа и как всё устроено 🙂" not in state["reply_text"]
     assert state["metadata"]["awaiting_interrupt_followup"] is True
 
 
@@ -96,17 +279,116 @@ def test_interest_agreement_moves_to_age_check() -> None:
 
     assert state["stage"] == "age_check"
     assert state["candidate_profile"]["interest_confirmed"] is True
-    assert text_messages(state) == ["Для начала скажи, сколько тебе лет?"]
+    assert text_messages(state) == [
+        "если коротко — это разговорные стримы про то, что тебе самой нравится, оплата сдельная, выплаты каждую неделю 🐬 давай только закрою формальность: сколько тебе лет?"
+    ]
 
 
-def test_age_answer_sends_work_intro_pack_and_salary_offer() -> None:
+def test_phone_model_number_at_age_check_is_not_read_as_underage() -> None:
+    state = run_graph(
+        initial_state(stage="age_check", profile={"interest_confirmed": True}),
+        "щас 14 про макс, но скоро поменяю на последний прошку",
+    )
+
+    assert state["stage"] == "age_check"
+    assert state["status"] != "closed"
+    assert state["candidate_profile"]["age"] is None
+    assert state["candidate_profile"]["qualification_status"] != "underage"
+
+
+def test_turning_18_soon_detection_and_birthday_parsing() -> None:
+    from datetime import UTC, datetime
+
+    assert is_turning_18_soon("через несколько дней 18") is True
+    assert is_turning_18_soon("скоро будет 18") is True
+    assert is_turning_18_soon("мне 25") is False
+
+    now = datetime(2026, 6, 7, tzinfo=UTC)
+    assert extract_birthday_18_at("через 3 дня", now).date().isoformat() == "2026-06-10"
+    by_month = extract_birthday_18_at("15 июня", now)
+    assert (by_month.month, by_month.day) == (6, 15)
+    # дата уже прошла в этом году -> переносится на следующий
+    assert extract_birthday_18_at("1 января", now).year == 2027
+
+
+def test_age_17_routes_to_pending_18_and_asks_birthday() -> None:
+    state = run_graph(
+        initial_state(stage="age_check", profile={"interest_confirmed": True}),
+        "мне 17, но скоро будет 18",
+    )
+
+    assert state["stage"] == "age_pending_18"
+    assert state["candidate_profile"]["age_confirmed"] is False
+    assert "день рождения" in (state["reply_text"] or "")
+
+
+def test_age_pending_18_captures_birthday_and_schedules_followups() -> None:
+    state = run_graph(
+        initial_state(stage="age_pending_18", profile={"interest_confirmed": True}),
+        "15 июня",
+    )
+
+    assert state["stage"] == "scheduled_until_18"
+    assert state["candidate_profile"]["birthday_18_at"]
+    reply = (state["reply_text"] or "").lower()
+    assert "др" in reply or "поздравл" in reply
+    schedule = [a for a in (state.get("pending_actions") or []) if a.get("type") == "schedule_birthday_followup"]
+    assert len(schedule) == 1
+    assert schedule[0]["birthday_at"]
+
+
+def test_age_under_17_still_goes_to_lost() -> None:
+    state = run_graph(
+        initial_state(stage="age_check", profile={"interest_confirmed": True}),
+        "мне 15",
+    )
+
+    assert state["stage"] == "lost"
+
+
+def test_age_answer_sends_both_voice_packs_and_digest_without_gate() -> None:
+    # Конверсионный пакет №1: после возраста СРАЗУ оба пака голосовых + текстовый
+    # дайджест условий + вопрос «остались вопросики?» — без гейта-разрешения
+    # «давай расскажу про зп?» (на нём умирали лиды).
     state = run_graph(initial_state(stage="age_check", profile={"interest_confirmed": True}), "18")
 
-    assert state["stage"] == "salary_schedule_offer"
+    assert state["stage"] == "post_equipment_questions_check"
     assert state["candidate_profile"]["age_confirmed"] is True
-    assert state["sent_voice_packs"] == ["work_intro"]
-    assert voice_packs(state) == ["work_intro"]
-    assert text_messages(state) == ["Если интересна наша сфера, давай расскажу про зп и график"]
+    assert state["sent_voice_packs"] == ["work_intro", "salary_schedule"]
+    assert voice_packs(state) == ["work_intro", "salary_schedule"]
+    texts = text_messages(state)
+    # Мостик-предупреждение перед войсами, дайджест после, вопрос в конце.
+    assert any("голосовых" in t for t in texts)
+    assert any("выплаты на карту" in t for t in texts)
+    assert texts[-1] == "ну что, как тебе условия — есть вопросики, или рассказать, что нужно для старта?"
+    # Гейта про «расскажу про зп» больше нет.
+    assert all("давай расскажу про зп" not in t for t in texts)
+
+
+def test_age_affirmative_to_18_question_confirms_age() -> None:
+    # «Да» в ответ на наш вопрос, упоминавший 18 («тебе уже есть 18?»), — это
+    # подтверждение возраста, а не повод переспрашивать «сколько тебе лет?».
+    state = initial_state(stage="age_check", profile={"interest_confirmed": True})
+    state["recent_messages"] = [
+        {"direction": "outbound", "sender_type": "agent", "body": "сразу уточню базовый момент — тебе уже есть 18?"}
+    ]
+    result = run_graph(state, "да")
+
+    assert result["candidate_profile"]["age_confirmed"] is True
+    assert result["candidate_profile"]["age"] == 18
+    assert result["stage"] == "post_equipment_questions_check"
+
+
+def test_age_bare_affirmative_without_18_context_does_not_confirm() -> None:
+    # Без «18» в нашем последнем сообщении голое «да» возраст НЕ подтверждает.
+    state = initial_state(stage="age_check", profile={"interest_confirmed": True})
+    state["recent_messages"] = [
+        {"direction": "outbound", "sender_type": "agent", "body": "давай для начала уточним небольшую формальность, сколько тебе лет?"}
+    ]
+    result = run_graph(state, "да")
+
+    assert result["candidate_profile"]["age_confirmed"] is None
+    assert result["stage"] == "age_check"
 
 
 def test_salary_offer_question_is_interrupt() -> None:
@@ -118,8 +400,66 @@ def test_salary_offer_question_is_interrupt() -> None:
     assert state["stage"] == "salary_schedule_offer"
     assert state["candidate_profile"]["salary_schedule_interest"] is None
     assert "не OnlyFans" in state["reply_text"]
-    assert "Если интересна наша сфера, давай расскажу про зп и график" not in state["reply_text"]
+    assert "если интересна наша сфера, давай расскажу про зп и график 🐬" not in state["reply_text"]
     assert state["metadata"]["awaiting_interrupt_followup"] is True
+
+
+def test_not_interested_has_job_is_rebutted_once_not_lost() -> None:
+    # «не интересует, у меня есть работа» раньше падало в unclear/мгновенный отказ.
+    # Теперь это возражение already_employed: отрабатываем углом совмещения, диалог
+    # остаётся на месте, а не уходит в lost.
+    result = deterministic_semantic(
+        initial_state(stage="interest_check") | {"incoming_message": "не интересует, у меня есть работа"}
+    )
+
+    assert result.message_type == "objection"
+    assert result.interrupt_topic == "already_employed"
+    assert result.has_unresolved_interrupt is True
+
+
+def test_not_interested_short_is_rebutted_once() -> None:
+    result = deterministic_semantic(
+        initial_state(stage="interest_check") | {"incoming_message": "не интересует"}
+    )
+
+    assert result.message_type == "objection"
+    assert result.interrupt_topic == "soft_decline_income"
+
+
+def test_repeated_decline_after_rebuttal_goes_to_refusal() -> None:
+    result = deterministic_semantic(
+        initial_state(stage="interest_check")
+        | {"incoming_message": "всё равно не интересует", "metadata": {"soft_decline_rebutted": True}}
+    )
+
+    assert result.message_type == "hard_refusal"
+
+
+def test_has_job_objection_runs_funnel_and_stays_then_lost_on_repeat() -> None:
+    first = run_graph(initial_state(stage="interest_check"), "спасибо, у меня уже есть работа")
+    assert first["stage"] == "interest_check"
+    assert first["metadata"].get("soft_decline_rebutted") is True
+    assert first["semantic_result"]["interrupt_topic"] == "already_employed"
+
+    second = run_graph(
+        initial_state(stage="interest_check", profile=None)
+        | {"metadata": {"soft_decline_rebutted": True}},
+        "нет, не интересно",
+    )
+    assert second["stage"] == "lost"
+
+
+def test_meet_in_person_request_is_answered_not_deflected() -> None:
+    state = run_graph(
+        initial_state(stage="interest_check"),
+        "А ты не хочешь встретиться в реальности и поговорить об этом?",
+    )
+
+    assert state["stage"] == "interest_check"
+    assert state["semantic_result"]["interrupt_topic"] == "meet_in_person"
+    reply = (state["reply_text"] or "").lower()
+    assert "вживую" in reply or "онлайн" in reply
+    assert "точных данных" not in reply
 
 
 def test_interested_but_english_concern_is_not_refusal() -> None:
@@ -131,7 +471,7 @@ def test_interested_but_english_concern_is_not_refusal() -> None:
     assert state["stage"] == "salary_schedule_offer"
     assert state["semantic_result"]["message_type"] == "mixed"
     assert state["semantic_result"]["interrupt_topic"] == "english_level"
-    assert "Английский не обязателен" in state["reply_text"]
+    assert "английский не обязателен" in state["reply_text"]
 
 
 def test_privacy_and_english_batch_uses_new_knowledge_topics() -> None:
@@ -188,7 +528,66 @@ def test_salary_agreement_sends_salary_pack_and_asks_any_questions() -> None:
     assert state["stage"] == "post_equipment_questions_check"
     assert state["candidate_profile"]["salary_schedule_interest"] is True
     assert voice_packs(state) == ["salary_schedule"]
-    assert text_messages(state) == ["Остались ли у тебя какие-нибудь ещё вопросы?"]
+    texts = text_messages(state)
+    # Дайджест условий текстом (на случай, если голосовые не слушает) + вопрос.
+    assert any("выплаты на карту" in t for t in texts)
+    assert texts[-1] == "ну что, как тебе условия — есть вопросики, или рассказать, что нужно для старта?"
+
+
+def _salary_offer_awaiting_state():
+    state = initial_state(
+        stage="salary_schedule_offer",
+        profile={"interest_confirmed": True, "age_confirmed": True},
+    )
+    state["metadata"] = {
+        "awaiting_interrupt_followup": True,
+        "interrupt_followup_stage": "salary_schedule_offer",
+        "interrupt_followup_question": "если интересна наша сфера, давай расскажу про зп и график 🐬",
+    }
+    return state
+
+
+def test_salary_offer_question_is_answered_and_waits() -> None:
+    # First interrupt turn: answer the question, stay on the offer, arm the follow-up.
+    state = run_graph(
+        initial_state(stage="salary_schedule_offer", profile={"interest_confirmed": True, "age_confirmed": True}),
+        "а сколько по деньгам платят?",
+    )
+
+    assert state["stage"] == "salary_schedule_offer"
+    assert state["candidate_profile"]["salary_schedule_interest"] is None
+    assert voice_packs(state) == []
+    assert state["metadata"]["awaiting_interrupt_followup"] is True
+
+
+def test_salary_offer_no_more_questions_sends_pack() -> None:
+    # After we answered, a neutral "понятно" means no more questions -> deliver voices.
+    state = run_graph(_salary_offer_awaiting_state(), "понятно")
+
+    assert state["stage"] == "post_equipment_questions_check"
+    assert state["candidate_profile"]["salary_schedule_interest"] is True
+    assert voice_packs(state) == ["salary_schedule"]
+    assert text_messages(state)[-1] == "ну что, как тебе условия — есть вопросики, или рассказать, что нужно для старта?"
+    assert not state["metadata"].get("awaiting_interrupt_followup")
+
+
+def test_salary_offer_followup_timeout_sends_pack() -> None:
+    # No reply within the window: the follow-up timeout delivers the voices.
+    state = _salary_offer_awaiting_state()
+    state["timeout_event"] = "interrupt_followup"
+    state = run_graph(state)
+
+    assert state["stage"] == "post_equipment_questions_check"
+    assert state["candidate_profile"]["salary_schedule_interest"] is True
+    assert voice_packs(state) == ["salary_schedule"]
+
+
+def test_salary_offer_new_question_after_answer_keeps_waiting() -> None:
+    # A fresh question while awaiting must be answered, not skipped to the voices.
+    state = run_graph(_salary_offer_awaiting_state(), "а что за платформа?")
+
+    assert state["stage"] == "salary_schedule_offer"
+    assert voice_packs(state) == []
 
 
 def test_action_stage_sends_voice_even_when_llm_reply_send_is_false() -> None:
@@ -199,7 +598,9 @@ def test_action_stage_sends_voice_even_when_llm_reply_send_is_false() -> None:
 
     assert state["stage"] == "post_equipment_questions_check"
     assert voice_packs(state) == ["salary_schedule"]
-    assert text_messages(state) == ["Остались ли у тебя какие-нибудь ещё вопросы?"]
+    texts = text_messages(state)
+    assert any("выплаты на карту" in t for t in texts)
+    assert texts[-1] == "ну что, как тебе условия — есть вопросики, или рассказать, что нужно для старта?"
 
 
 def test_equipment_does_not_close_phone_model_requirement() -> None:
@@ -208,7 +609,7 @@ def test_equipment_does_not_close_phone_model_requirement() -> None:
     assert state["stage"] == "equipment_phone_check"
     assert state["candidate_profile"]["equipment_available"] is True
     assert state["candidate_profile"]["phone_model"] is None
-    assert text_messages(state) == ["О, круто! А чтобы мы точно всё настроили — какая у тебя модель телефона?"]
+    assert text_messages(state) == ["о, круто! а чтобы мы точно всё настроили, какая у тебя моделька телефончика?"]
 
 
 def test_equipment_question_is_interrupt_not_equipment_available() -> None:
@@ -238,7 +639,7 @@ def test_reply_guard_uses_policy_followup_for_equipment_partial() -> None:
 
     assert guarded is not None
     assert [message.text for message in guarded.outgoing_messages] == [
-        "О, круто! А чтобы мы точно всё настроили — какая у тебя модель телефона?"
+        "о, круто! а чтобы мы точно всё настроили, какая у тебя моделька телефончика?"
     ]
 
 
@@ -299,7 +700,92 @@ def test_phone_model_moves_to_interview_offer() -> None:
 
     assert state["stage"] == "interview_offer"
     assert state["candidate_profile"]["phone_model"] == "Samsung S25 Ultra"
-    assert text_messages(state) == ["Можем записаться на собеседование?"]
+    assert text_messages(state) == ["нам подходит", "тогда можем записаться на собеседование?"]
+
+
+def test_cyrillic_poco_model_does_not_loop_and_advances() -> None:
+    # Regression: «Поко м6 про» (Cyrillic brand) was not recognized, so the
+    # funnel re-asked the phone question forever (lead @durabi2li5).
+    state = run_graph(initial_state(stage="equipment_phone_check"), "Поко м6 про")
+
+    assert state["stage"] == "interview_offer"
+    assert state["candidate_profile"]["phone_model"] == "Поко м6 про"
+
+
+def test_unspecified_phone_is_assumed_fit_and_advances() -> None:
+    # "это мой телефон" without a model => assume fit, do not loop.
+    state = run_graph(initial_state(stage="equipment_phone_check"), "это мой телефон, обычный")
+
+    assert state["stage"] == "interview_offer"
+    assert state["candidate_profile"]["phone_eligible"] is True
+
+
+def test_unfit_iphone_branches_to_pc_webcam_fallback() -> None:
+    state = run_graph(initial_state(stage="equipment_phone_check"), "айфон 8")
+
+    assert state["stage"] == "equipment_pc_fallback_check"
+    assert state["candidate_profile"]["phone_eligible"] is False
+    joined = " ".join(text_messages(state)).lower()
+    assert "веб-камер" in joined or "пк" in joined
+
+
+def test_pc_webcam_yes_advances_to_interview_offer() -> None:
+    state = run_graph(
+        initial_state(stage="equipment_pc_fallback_check"),
+        "да, есть ноут с веб-камерой",
+    )
+
+    assert state["stage"] == "interview_offer"
+    assert state["candidate_profile"]["pc_webcam_available"] is True
+
+
+def test_pc_webcam_no_closes_lead_as_lost() -> None:
+    state = run_graph(
+        initial_state(stage="equipment_pc_fallback_check"),
+        "нет, только этот телефон",
+    )
+
+    assert state["stage"] == "lost"
+    assert state["candidate_profile"]["pc_webcam_available"] is False
+
+
+def test_assess_phone_eligibility_rule() -> None:
+    assert assess_phone_eligibility("айфон 11") is True
+    assert assess_phone_eligibility("iPhone 13 pro") is True
+    assert assess_phone_eligibility("айфон 8") is False
+    assert assess_phone_eligibility("iphone x") is False
+    # Android / unknown year => undecidable here, judged by LLM (None == fit).
+    assert assess_phone_eligibility("Поко м6 про") is None
+    assert assess_phone_eligibility("Samsung S25 Ultra") is None
+
+
+def test_apply_reply_context() -> None:
+    # A bare "." reply surfaces the quoted message as the effective text.
+    assert apply_reply_context(".", "Поко м6 про") == "Поко м6 про"
+    assert apply_reply_context("👍", "у тебя poco m6 pro?") == "у тебя poco m6 pro?"
+    # A substantive reply keeps its body and appends the quote as context.
+    assert apply_reply_context("да это он", "Поко м6 про") == "да это он (в ответ на: «Поко м6 про»)"
+    # No quote -> body unchanged.
+    assert apply_reply_context(".", "") == "."
+
+
+def test_reply_to_a_phone_model_advances_via_quote() -> None:
+    # Lead replies "." quoting her own "Поко м6 про" -> funnel reads the quote
+    # and advances instead of looping on the unparseable ".".
+    state = initial_state(stage="equipment_phone_check")
+    state["message_batch"] = [
+        {"direction": "inbound", "sender_type": "lead", "body": "Поко м6 про"}
+    ]
+    state["incoming_message"] = "Поко м6 про"
+    result = run_graph(state)
+    assert result["stage"] == "interview_offer"
+
+
+def test_extract_pc_webcam_available() -> None:
+    assert extract_pc_webcam_available("да, есть ноутбук с камерой") is True
+    assert extract_pc_webcam_available("есть пк") is True
+    assert extract_pc_webcam_available("нет, только телефон") is False
+    assert extract_pc_webcam_available("не знаю что сказать") is None
 
 
 def test_interview_offer_accepts_go_zapishimsya_and_asks_contact() -> None:
@@ -307,7 +793,7 @@ def test_interview_offer_accepts_go_zapishimsya_and_asks_contact() -> None:
 
     assert state["stage"] == "contact_collection"
     assert state["candidate_profile"]["interview_interest"] is True
-    assert text_messages(state) == ["Для записи мне нужен твой номер телефона и имя"]
+    assert text_messages(state) == ["для записи мне нужно твоё имя и номер телефончика"]
 
 
 def test_no_questions_moves_to_profile_context() -> None:
@@ -316,7 +802,8 @@ def test_no_questions_moves_to_profile_context() -> None:
     assert state["stage"] == "profile_theme_check"
     assert state["candidate_profile"]["questions_resolved"] is True
     assert text_messages(state) == [
-        "Расскажи немного о себе: учишься/работаешь? Чем любишь заниматься в свободное время?"
+        "давай я уточню у тебя несколько деталей, и далее мы с тобой запишемся на собеседование",
+        "расскажи немного о себе, учишься/работаешь? чем любишь заниматься в свободное время? помогу подобрать тематику для стримов 🐬",
     ]
 
 
@@ -326,9 +813,9 @@ def test_post_equipment_short_faq_topic_answers_before_repeating_question() -> N
     assert state["stage"] == "post_equipment_questions_check"
     assert state["candidate_profile"]["questions_resolved"] is None
     assert "стажировочных днях" in state["reply_text"]
-    assert "Остались ли у тебя какие-нибудь ещё вопросы?" not in state["reply_text"]
+    assert "ну что, как тебе условия — есть вопросики, или рассказать, что нужно для старта?" not in state["reply_text"]
     assert state["metadata"]["awaiting_interrupt_followup"] is True
-    assert state["metadata"]["interrupt_followup_question"] == "Остались ли у тебя какие-нибудь ещё вопросы?"
+    assert state["metadata"]["interrupt_followup_question"] == "ну что, как тебе условия — есть вопросики, или рассказать, что нужно для старта?"
 
 
 def test_booking_intent_after_materials_moves_to_next_required_question() -> None:
@@ -338,7 +825,8 @@ def test_booking_intent_after_materials_moves_to_next_required_question() -> Non
     assert state["candidate_profile"]["questions_resolved"] is True
     assert state["candidate_profile"]["interview_interest"] is True
     assert text_messages(state) == [
-        "Расскажи немного о себе: учишься/работаешь? Чем любишь заниматься в свободное время?"
+        "давай я уточню у тебя несколько деталей, и далее мы с тобой запишемся на собеседование",
+        "расскажи немного о себе, учишься/работаешь? чем любишь заниматься в свободное время? помогу подобрать тематику для стримов 🐬",
     ]
 
 
@@ -352,7 +840,7 @@ def test_no_questions_and_sobes_booking_skips_completed_profile_question() -> No
     assert state["candidate_profile"]["questions_resolved"] is True
     assert state["candidate_profile"]["interview_interest"] is True
     assert "учишься/работаешь" not in state["reply_text"]
-    assert "Есть ли у тебя комната" in state["reply_text"]
+    assert "у тебя есть комната" in state["reply_text"]
 
 
 def test_neutral_ack_after_faq_waits_without_reply() -> None:
@@ -371,9 +859,9 @@ def test_english_question_gets_short_relevant_answer() -> None:
     state = run_graph(initial_state(stage="post_equipment_questions_check"), "А английский нужен?")
 
     assert state["stage"] == "post_equipment_questions_check"
-    assert "Английский не обязателен" in state["reply_text"]
+    assert "английский не обязателен" in state["reply_text"]
     assert "переводчиком" in state["reply_text"]
-    assert "Остались ли у тебя какие-нибудь ещё вопросы?" not in state["reply_text"]
+    assert "ну что, как тебе условия — есть вопросики, или рассказать, что нужно для старта?" not in state["reply_text"]
     assert state["metadata"]["awaiting_interrupt_followup"] is True
 
 
@@ -388,9 +876,9 @@ def test_repeated_interrupts_softly_return_to_goal_after_fourth_question() -> No
         state = run_graph(next_state(state), message)
 
     assert state["stage"] == "interest_check"
-    assert "Английский не обязателен" in state["reply_text"]
-    assert "Чтобы не грузить всем сразу" in state["reply_text"]
-    assert "Рассказать подробнее?" not in state["reply_text"]
+    assert "английский не обязателен" in state["reply_text"]
+    assert "чтобы не грузить всем сразу" in state["reply_text"]
+    assert "если интересно — расскажу, что за работа и как всё устроено 🙂" not in state["reply_text"]
 
 
 def test_mixed_interest_question_preserves_interest_fact() -> None:
@@ -419,7 +907,7 @@ def test_multi_message_interest_source_and_selection_interrupt() -> None:
     assert state["semantic_result"]["retrieval_topics"][:2] == ["contact_source", "why_selected"]
     assert "Контакт мог" in state["reply_text"]
     assert "Жёстких критериев" in state["reply_text"]
-    assert "Рассказать подробнее?" not in state["reply_text"]
+    assert "если интересно — расскажу, что за работа и как всё устроено 🙂" not in state["reply_text"]
 
 
 def test_multi_message_nudity_batch_is_one_objection() -> None:
@@ -435,9 +923,33 @@ def test_multi_message_nudity_batch_is_one_objection() -> None:
     assert state["stage"] == "salary_schedule_offer"
     assert state["semantic_result"]["has_unresolved_interrupt"] is True
     assert "nudity_onlyfans" in state["semantic_result"]["retrieval_topics"]
-    assert "job_description" in state["semantic_result"]["retrieval_topics"]
+    # The broad job_description blob is demoted once a specific concern (nudity) is
+    # present, so the reply stays focused on her actual question instead of dumping
+    # the whole job description on top.
+    assert "job_description" not in state["semantic_result"]["retrieval_topics"]
     assert "не OnlyFans" in state["reply_text"]
-    assert "прямые трансляции" in state["reply_text"]
+
+
+def test_specific_question_demotes_broad_job_description() -> None:
+    """Asking a pointed question whose wording merely mentions streaming must answer
+    the specific topic, not blend in the whole job_description blob (regression:
+    «на каких платформах стримы будут проходить» → only platform_info)."""
+    state = initial_state(
+        stage="salary_schedule_offer",
+        profile={"interest_confirmed": True, "age_confirmed": True},
+    )
+    state["message_batch"] = [
+        {"direction": "inbound", "sender_type": "lead", "body": "а на каких платформах стримы будут проходить?"},
+    ]
+
+    state = run_graph(state)
+
+    topics = state["semantic_result"]["retrieval_topics"]
+    assert "platform_info" in topics
+    assert "job_description" not in topics
+    assert "Dacast" in state["reply_text"] or "Restream" in state["reply_text"]
+    # the job-description blob must NOT be appended
+    assert "разговорные эфиры" not in state["reply_text"]
 
 
 def test_multi_topic_question_batch_answers_all_relevant_knowledge() -> None:
@@ -460,7 +972,7 @@ def test_multi_topic_question_batch_answers_all_relevant_knowledge() -> None:
     assert "оборудование" in state["reply_text"]
     assert "стажировочных днях" in state["reply_text"]
     assert "ГПХ" in state["reply_text"]
-    assert "Остались ли у тебя какие-нибудь ещё вопросы?" not in state["reply_text"]
+    assert "ну что, как тебе условия — есть вопросики, или рассказать, что нужно для старта?" not in state["reply_text"]
 
 
 def test_friend_and_platform_batch_is_question_not_objection() -> None:
@@ -472,6 +984,7 @@ def test_friend_and_platform_batch_is_question_not_objection() -> None:
 
     state = run_graph(state)
 
+    # First interrupt turn: answer the questions and wait; do not deliver yet.
     assert state["stage"] == "salary_schedule_offer"
     assert state["semantic_result"]["message_type"] == "interrupt_question"
     assert state["semantic_result"]["interrupt_type"] == "question"
@@ -489,7 +1002,7 @@ def test_post_equipment_irrelevant_reply_uses_natural_followup() -> None:
 
     assert state["stage"] == "post_equipment_questions_check"
     assert text_messages(state) == [
-        "Поняла. Тогда уточню: остались ли у тебя ещё вопросы по условиям, оплате или формату?"
+        "поняла) тогда уточню: остались ли у тебя ещё вопросики по условиям, оплате или формату?"
     ]
 
 
@@ -498,7 +1011,7 @@ def test_social_only_greeting_does_not_create_interrupt_or_repeat_greeting() -> 
 
     assert state["stage"] == "interest_check"
     assert state["semantic_result"]["has_unresolved_interrupt"] is False
-    assert text_messages(state) == ["Рассказать подробнее?"]
+    assert text_messages(state) == ["если интересно — расскажу, что за работа и как всё устроено 🙂"]
 
 
 def test_actionable_topic_answers_knowledge_instead_of_repeating_question() -> None:
@@ -622,7 +1135,247 @@ def test_multi_message_outbound_actions_share_reply_group_id() -> None:
     assert None not in group_ids
     assert [action["reply_group_index"] for action in actions[:3]] == [1, 2, 3]
     assert all(action["reply_group_size"] == 3 for action in actions[:3])
-    assert [action["idempotency_key"].rsplit(":", 2)[-2] for action in actions[:3]] == ["0", "1", "2"]
+    # Ключ детерминирован и зависит только от reply_group_id + позиции (group_index),
+    # без digest текста: повторный прогон того же хода даёт те же ключи.
+    group_id = next(iter(group_ids))
+    assert [action["idempotency_key"] for action in actions[:3]] == [
+        f"{group_id}:1",
+        f"{group_id}:2",
+        f"{group_id}:3",
+    ]
+
+
+def test_collapse_outbound_duplicates_removes_readback_pairs() -> None:
+    """Соседние исходящие с одинаковым текстом (sent + перечитанный поллингом
+    synced) схлопываются в одно, чтобы LLM не видела, что «написала дважды»,
+    и не извинялась. Входящие и разные исходящие не трогаем."""
+    from app.models.message import Message
+
+    def msg(direction: str, body: str) -> Message:
+        return Message(direction=direction, body=body)
+
+    messages = [
+        msg("inbound", "привет"),
+        msg("outbound", "Привет! как дела"),
+        msg("outbound", "Привет!  как дела"),  # readback-дубль (норм. совпадает)
+        msg("inbound", "норм"),
+        msg("outbound", "ок"),
+    ]
+    collapsed = _collapse_outbound_duplicates(messages)
+    assert [(m.direction, m.body) for m in collapsed] == [
+        ("inbound", "привет"),
+        ("outbound", "Привет! как дела"),
+        ("inbound", "норм"),
+        ("outbound", "ок"),
+    ]
+
+
+def test_dedupe_against_recent_outbound_swaps_repeated_question_for_variant() -> None:
+    """Канонный вопрос стадии, уже отправленный недавно, не дублируется дословно —
+    подставляется свежая формулировка того же вопроса."""
+    from app.services.funnel_graph.graph import dedupe_against_recent_outbound
+
+    canned = "если интересно — расскажу, что за работа и как всё устроено 🙂"
+    state = {"recent_messages": [{"direction": "outbound", "body": canned}], "conversation_history": []}
+    out = dedupe_against_recent_outbound([{"type": "text", "text": canned}], state)
+    assert len(out) == 1
+    assert out[0]["text"] != canned  # заменено на вариант, не дословный повтор
+
+
+def test_dedupe_against_recent_outbound_drops_exact_repeat_without_variants() -> None:
+    from app.services.funnel_graph.graph import dedupe_against_recent_outbound
+
+    state = {"recent_messages": [{"direction": "outbound", "body": "привет как дела"}], "conversation_history": []}
+    out = dedupe_against_recent_outbound([{"type": "text", "text": "Привет как дела"}], state)
+    assert out == []  # нечего сказать нового -> не дублим, лучше промолчать
+
+
+def test_dedupe_against_recent_outbound_keeps_new_and_drops_in_turn_dup() -> None:
+    from app.services.funnel_graph.graph import dedupe_against_recent_outbound
+
+    state = {"recent_messages": [], "conversation_history": []}
+    out = dedupe_against_recent_outbound(
+        [{"type": "text", "text": "спасибо"}, {"type": "text", "text": "Спасибо"}, {"type": "text", "text": "новое по делу"}],
+        state,
+    )
+    assert [m.get("text") for m in out] == ["спасибо", "новое по делу"]
+
+
+def test_pending_actions_stagger_text_delays() -> None:
+    """Тексты одного ответа уходят с РАЗНЫМ delay (строго возрастающим): иначе
+    у всех джоб одинаковый scheduled_at и порядок отправки решает гонка."""
+    state = initial_state(stage="post_equipment_questions_check")
+    outgoing = [
+        {"type": "text", "text": "Короткий."},
+        {"type": "text", "text": "Это сообщение заметно длиннее, в нём существенно больше символов для набора."},
+        {"type": "text", "text": "Третье."},
+    ]
+
+    actions = pending_actions_from_outgoing(state | {"send_reply": True}, outgoing)
+    delays = [action["delay_seconds"] for action in actions[:3]]
+
+    assert delays[0] == 0
+    assert delays[0] < delays[1] < delays[2]
+    gaps = [delays[1] - delays[0], delays[2] - delays[1]]
+    assert all(3 <= gap <= 12 for gap in gaps)
+    # Пауза пропорциональна длине предыдущего сообщения (длиннее «печатали» дольше).
+    assert gaps[1] > gaps[0]
+
+
+def test_voice_pack_items_keep_single_base_delay() -> None:
+    """Контракт пака не сломан стаггером: все голосовые + хвостовой текст — на
+    одном base delay, паузу между ними имитирует воркер (recording_delay)."""
+    state = initial_state(stage="salary_schedule_delivery")
+    state["voice_packs"] = {
+        "salary_schedule": [
+            {"id": "s1", "media_path": "data/v1.ogg", "caption": "", "recording_delay_seconds": 40},
+            {"id": "s2", "media_path": "data/v2.ogg", "caption": "", "recording_delay_seconds": 40},
+        ]
+    }
+    outgoing = [
+        {"type": "voice_pack", "voice_pack_id": "salary_schedule"},
+        {"type": "text", "text": "Остались вопросы?"},
+    ]
+
+    actions = pending_actions_from_outgoing(state | {"send_reply": True}, outgoing)
+
+    assert [action["delay_seconds"] for action in actions[:3]] == [0, 0, 0]
+
+
+def test_interrupt_without_answer_gets_ack_not_stage_question() -> None:
+    """Лид задал вопрос, оркестратор не дал ответа: бот обязан хотя бы признать
+    вопрос (ack), а НЕ подставлять анкетный вопрос стадии — игнор прямого вопроса
+    и был главной причиной отвалов на interest_check."""
+    state = initial_state(stage="interest_check")
+    state.update(
+        {
+            "incoming_message": "а в каком стриминге? ссылочку дашь?",
+            "semantic_result": {
+                "message_type": "interrupt_question",
+                "current_goal_satisfied": False,
+                "has_unresolved_interrupt": True,
+                "interrupt_type": "question",
+                "interrupt_topic": "platform_details",
+                "facts": {},
+            },
+            "reply_result": {"send_reply": True, "outgoing_messages": []},
+        }
+    )
+
+    result_state = asyncio.run(state_controller(state))
+    texts = text_messages(result_state)
+
+    assert result_state["stage"] == "interest_check"
+    assert len(texts) == 1
+    assert "точных данных" in texts[0]  # ack из unknown_interrupt_reply
+    assert "если интересно — расскажу, что за работа и как всё устроено 🙂" not in texts
+    # Вопрос стадии вернётся отложенным followup'ом, а не вместо ответа.
+    assert result_state["metadata"]["awaiting_interrupt_followup"] is True
+
+
+def test_exhausted_question_is_recorded_and_not_regenerated_next_turn() -> None:
+    """Все формулировки канонного вопроса уже отправлены: дедуп дропает повтор и
+    пишет исчерпание в metadata; следующий ход контроллер НЕ регенерит ту же
+    фразу (раньше цикл «дроп -> та же фраза -> дроп» крутился бесконечно)."""
+    from app.services.funnel_graph.reply import QUESTION_VARIANTS
+
+    canned = "если интересно — расскажу, что за работа и как всё устроено 🙂"
+    sent_all = [{"direction": "outbound", "body": canned}] + [
+        {"direction": "outbound", "body": variant} for variant in QUESTION_VARIANTS[canned]
+    ]
+
+    state = initial_state(stage="interest_check")
+    state["recent_messages"] = state["recent_messages"] + sent_all
+    state.update(
+        {
+            "incoming_message": "ну не знаю",
+            "semantic_result": {
+                "message_type": "unclear",
+                "current_goal_satisfied": False,
+                "has_unresolved_interrupt": False,
+                "facts": {},
+            },
+            "reply_result": {"send_reply": True, "outgoing_messages": []},
+        }
+    )
+
+    first = asyncio.run(state_controller(state))
+
+    # Ход 1: повтор дропнут, исчерпание записано персистентно.
+    assert text_messages(first) == []
+    assert canned in (first["metadata"].get("exhausted_questions") or {})
+
+    # Ход 2: контроллер видит запись и не генерит ту же канонику заново.
+    # state_controller возвращает частичный апдейт — накатываем его на state.
+    follow = {**state, **first}
+    follow.update(
+        {
+            "incoming_message": "хм",
+            "semantic_result": {
+                "message_type": "unclear",
+                "current_goal_satisfied": False,
+                "has_unresolved_interrupt": False,
+                "facts": {},
+            },
+            "reply_result": {"send_reply": True, "outgoing_messages": []},
+        }
+    )
+    second = asyncio.run(state_controller(follow))
+    assert text_messages(second) == []
+
+    # Смена стадии чистит исчерпание (новая стадия — новые фразы).
+    moved = {**follow, **second}
+    moved.update(
+        {
+            "incoming_message": "да, интересно!",
+            "semantic_result": {
+                "message_type": "stage_answer",
+                "current_goal_satisfied": True,
+                "has_unresolved_interrupt": False,
+                "facts": {"interest_confirmed": True, "interest_status": "interested"},
+            },
+            "reply_result": {"send_reply": True, "outgoing_messages": []},
+        }
+    )
+    third = asyncio.run(state_controller(moved))
+    assert third["stage"] != "interest_check"
+    assert "exhausted_questions" not in (third["metadata"] or {})
+
+
+def test_warmup_pitch_and_profile_bridge_have_variants() -> None:
+    from app.services.funnel_graph.reply import (
+        INBOUND_WARMUP_PITCH,
+        PROFILE_BRIDGE,
+        QUESTION_VARIANTS,
+        canonical_question,
+    )
+
+    for canned in (INBOUND_WARMUP_PITCH, PROFILE_BRIDGE):
+        variants = QUESTION_VARIANTS[canned]
+        assert len(variants) >= 2
+        assert canned not in variants  # канон не дублируется в вариантах
+        for variant in variants:
+            assert canonical_question(variant) == canned
+
+
+def test_reply_idempotency_key_is_independent_of_generated_text() -> None:
+    """Один и тот же ход (та же стадия + те же входящие), но разный текст ответа
+    LLM, обязан давать ОДИНАКОВЫЙ idempotency_key. Иначе повторная обработка хода
+    с чуть другой формулировкой создаёт дубль-отправку — ровно тот баг, который мы
+    чиним. Ключ должен зависеть только от входа хода, не от вывода модели."""
+    state = initial_state(stage="interest_check")
+    state["incoming_message"] = "привет, расскажи подробнее"
+    state["message_batch"] = [{"id": "m-1", "body": "привет, расскажи подробнее", "sent_at": "2026-06-10T10:00:00+00:00"}]
+
+    first = pending_actions_from_outgoing(
+        state | {"send_reply": True}, [{"type": "text", "text": "Привет! Расскажу с радостью."}]
+    )
+    second = pending_actions_from_outgoing(
+        state | {"send_reply": True}, [{"type": "text", "text": "Приветик) конечно расскажу."}]
+    )
+
+    assert first[0]["idempotency_key"] == second[0]["idempotency_key"]
+    assert first[0]["reply_group_id"] == second[0]["reply_group_id"]
 
 
 def test_voice_pack_expands_to_recorded_voice_jobs_before_text() -> None:
@@ -657,7 +1410,10 @@ def test_voice_pack_expands_to_recorded_voice_jobs_before_text() -> None:
     assert actions[1]["media_path"].endswith("voice_intro_04_next_steps.ogg")
     assert actions[0]["recording_delay_seconds"] == 40
     assert actions[1]["recording_delay_seconds"] == 40
-    assert [action["delay_seconds"] for action in actions[:3]] == [0, 40, 80]
+    # Весь пак планируется на один момент (один батч/цикл отправки) — реалистичную
+    # паузу записи между голосовыми даёт сам outbound-воркер (recording_delay при
+    # отправке), а не разнос по scheduled_at. Хвостовой текст — туда же.
+    assert [action["delay_seconds"] for action in actions[:3]] == [0, 0, 0]
     assert [action["reply_group_index"] for action in actions[:3]] == [1, 2, 3]
     assert all(action["reply_group_size"] == 3 for action in actions[:3])
 
@@ -722,7 +1478,7 @@ def test_equipment_phone_stage_answers_faq_and_returns_to_phone_model() -> None:
     assert state["stage"] == "equipment_phone_check"
     assert state["candidate_profile"]["phone_model"] is None
     assert "ГПХ" in state["reply_text"]
-    assert "Какая у тебя модель телефона?" not in state["reply_text"]
+    assert "какая у тебя моделька телефончика?" not in state["reply_text"]
     assert state["metadata"]["awaiting_interrupt_followup"] is True
 
 
@@ -768,7 +1524,7 @@ def test_profile_later_keeps_stage() -> None:
 
     assert state["stage"] == "profile_theme_check"
     assert state["candidate_profile"]["profile_info"] is None
-    assert text_messages(state) == ["Хорошо, буду ждать"]
+    assert text_messages(state) == ["хорошо, буду ждать"]
 
 
 def test_profile_no_experience_objection_does_not_close_profile_stage() -> None:
@@ -780,9 +1536,9 @@ def test_profile_no_experience_objection_does_not_close_profile_stage() -> None:
     assert state["stage"] == "profile_theme_check"
     assert state["candidate_profile"]["profile_info"] is None
     assert "Опыт не обязателен" in state["reply_text"]
-    assert "Расскажи немного о себе" not in state["reply_text"]
+    assert "расскажи немного о себе" not in state["reply_text"]
     assert state["metadata"]["awaiting_interrupt_followup"] is True
-    assert state["metadata"]["interrupt_followup_question"] == "Расскажи немного о себе: учишься/работаешь? Чем любишь заниматься в свободное время?"
+    assert state["metadata"]["interrupt_followup_question"] == "расскажи немного о себе, учишься/работаешь? чем любишь заниматься в свободное время? помогу подобрать тематику для стримов 🐬"
 
 
 def test_interrupt_timeout_returns_to_active_question_after_wait() -> None:
@@ -796,7 +1552,7 @@ def test_interrupt_timeout_returns_to_active_question_after_wait() -> None:
     )
 
     assert timeout_state["stage"] == "post_equipment_questions_check"
-    assert text_messages(timeout_state) == ["Что-то ещё осталось непонятным?"]
+    assert text_messages(timeout_state) == ["что-то ещё осталось непонятным?"]
     assert not timeout_state["metadata"].get("awaiting_interrupt_followup")
     assert not delayed_followup_actions(timeout_state)
 
@@ -815,7 +1571,7 @@ def test_interrupt_timeout_ignores_stale_recent_inbound_text() -> None:
     timeout_state = run_graph(payload)
 
     assert timeout_state["semantic_result"]["message_type"] == "empty"
-    assert text_messages(timeout_state) == ["Что-то ещё осталось непонятным?"]
+    assert text_messages(timeout_state) == ["что-то ещё осталось непонятным?"]
 
 
 def test_new_message_during_interrupt_wait_is_processed_without_timeout_repeat() -> None:
@@ -825,7 +1581,7 @@ def test_new_message_during_interrupt_wait_is_processed_without_timeout_repeat()
 
     assert state["stage"] == "post_equipment_questions_check"
     assert "ГПХ" in state["reply_text"]
-    assert "Остались ли у тебя какие-нибудь ещё вопросы?" not in state["reply_text"]
+    assert "ну что, как тебе условия — есть вопросики, или рассказать, что нужно для старта?" not in state["reply_text"]
     assert state["metadata"]["awaiting_interrupt_followup"] is True
 
 
@@ -835,8 +1591,8 @@ def test_profile_extracts_not_working_without_marking_as_working() -> None:
     assert state["stage"] == "room_available_check"
     assert state["candidate_profile"]["profile_info"]
     assert "не работаю" in state["candidate_profile"]["work_or_study"]
-    assert len(text_messages(state)) == 1
-    assert "Есть ли у тебя комната" in text_messages(state)[0]
+    assert len(text_messages(state)) == 2
+    assert "у тебя есть комната" in text_messages(state)[1]
 
 
 def test_contextual_negative_profile_answer_advances_to_next_question() -> None:
@@ -846,7 +1602,7 @@ def test_contextual_negative_profile_answer_advances_to_next_question() -> None:
     assert state["candidate_profile"]["profile_info"] == "я же говорил что нет"
     assert state["candidate_profile"]["work_or_study"] == "не учится и не работает"
     assert "учишься/работаешь" not in state["reply_text"]
-    assert "Есть ли у тебя комната" in state["reply_text"]
+    assert "у тебя есть комната" in state["reply_text"]
 
 
 def test_no_current_activity_profile_answer_does_not_require_hobbies() -> None:
@@ -857,7 +1613,7 @@ def test_no_current_activity_profile_answer_does_not_require_hobbies() -> None:
     assert state["candidate_profile"]["work_or_study"] == "сейчас ничем не занимается"
     assert state["candidate_profile"]["hobbies"] is None
     assert "учишься/работаешь" not in state["reply_text"]
-    assert "Есть ли у тебя комната" in state["reply_text"]
+    assert "у тебя есть комната" in state["reply_text"]
 
 
 def test_free_time_activity_profile_answers_advance_without_explicit_work_or_hobbies() -> None:
@@ -868,7 +1624,7 @@ def test_free_time_activity_profile_answers_advance_without_explicit_work_or_hob
         assert state["candidate_profile"]["profile_info"] == message
         assert state["candidate_profile"]["hobbies"] is None
         assert "учишься/работаешь" not in state["reply_text"]
-        assert "Есть ли у тебя комната" in state["reply_text"]
+        assert "у тебя есть комната" in state["reply_text"]
 
 
 def test_contact_collection_accepts_partial_then_missing_field() -> None:
@@ -877,7 +1633,7 @@ def test_contact_collection_accepts_partial_then_missing_field() -> None:
     assert state["stage"] == "contact_collection"
     assert state["candidate_profile"]["phone_number"] == "79999999999"
     assert state["candidate_profile"]["candidate_name"] is None
-    assert text_messages(state) == ["Спасибо, номер получила. Напиши, пожалуйста, имя"]
+    assert text_messages(state) == ["спасибо, номер получила) напиши, пожалуйста, имя"]
 
 
 def test_contact_collection_combines_multiple_inbound_messages() -> None:
@@ -893,7 +1649,7 @@ def test_contact_collection_combines_multiple_inbound_messages() -> None:
     assert result_state["incoming_message"] == "Диана\n79999999999"
     assert result_state["candidate_profile"]["candidate_name"] == "Диана"
     assert result_state["candidate_profile"]["phone_number"] == "79999999999"
-    assert text_messages(result_state) == ["Завтра будет удобно провести собеседование?"]
+    assert text_messages(result_state) == ["завтра будет удобно провести собеседование?"]
 
 
 def test_reply_guard_suppresses_stale_partial_contact_reply_when_complete() -> None:
@@ -918,7 +1674,7 @@ def test_reply_guard_suppresses_stale_partial_contact_reply_when_complete() -> N
 
 def test_reply_guard_replaces_booking_transition_with_missing_question() -> None:
     state = initial_state(stage="profile_theme_check")
-    state["current_question"] = "Расскажи немного о себе: учишься/работаешь? Чем любишь заниматься в свободное время?"
+    state["current_question"] = "расскажи немного о себе, учишься/работаешь? чем любишь заниматься в свободное время? помогу подобрать тематику для стримов 🐬"
     state["pending_question_text"] = state["current_question"]
     state["semantic_result"] = {
         "message_type": "partial_answer",
@@ -936,7 +1692,7 @@ def test_reply_guard_replaces_booking_transition_with_missing_question() -> None
 
     assert guarded is not None
     text = guarded.outgoing_messages[0].text or ""
-    assert "Расскажи немного о себе" in text
+    assert "расскажи немного о себе" in text
 
 
 def test_controller_advances_when_required_fields_are_complete_even_if_llm_goal_flag_false() -> None:
@@ -959,7 +1715,7 @@ def test_controller_advances_when_required_fields_are_complete_even_if_llm_goal_
     result_state = asyncio.run(state_controller(state))
 
     assert result_state["stage"] == "interview_day_check"
-    assert text_messages(result_state) == ["Завтра будет удобно провести собеседование?"]
+    assert text_messages(result_state) == ["завтра будет удобно провести собеседование?"]
 
 
 def test_controller_skips_age_question_when_age_collected_with_interest() -> None:
@@ -1196,6 +1952,65 @@ def test_action_executor_creates_voice_job_with_recording_metadata() -> None:
     assert jobs[0].media_metadata["duration_seconds"] == 0
 
 
+def test_action_executor_handoff_notifies_once() -> None:
+    dialog = Dialog(
+        id=uuid.uuid4(),
+        account_id=uuid.uuid4(),
+        crmchat_dialog_id="d1",
+        telegram_username="@lead",
+    )
+    lead = Lead(id=uuid.uuid4(), dialog_id=dialog.id)
+    runtime = LeadFunnelRuntime(
+        id=uuid.uuid4(),
+        lead_id=lead.id,
+        dialog_id=dialog.id,
+        thread_id=str(dialog.id),
+        metadata_json={"candidate_profile": {"candidate_name": "Аня", "phone_number": "+79990000000"}},
+    )
+
+    captured: list[dict] = []
+
+    class _Notifier:
+        handoff_enabled = True
+
+        async def notify_handoff(self, **kwargs):
+            captured.append(kwargs)
+
+    class _HandoffSession:
+        def __init__(self):
+            self.added = []
+            self.handoff = None
+
+        async def execute(self, query):
+            return FakeScalarResult(self.handoff)
+
+        async def get(self, model, object_id):
+            return None
+
+        def add(self, instance):
+            self.added.append(instance)
+            if isinstance(instance, HumanHandoff):
+                self.handoff = instance
+
+        async def flush(self):
+            pass
+
+    session = _HandoffSession()
+    executor = FunnelActionExecutor(session, notifier=_Notifier())
+    action = {"type": "handoff", "reason": "funnel_requested_handoff"}
+
+    asyncio.run(executor.execute(dialog=dialog, lead=lead, runtime=runtime, actions=[action]))
+    # Повторный прогон (терминальная стадия переобрабатывается) не должен дублировать.
+    asyncio.run(executor.execute(dialog=dialog, lead=lead, runtime=runtime, actions=[action]))
+
+    handoffs = [item for item in session.added if isinstance(item, HumanHandoff)]
+    assert len(handoffs) == 1
+    assert runtime.stage == "human_handoff"
+    assert len(captured) == 1
+    assert captured[0]["telegram_username"] == "@lead"
+    assert captured[0]["profile"]["candidate_name"] == "Аня"
+
+
 def test_psycopg_conn_string_converts_asyncpg_scheme() -> None:
     assert psycopg_conn_string("postgresql+asyncpg://u:p@localhost/db") == "postgresql://u:p@localhost/db"
 
@@ -1254,7 +2069,12 @@ def initial_state(stage="interest_check", profile=None):
         "slots": candidate_profile,
         "sent_voice_packs": [],
         "sent_templates": [],
-        "recent_messages": [],
+        # Кандидат на interest_check и далее уже отвечает на наш first-touch опенер,
+        # поэтому в истории есть прошлое агентское сообщение (иначе это «первый
+        # контакт» и воронка по дизайну отдаёт опенер ещё раз).
+        "recent_messages": [
+            {"direction": "outbound", "sender_type": "agent", "body": "first-touch opener"}
+        ],
         "message_batch": [],
         "metadata": {},
     }
@@ -1294,7 +2114,7 @@ def delayed_followup_actions(state):
     return [
         action
         for action in state.get("pending_actions") or []
-        if action.get("type") == "send_text" and action.get("delay_seconds") == 60
+        if action.get("type") == "send_text" and action.get("delay_seconds") == 120
     ]
 
 

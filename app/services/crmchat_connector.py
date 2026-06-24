@@ -4,11 +4,14 @@ import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from app.core.config import Settings, get_settings
+
+if TYPE_CHECKING:
+    from app.models.account import Account
 
 CRMCHAT_TELEGRAM_ALLOWED_METHODS = frozenset(
     {
@@ -22,6 +25,7 @@ CRMCHAT_TELEGRAM_ALLOWED_METHODS = frozenset(
         "messages.sendMessage",
         "messages.sendMedia",
         "messages.editMessage",
+        "messages.getBotCallbackAnswer",
         "upload.saveFilePart",
     }
 )
@@ -77,6 +81,7 @@ class TelegramMessageSnapshot:
     text: str | None = None
     date: str | None = None
     outgoing: bool = False
+    reply_to_message_id: str | None = None
     raw: Mapping[str, Any] | None = None
 
 
@@ -142,26 +147,64 @@ class CRMChatConnector:
         settings: Settings | None = None,
         http_client: httpx.AsyncClient | None = None,
         allowed_methods: frozenset[str] = CRMCHAT_TELEGRAM_ALLOWED_METHODS,
+        *,
+        base_url: str | None = None,
+        api_key: str | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.allowed_methods = allowed_methods
+        # Per-account overrides: when an Account carries its own CRMchat base url
+        # and bearer key, the connector authenticates as that account. Falls back
+        # to the global .env CRMCHAT_* settings when not supplied.
+        self._base_url_override = base_url
+        self._api_key_override = api_key
         self._owns_http_client = http_client is None
         self.http_client = http_client or self._build_http_client()
 
+    @classmethod
+    def for_account(
+        cls,
+        account: "Account",
+        *,
+        settings: Settings | None = None,
+        allowed_methods: frozenset[str] = CRMCHAT_TELEGRAM_ALLOWED_METHODS,
+    ) -> "CRMChatConnector":
+        """Build a connector authenticated with this account's own credentials.
+
+        Each Дайвинчик account is a separate CRMchat connection (its own bearer
+        key). When the account has no stored credentials the connector falls back
+        to the global settings, preserving the original single-account behaviour.
+        """
+        return cls(
+            settings=settings,
+            allowed_methods=allowed_methods,
+            base_url=account.crmchat_api_base_url or None,
+            api_key=account.crmchat_api_key or None,
+        )
+
     def _build_http_client(self) -> httpx.AsyncClient:
-        if not self.settings.crmchat_api_base_url:
+        base_url = self._base_url_override or self.settings.crmchat_api_base_url
+        api_key = self._api_key_override or self.settings.crmchat_api_key
+        if not base_url:
             raise CRMChatConfigurationError(
                 "CRMCHAT_API_BASE_URL is required for CRMchat API calls"
             )
-        if not self.settings.crmchat_api_key:
+        if not api_key:
             raise CRMChatConfigurationError(
                 "CRMCHAT_API_KEY is required for CRMchat API calls"
             )
 
+        # Раздельные таймауты: коннект падает быстро (мёртвый/троттленый аккаунт не
+        # должен висеть полную минуту), чтение ограничено общим бюджетом. Иначе при
+        # троттлинге аккаунта (после массовых лайков Дайвинчика) каждый getHistory
+        # висел до 60с, и цикл поллинга раздувался до ~5+ минут — ответы лидам
+        # «западали». См. [[account-throttle-fast-timeout]].
+        read_timeout = self.settings.crmchat_timeout_seconds
+        connect_timeout = min(10.0, float(read_timeout))
         return httpx.AsyncClient(
-            base_url=self.settings.crmchat_api_base_url,
-            headers={"Authorization": f"Bearer {self.settings.crmchat_api_key}"},
-            timeout=self.settings.crmchat_timeout_seconds,
+            base_url=base_url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=httpx.Timeout(read_timeout, connect=connect_timeout),
         )
 
     async def aclose(self) -> None:
@@ -469,6 +512,27 @@ class CRMChatConnector:
             {"peer": dict(peer), "message": message, "randomId": str(random_id)},
         )
 
+    async def get_bot_callback_answer(
+        self,
+        workspace_id: str,
+        account_id: str,
+        peer: Mapping[str, Any],
+        message_id: int | str,
+        data: str,
+    ) -> Mapping[str, Any]:
+        """Press an inline keyboard button (keyboardButtonCallback).
+
+        ``data`` is the button's callback payload exactly as returned by
+        messages.getHistory (base64-encoded bytes). Pressing the button is what
+        Telegram clients do under the hood when a user taps an inline button.
+        """
+        return await self.call_telegram_method(
+            workspace_id,
+            account_id,
+            "messages.getBotCallbackAnswer",
+            {"peer": dict(peer), "msgId": int(message_id), "data": data},
+        )
+
     async def set_voice_recording(
         self,
         workspace_id: str,
@@ -697,10 +761,27 @@ def normalize_messages_response(
                 ),
                 date=optional_str(raw_message.get("date")),
                 outgoing=bool(raw_message.get("out") or raw_message.get("outgoing")),
+                reply_to_message_id=extract_reply_to_message_id(raw_message),
                 raw=raw_message,
             )
         )
     return snapshots
+
+
+def extract_reply_to_message_id(raw_message: Mapping[str, Any]) -> str | None:
+    """Telegram message id this message is a reply/quote to, if any.
+
+    Raw shape (MTProto via CRMChat):
+        {"replyTo": {"_": "messageReplyHeader", "replyToMsgId": 2720}}
+    """
+    reply_to = raw_message.get("replyTo") or raw_message.get("reply_to")
+    if isinstance(reply_to, Mapping):
+        return optional_str(
+            reply_to.get("replyToMsgId")
+            or reply_to.get("reply_to_msg_id")
+            or reply_to.get("replyToTopId")
+        )
+    return None
 
 
 def build_input_peer_from_resolve_username(payload: Mapping[str, Any]) -> Mapping[str, Any]:

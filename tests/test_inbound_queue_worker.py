@@ -22,7 +22,9 @@ class SharedClaimRepository:
     def __init__(self, events):
         self.events = events
 
-    async def claim_ready_batch(self, *, lease_owner: str, limit: int = 100, lease_seconds: int = 60):
+    async def claim_ready_batch(
+        self, *, lease_owner: str, limit: int = 100, lease_seconds: int = 60, dialog_ids=None
+    ):
         now = datetime.now(UTC)
         claimed = []
         for event in self.events:

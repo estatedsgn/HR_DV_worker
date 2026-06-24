@@ -20,6 +20,7 @@ class TelegramPollingRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     dialogs_seen: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     dialogs_synced: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    dialogs_skipped: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     messages_seen: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     messages_created: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     flood_wait_seconds: Mapped[int | None] = mapped_column(Integer)
@@ -29,3 +30,7 @@ class TelegramPollingRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_message: Mapped[str | None] = mapped_column(Text)
+    # Per-dialog сбои, изолированные _sync_snapshots: какие диалоги пропущены и
+    # почему. Отдельно от error_message, чтобы completed-прогон с пропусками не
+    # читался мониторингом как упавший.
+    skip_details: Mapped[str | None] = mapped_column(Text)

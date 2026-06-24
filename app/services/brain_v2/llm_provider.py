@@ -139,9 +139,10 @@ class BrainLLMAdapter:
         user_payload: dict[str, Any],
         response_model: type[BaseModel],
     ) -> dict[str, Any]:
+        from app.services.llm_key_pool import get_key_pool, is_exhaustion_error
+
         config = self.config_for(component, response_model)
-        key = api_key_for_provider(self.settings, config.provider)
-        if not key:
+        if not api_key_for_provider(self.settings, config.provider):
             raise BrainLLMError(f"Missing API key for provider {config.provider}")
 
         request_json: dict[str, Any] = {
@@ -162,40 +163,57 @@ class BrainLLMAdapter:
                 },
             }
         url = f"{base_url_for_provider(config.provider, self.settings)}/chat/completions"
-        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
         started = time.perf_counter()
         last_error: Exception | None = None
-        for attempt in range(config.retry_policy.max_retries + 1):
-            try:
-                response = await self._post(url, request_json, headers, config.timeout_seconds)
-                payload = response.json()
-                if response.is_error:
-                    raise BrainLLMError(extract_error_message(payload) or response.text)
-                content = extract_chat_content(payload)
-                if content is None:
-                    raise BrainLLMError("LLM response did not contain message content")
-                parsed = parse_json_content(content)
-                usage = payload.get("usage") if isinstance(payload, dict) else {}
-                self.telemetry.append(
-                    LLMCallTelemetry(
-                        component=component,
-                        provider=config.provider,
-                        model=str(payload.get("model") or config.model),
-                        status="completed",
-                        latency_ms=int((time.perf_counter() - started) * 1000),
-                        prompt_tokens=optional_int((usage or {}).get("prompt_tokens")),
-                        completion_tokens=optional_int((usage or {}).get("completion_tokens")),
-                        estimated_cost=None,
-                        request_json=request_json,
-                        response_json=payload if isinstance(payload, dict) else {"raw": payload},
+        pool = get_key_pool(self.settings)
+        # Outer loop rotates keys; each key gets the normal retry budget. Capped
+        # at the number of keys so a fully-spent pool fails fast instead of
+        # spinning forever.
+        for _ in range(max(1, len(pool))):
+            key = api_key_for_provider(self.settings, config.provider)
+            if not key:
+                break
+            headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+            exhausted = False
+            for attempt in range(config.retry_policy.max_retries + 1):
+                try:
+                    response = await self._post(url, request_json, headers, config.timeout_seconds)
+                    payload = response.json()
+                    if response.is_error:
+                        raise BrainLLMError(extract_error_message(payload) or response.text)
+                    content = extract_chat_content(payload)
+                    if content is None:
+                        raise BrainLLMError("LLM response did not contain message content")
+                    parsed = parse_json_content(content)
+                    usage = payload.get("usage") if isinstance(payload, dict) else {}
+                    self.telemetry.append(
+                        LLMCallTelemetry(
+                            component=component,
+                            provider=config.provider,
+                            model=str(payload.get("model") or config.model),
+                            status="completed",
+                            latency_ms=int((time.perf_counter() - started) * 1000),
+                            prompt_tokens=optional_int((usage or {}).get("prompt_tokens")),
+                            completion_tokens=optional_int((usage or {}).get("completion_tokens")),
+                            estimated_cost=None,
+                            request_json=request_json,
+                            response_json=payload if isinstance(payload, dict) else {"raw": payload},
+                        )
                     )
-                )
-                return parsed
-            except Exception as exc:
-                last_error = exc
-                if attempt >= config.retry_policy.max_retries:
-                    break
-                await asyncio.sleep(config.retry_policy.base_delay_seconds * (2**attempt))
+                    return parsed
+                except Exception as exc:
+                    last_error = exc
+                    if is_exhaustion_error(str(exc)):
+                        exhausted = True
+                        break
+                    if attempt >= config.retry_policy.max_retries:
+                        break
+                    await asyncio.sleep(config.retry_policy.base_delay_seconds * (2**attempt))
+            if exhausted:
+                new_key = pool.mark_exhausted(key)
+                if new_key and new_key != key:
+                    continue  # retry the whole request with the next key
+            break
         self.telemetry.append(
             LLMCallTelemetry(
                 component=component,
@@ -265,14 +283,22 @@ def component_model(settings: Settings, component: str) -> str:
 def api_key_for_provider(settings: Settings, provider: str) -> str | None:
     provider = provider.lower()
     if provider == "openai":
-        return settings.openai_api_key or settings.llm_api_key
+        return settings.openai_api_key or _pool_key(settings)
     if provider == "deepseek":
         return settings.deepseek_api_key
     if provider == "groq":
         return settings.groq_api_key
     if provider == "openrouter":
-        return settings.openrouter_api_key or settings.llm_api_key
-    return settings.llm_api_key
+        return settings.openrouter_api_key or _pool_key(settings)
+    return _pool_key(settings)
+
+
+def _pool_key(settings: Settings) -> str | None:
+    """Currently active key from the rotating pool (falls back to the legacy
+    single key when no pool is configured)."""
+    from app.services.llm_key_pool import get_key_pool
+
+    return get_key_pool(settings).active_key() or settings.llm_api_key
 
 
 def base_url_for_provider(provider: str, settings: Settings | None = None) -> str:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -13,6 +14,7 @@ from app.services.brain_v2.llm_provider import BrainLLMAdapter, BrainLLMError
 from app.services.funnel_graph.funnel_policy import stage_requirement_met
 from app.services.funnel_graph.knowledge import PROJECT_ROOT
 from app.services.funnel_graph.model_profiles import active_model_profile, is_complex_turn
+from app.services.funnel_graph.persona import with_persona
 from app.services.funnel_graph.state import FunnelGraphState, latest_inbound_text
 
 
@@ -41,6 +43,8 @@ class SemanticFacts(BaseModel):
     interest_status: str | None = None
     age: int | None = None
     age_confirmed: bool | None = None
+    birthday: str | None = None
+    birthday_18_at: str | None = None
     salary_schedule_interest: bool | None = None
     questions_resolved: bool | None = None
     profile_info: str | None = None
@@ -50,6 +54,8 @@ class SemanticFacts(BaseModel):
     room_note: str | None = None
     equipment_available: bool | None = None
     phone_model: str | None = None
+    phone_eligible: bool | None = None
+    pc_webcam_available: bool | None = None
     interview_interest: bool | None = None
     candidate_name: str | None = None
     phone_number: str | None = None
@@ -229,7 +235,7 @@ class SemanticAnalyzer:
             return None
 
     def _render_prompt(self, state: FunnelGraphState) -> str:
-        return self.prompt_path.read_text(encoding="utf-8")
+        return with_persona(self.prompt_path.read_text(encoding="utf-8"))
 
     def _user_payload(self, state: FunnelGraphState) -> dict[str, Any]:
         return {
@@ -380,11 +386,37 @@ OBJECTION_TOPICS = {
     "privacy_anonymity",
     "documents_privacy",
     "exit_policy",
+    "soft_decline_income",
+    "already_employed",
+    # Из живых переписок 06-10 (см. docs/CHANGELOG_AGENT.md, пакет №2):
+    "bot_suspicion",
+    "already_in_industry",
+    "legal_concern",
+    "need_to_think",
+    "wants_smalltalk_first",
 }
 
 
 def is_specific_topic(topic: str | None) -> bool:
     return bool(topic and str(topic).strip().lower() not in GENERIC_TOPICS)
+
+
+# Broad "catch-all" topics whose trigger words (e.g. "стрим"/"трансляц" for the
+# whole job) overlap with almost any domain question. They are valid answers only
+# when nothing more specific was asked; when a specific topic co-occurs they are
+# dropped so a pointed question ("на каких платформах?") gets a pointed answer
+# instead of the entire job description blob.
+BROAD_TOPICS = {"job_description"}
+
+
+def demote_broad_topics(topics: list[str]) -> list[str]:
+    """Drop broad catch-all topics when a more specific topic is present."""
+    has_specific = any(
+        topic not in BROAD_TOPICS and is_specific_topic(topic) for topic in topics
+    )
+    if not has_specific:
+        return topics
+    return [topic for topic in topics if topic not in BROAD_TOPICS]
 
 
 def normalize_semantic_result(result: SemanticResult) -> SemanticResult:
@@ -414,7 +446,7 @@ def first_specific_topic(result: SemanticResult) -> str | None:
 def compact_topics(topics: list[str]) -> list[str]:
     normalized = normalize_topic_list(topics)
     specific = [topic for topic in normalized if is_specific_topic(topic)]
-    values = specific or normalized
+    values = demote_broad_topics(specific or normalized)
     result: list[str] = []
     for topic in values:
         if topic not in result:
@@ -525,17 +557,33 @@ def deterministic_semantic(state: FunnelGraphState) -> SemanticResult:
             retrieval_topics=["do_not_contact"],
             confidence=0.98,
         )
-    if is_hard_refusal(normalized, stage):
+    # Несогласие/отказ ("не интересует", "у меня есть работа", "спасибо, но нет",
+    # "нет" на гейте…): ПЕРВЫЙ раз отрабатываем возражение (деньги/совмещение) —
+    # граф пометит soft_decline_rebutted. Если кандидат отказывается ПОВТОРНО, без
+    # реального вопроса и новой конкретной темы — уводим в lost, не долбя питчем по
+    # кругу. См. [[soft-decline-objection-once]].
+    _meta = dict(state.get("metadata") or {})
+    decline_topic = rebuttable_decline_topic(normalized)
+    bare_gate_refusal = is_hard_refusal(normalized, stage)
+    if (
+        _meta.get("soft_decline_rebutted")
+        and not has_question
+        and (decline_topic is not None or bare_gate_refusal or is_negative(normalized))
+        and not any(topic in OBJECTION_TOPICS for topic in topics)
+    ):
+        return hard_refusal_result(text, "decline_repeated")
+    if not has_question and (decline_topic is not None or bare_gate_refusal):
+        topic = decline_topic or "soft_decline_income"
         return SemanticResult(
-            message_type="hard_refusal",
-            summary="candidate refused",
+            message_type="objection",
+            summary=f"decline -> rebut once ({topic})",
             has_unresolved_interrupt=True,
-            interrupt_type="refusal",
-            interrupt_topic="refusal",
+            interrupt_type="objection",
+            interrupt_topic=topic,
             interrupt_text=text,
             retrieval_query=text,
-            retrieval_topics=["refusal"],
-            confidence=0.92,
+            retrieval_topics=[topic],
+            confidence=0.85,
         )
     if is_pause(normalized):
         return SemanticResult(
@@ -584,12 +632,56 @@ def deterministic_semantic(state: FunnelGraphState) -> SemanticResult:
                 facts["interview_interest"] = True
             return stage_answer(text, facts, "interest confirmed")
     elif stage == "age_check":
-        age = extract_age(normalized)
-        if age is not None:
+        # Guard: "14 про макс" / "11 айфон" are phone models, not the candidate's age.
+        age = None if looks_like_phone_context(normalized) else extract_age(normalized)
+        if age is not None and age >= 18:
             facts["age"] = age
-            facts["age_confirmed"] = age >= 18
-            facts["qualification_status"] = "age_ok" if age >= 18 else "underage"
-            return stage_answer(text, facts, "age provided") if age >= 18 else hard_refusal_result(text, "underage")
+            facts["age_confirmed"] = True
+            facts["qualification_status"] = "age_ok"
+            return stage_answer(text, facts, "age provided")
+        # «Скоро 18»: 17 лет ИЛИ явное «через N дней / скоро / будет 18» — не теряем
+        # кандидатку, а уходим в age_pending_18 спросить дату рождения.
+        if (age is not None and age == 17) or (age is None and is_turning_18_soon(normalized)):
+            if age is not None:
+                facts["age"] = age
+            facts["age_confirmed"] = False
+            facts["qualification_status"] = "pending_18"
+            return SemanticResult(
+                message_type="stage_answer",
+                summary="candidate turns 18 soon -> ask birthday",
+                current_goal_satisfied=False,
+                has_unresolved_interrupt=False,
+                facts=SemanticFacts.model_validate(facts),
+                retrieval_query=text,
+                evidence="turning 18 soon",
+                confidence=0.85,
+            )
+        if age is not None:  # younger than 17 -> genuinely underage
+            facts["age"] = age
+            facts["age_confirmed"] = False
+            facts["qualification_status"] = "underage"
+            return hard_refusal_result(text, "underage")
+        # «Да / конечно / есть» в ответ на наш вопрос, упоминавший «18» («тебе уже
+        # есть 18?») — засчитываем 18+ без числа. Реальные диалоги застревали тут:
+        # модель спрашивала про 18, девочка отвечала «Да», а воронка тупо
+        # переспрашивала канонный «сколько тебе лет?». Документы проверит собес.
+        if (
+            agreement
+            and not has_question
+            and not has_objection
+            and "18" in last_outbound_bot_text(state)
+        ):
+            facts["age"] = 18
+            facts["age_confirmed"] = True
+            facts["qualification_status"] = "age_ok"
+            return stage_answer(text, facts, "18+ confirmed affirmatively")
+    elif stage == "age_pending_18":
+        birthday_at = extract_birthday_18_at(normalized)
+        if birthday_at is not None:
+            facts["birthday"] = text.strip()[:80]
+            facts["birthday_18_at"] = birthday_at.isoformat()
+            facts["qualification_status"] = "pending_18"
+            return stage_answer(text, facts, "birthday captured for 18th-birthday follow-up")
     elif stage == "salary_schedule_offer":
         if (agreement or booking_intent) and not has_question and not has_objection:
             facts["salary_schedule_interest"] = True
@@ -648,11 +740,36 @@ def deterministic_semantic(state: FunnelGraphState) -> SemanticResult:
         phone_model = extract_phone_model(text)
         if phone_model:
             facts["phone_model"] = phone_model
+            eligible = assess_phone_eligibility(phone_model)
+            if eligible is not None:
+                facts["phone_eligible"] = eligible
             return stage_answer(text, facts, "phone model provided")
         if mentions_phone_brand(normalized) and not has_question:
             return partial_answer(text, facts, ["phone_requirements"])
+        # Не называет конкретную модель, но утверждает, что телефон есть/обычный
+        # ("это мой телефон", "обычный", "норм", "пользуюсь им"). Не зацикливаем
+        # переспрос — по решению: непонятная модель = считаем, что подходит.
+        if (
+            contains_any(
+                normalized,
+                ("мой телефон", "это мой", "обычный", "обычн", "нормальн", "норм", "пользуюсь", "современн", "новый", "свежий"),
+            )
+            and not has_question
+            and not has_objection
+        ):
+            facts["phone_model"] = (text.strip()[:80] or "не уточнила")
+            facts["phone_eligible"] = True
+            return stage_answer(text, facts, "model unspecified, assumed fit")
         if facts.get("equipment_available"):
             return partial_answer(text, facts, ["equipment"])
+        if booking_intent and not has_question and not has_objection:
+            facts["interview_interest"] = True
+            return partial_answer(text, facts, [])
+    elif stage == "equipment_pc_fallback_check":
+        pc = extract_pc_webcam_available(text)
+        if pc is not None:
+            facts["pc_webcam_available"] = pc
+            return stage_answer(text, facts, "pc/webcam availability answered")
         if booking_intent and not has_question and not has_objection:
             facts["interview_interest"] = True
             return partial_answer(text, facts, [])
@@ -809,6 +926,30 @@ def partial_or_objection(text: str, facts: dict[str, Any], topic: str) -> Semant
     )
 
 
+def last_outbound_bot_text(state: FunnelGraphState) -> str:
+    """Текст нашего ПОСЛЕДНЕГО исходящего (что бот реально спросил последним).
+
+    Сначала metadata.last_bot_message (его пишет action_executor каждый ход),
+    затем — последняя outbound-запись из recent_messages / conversation_history.
+    Нужен, чтобы понимать утвердительные ответы на переформулированные вопросы
+    («тебе уже есть 18?» → «да»)."""
+    metadata = dict(state.get("metadata") or {})
+    last = str(metadata.get("last_bot_message") or "").strip()
+    if last:
+        return last
+    for source in ("recent_messages", "conversation_history"):
+        for item in reversed(list(state.get(source) or [])):
+            if not isinstance(item, dict):
+                continue
+            direction = str(item.get("direction") or "").lower()
+            sender = str(item.get("sender_type") or "").lower()
+            if direction == "outbound" or sender in {"agent", "bot", "recruiter"}:
+                body = str(item.get("body") or "").strip()
+                if body:
+                    return body
+    return ""
+
+
 def hard_refusal_result(text: str, topic: str) -> SemanticResult:
     return SemanticResult(
         message_type="hard_refusal",
@@ -880,8 +1021,144 @@ def is_hard_refusal(text: str, stage: str) -> bool:
     return text in {"нет", "нет спасибо", "неа"} and stage in {"interest_check", "salary_schedule_offer", "interview_offer"}
 
 
+SOFT_DECLINE_MARKERS = (
+    "спасибо, но нет",
+    "спасибо но нет",
+    "пока нет",
+    "не думаю что",
+    "вряд ли",
+    "не моё",
+    "не мое",
+    "не горю желанием",
+    "не готова пока",
+    "наверное нет",
+)
+
+
+def is_soft_decline(text: str) -> bool:
+    """A polite/soft 'no' that deserves ONE objection rebuttal (income angle),
+    not an instant give-up like a hard refusal. Narrow on purpose so it doesn't
+    swallow genuine questions that merely contain 'но'."""
+    if re.search(r"(^|[\s,!.?])но\s+нет([\s,!.?]|$)", text):
+        return True
+    return contains_any(text, SOFT_DECLINE_MARKERS)
+
+
+# «У меня уже есть работа» — отрабатывается углом совмещения/доп.дохода, а не
+# просто деньгами; отдельная тема even_employed с собственным ответом.
+ALREADY_EMPLOYED_MARKERS = (
+    "есть работа",
+    "уже работаю",
+    "своя работа",
+    "работа есть",
+    "не ищу работу",
+    "не ищу работы",
+    "трудоустроена",
+    "трудоустроен",
+    "у меня работа",
+)
+
+# «Не интересует / не нужно / не надо» и т.п. — несогласие, которое отрабатывается
+# денежным углом РОВНО раз (как soft decline), а не уводится в lost сразу.
+NOT_INTERESTED_MARKERS = (
+    "не интересует",
+    "неинтересует",
+    "не интересна",
+    "не нужно",
+    "не нужна работа",
+    "не надо",
+    "мне это не нужно",
+)
+
+
+def rebuttable_decline_topic(text: str) -> str | None:
+    """Единая точка распознавания «несогласия, которое стоит отработать один раз».
+
+    Возвращает топик возражения для отработки (`already_employed` /
+    `soft_decline_income`) или None. Граф после отработки ставит
+    `soft_decline_rebutted`; повторный отказ затем уходит в lost. См.
+    [[soft-decline-objection-once]]."""
+    if contains_any(text, ALREADY_EMPLOYED_MARKERS):
+        return "already_employed"
+    if is_soft_decline(text) or contains_any(text, NOT_INTERESTED_MARKERS):
+        return "soft_decline_income"
+    return None
+
+
 def is_pause(text: str) -> bool:
     return contains_any(text, ("через час", "позже", "потом", "занята", "занят", "не сейчас", "попозже"))
+
+
+def is_turning_18_soon(text: str) -> bool:
+    """Кандидатка сообщает, что 18 ещё нет, но исполнится скоро («через несколько
+    дней 18», «скоро 18», «будет 18 в июне»…). Требуем и «18», и маркер близкого
+    будущего, чтобы не путать с уже-взрослыми."""
+    if "18" not in text:
+        return False
+    return bool(
+        re.search(
+            r"(скоро|почти|вот[\s-]?вот|на дн|через\s+\w+|будет|исполн|стукнет|ещё нет|еще нет|пока нет|нет ещё|нет еще|пока 17|мне 17|только 17)",
+            text,
+        )
+    )
+
+
+RUS_MONTHS = {
+    "январ": 1, "феврал": 2, "март": 3, "марта": 3, "апрел": 4, "ма": 5, "мая": 5,
+    "июн": 6, "июл": 7, "август": 8, "авгус": 8, "сентябр": 9, "октябр": 10,
+    "ноябр": 11, "декабр": 12,
+}
+
+_RELATIVE_DAYS = (("послезавтра", 2), ("завтра", 1), ("сегодня", 0))
+
+
+def extract_birthday_18_at(text: str, now: datetime | None = None) -> datetime | None:
+    """Распарсить дату рождения и вернуть момент 18-летия (09:00 UTC того дня).
+
+    Поддерживает: «через N дней», «через неделю/две недели», «завтра/послезавтра/
+    сегодня», «DD.MM», «DD <месяц>». Для месяца/числа берётся БЛИЖАЙШЕЕ будущее
+    вхождение (кандидатке скоро 18, значит её ближайший др и есть 18-летие)."""
+    now = now or datetime.now(UTC)
+    today = now.replace(hour=9, minute=0, second=0, microsecond=0)
+
+    weeks = re.search(r"через\s+(\d+)\s*недел", text)
+    if weeks:
+        return today + timedelta(weeks=int(weeks.group(1)))
+    if re.search(r"через\s+недел", text):
+        return today + timedelta(weeks=1)
+    days = re.search(r"через\s+(\d+)\s*(дн|дня|дней|день)", text)
+    if days:
+        return today + timedelta(days=int(days.group(1)))
+    for marker, offset in _RELATIVE_DAYS:
+        if marker in text:
+            return today + timedelta(days=offset)
+
+    day = month = None
+    dmy = re.search(r"\b([0-3]?\d)[.\-/]([01]?\d)\b", text)
+    if dmy:
+        day, month = int(dmy.group(1)), int(dmy.group(2))
+    else:
+        dm = re.search(r"\b([0-3]?\d)\s+([а-я]+)", text)
+        if dm:
+            day = int(dm.group(1))
+            stem = dm.group(2)
+            for key, num in RUS_MONTHS.items():
+                if stem.startswith(key):
+                    month = num
+                    break
+    if day and month and 1 <= day <= 31 and 1 <= month <= 12:
+        year = now.year
+        try:
+            candidate = today.replace(year=year, month=month, day=day)
+        except ValueError:
+            return None
+        if candidate < today:
+            try:
+                candidate = candidate.replace(year=year + 1)
+            except ValueError:
+                return None
+        return candidate
+    return None
 
 
 def is_social_only(text: str) -> bool:
@@ -943,6 +1220,7 @@ def infer_topics(text: str) -> list[str]:
         ("training_process", ("стажиров", "обучен", "сколько длится", "когда начать", "когда можно начать", "старт")),
         ("friend_streaming", ("подруг", "вдвоем", "вдвоём", "вместе", "одному", "одной", "привести")),
         ("theme_selection", ("тематика", "тема", "хобби", "увлеч", "рис", "танц", "макияж", "визаж", "тик ток", "тикток", "сериал", "готов", "рукодел")),
+        ("meet_in_person", ("встрети", "встреча", "вживую", "в реальности", "увидеться", "повидаться", "оффлайн", "офлайн", "при встрече")),
         ("interview_process", ("собесед", "интервью", "созвон", "зум", "zoom", "google meet", "meet", "дискорд", "скачать", "онлайн", "сколько занимает")),
         ("room", ("комната", "место", "помешает", "одна")),
         ("timezone", ("мск", "москва", "москов", "часовой", "время разное", "время то разное", "краснояр", "utc", "моему времени")),
@@ -954,15 +1232,24 @@ def infer_topics(text: str) -> list[str]:
         ("no_experience", ("нет опыта", "не умею", "никогда", "без опыта", "стесня", "не работала", "не работал", "не работаю на", "мой уровень")),
         ("new_sphere_uncertainty", ("в новинку", "новая сфера", "ничего не понятно", "не уверена", "попробовать страшно")),
         ("no_time", ("нет времени", "занята", "позже", "не сейчас", "через час", "потом", "уснула")),
+        # ВАЖНО: маркеры — подстроки; голое «бот» нельзя (содержится в «работа»).
+        ("bot_suspicion", ("ты бот", "вы бот", "не бот", "бот?", "бот что ли", "ботом", "фейк", "робот", "нейросет", "автоответ", "ты вообще человек", "живой человек", "ты человек")),
+        ("already_in_industry", ("уже этим занимаюсь", "тем же самым", "этим же занимаюсь", "уже занимаюсь этим", "уже стримлю", "я стример", "уже в этой сфере", "работаю в этой сфере", "уже в теме")),
+        ("legal_concern", ("законно", "легально", "налог", "уголов", "запрещено", "по закону")),
+        ("need_to_think", ("подумаю", "надо подумать", "нужно подумать", "посоветуюсь", "обсужу с")),
+        ("wants_smalltalk_first", ("не про работу", "не о работе", "просто пообщаемся", "пообщаемся для начала", "сначала познакомимся", "давай познакомимся", "узнаем друг друга")),
     ]
     topics = [topic for topic, markers in topic_markers if contains_any(text, markers)]
-    return topics[:5]
+    # Demote the broad job_description topic when a specific topic also matched, so
+    # the most specific topic leads (it also drives interrupt_topic via
+    # first_specific_topic) and the reply answers the actual question.
+    return demote_broad_topics(topics)[:5]
 
 
 def is_question_like(raw: str, text: str, topics: list[str]) -> bool:
     if "?" in raw:
         return True
-    if any(topic in {"timezone", "platform_info", "company_channels", "friend_streaming", "training_process", "privacy_anonymity", "documents_privacy", "exit_policy"} for topic in topics):
+    if any(topic in {"timezone", "platform_info", "company_channels", "friend_streaming", "training_process", "privacy_anonymity", "documents_privacy", "exit_policy", "meet_in_person"} for topic in topics):
         return True
     return bool(topics) and contains_any(
         text,
@@ -988,9 +1275,26 @@ def is_objection_like(text: str, topics: list[str]) -> bool:
     return contains_any(text, ("боюсь", "стесняюсь", "не уверена", "сомневаюсь", "не понятно", "непонятно", "проблем"))
 
 
+PHONE_MODEL_AGE_FALSE_SUFFIXES = {
+    "про", "pro", "макс", "max", "плюс", "plus", "ultra", "ультра",
+    "мини", "mini", "se", "промакс", "прошка", "прошку", "айфон", "iphone",
+}
+
+
 def extract_age(text: str) -> int | None:
-    for match in re.finditer(r"\b(1[4-9]|[2-6]\d)\b", text):
-        return int(match.group(1))
+    tokens = text.split()
+    for index, token in enumerate(tokens):
+        cleaned = token.strip(".,!?:;()")
+        if not re.fullmatch(r"1[4-9]|[2-6]\d", cleaned):
+            continue
+        prev_token = tokens[index - 1].strip(".,!?:;()") if index > 0 else ""
+        next_token = tokens[index + 1].strip(".,!?:;()") if index + 1 < len(tokens) else ""
+        # Skip numbers that are part of a phone model, e.g. "14 про макс", "айфон 13", "11 pro".
+        if any(marker in prev_token for marker in PHONE_MODEL_MARKERS):
+            continue
+        if next_token in PHONE_MODEL_AGE_FALSE_SUFFIXES:
+            continue
+        return int(cleaned)
     if text in {"18+", "есть 18", "совершеннолетняя"}:
         return 18
     return None
@@ -1161,25 +1465,56 @@ def mentions_equipment(text: str) -> bool:
 PHONE_MODEL_MARKERS = (
     "iphone",
     "айфон",
+    "айфончик",
     "samsung",
     "самсунг",
+    "галакси",
+    "galaxy",
     "xiaomi",
+    "сяоми",
+    "ксиоми",
     "redmi",
+    "редми",
     "poco",
+    "поко",
     "honor",
+    "хонор",
     "huawei",
+    "хуавей",
+    "хуавэй",
     "oneplus",
+    "ванплюс",
     "pixel",
+    "пиксель",
+    "пиксел",
     "realme",
+    "реалми",
     "vivo",
+    "виво",
     "oppo",
+    "оппо",
     "tecno",
+    "техно",
     "infinix",
+    "инфиникс",
+    "nothing phone",
+    "нубия",
+    "nubia",
 )
 
 
 def mentions_phone_brand(text: str) -> bool:
     return contains_any(text, PHONE_MODEL_MARKERS)
+
+
+def looks_like_phone_context(text: str) -> bool:
+    """True when a number in the message belongs to a phone model, not the age."""
+    if mentions_phone_brand(text):
+        return True
+    return contains_any(
+        text,
+        ("про макс", "промакс", "pro max", "прошк", "прошка", "ultra", "ультра", "plus", "плюс", "модель", "телефон"),
+    )
 
 
 def extract_phone_model(text: str) -> str | None:
@@ -1191,6 +1526,51 @@ def extract_phone_model(text: str) -> str | None:
     if cleaned_normalized in PHONE_MODEL_MARKERS:
         return None
     return cleaned.strip(" .,!?:;")[:80] or None
+
+
+_IPHONE_NUM_RE = re.compile(r"(?:iphone|айфон\w*)\s*(\d{1,2})")
+
+
+def assess_phone_eligibility(model_text: str) -> bool | None:
+    """Deterministic safety net for the recording-device rule.
+
+    Rule (for booking): iPhone 11+, Android released 2023+, flagship 2022+.
+    We can only judge *numbered iPhones* with certainty here (iPhone 11+ = fit,
+    iPhone X/8 and below = unfit). For Android the release year almost never
+    lives in the model string and varies wildly, so we return None and let the
+    LLM judge — and an undecidable model is treated as fit upstream (per spec:
+    "непонятно какой телефон = считаем, что подходит", do not loop).
+    """
+    norm = normalize_text(model_text)
+    match = _IPHONE_NUM_RE.search(norm)
+    if match:
+        try:
+            num = int(match.group(1))
+        except ValueError:
+            num = None
+        if num is not None and 1 <= num <= 20:
+            return num >= 11
+    if contains_any(norm, ("айфон икс", "айфон x", "iphone x", "айфон 10", "iphone 10")):
+        return False  # iPhone X == 10, below the cutoff
+    return None
+
+
+def extract_pc_webcam_available(text: str) -> bool | None:
+    """yes/no for the 'do you have a PC/laptop with a webcam?' fallback stage."""
+    norm = normalize_text(text)
+    mentions_pc = contains_any(
+        norm,
+        ("пк", "комп", "компьютер", "ноут", "ноутбук", "макбук", "macbook", "моноблок", "laptop"),
+    )
+    if contains_any(text, ("нет", "неа", "нету", "не могу", "отсутств", "к сожалению")) and not contains_any(
+        text, ("да", "есть", "имеется")
+    ):
+        return False
+    if mentions_pc and not is_negative(text):
+        return True
+    if contains_any(text, ("да", "есть", "имеется", "конечно", "ага")) and not is_negative(text):
+        return True
+    return None
 
 
 def extract_phone_number(text: str) -> str | None:

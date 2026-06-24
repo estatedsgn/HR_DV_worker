@@ -19,7 +19,15 @@ class FakeOutboundRepository:
     def __init__(self, jobs):
         self.jobs = jobs
 
-    async def claim_ready_batch(self, *, lease_owner: str, limit: int = 50, lease_seconds: int = 60):
+    async def claim_ready_batch(
+        self,
+        *,
+        lease_owner: str,
+        limit: int = 50,
+        lease_seconds: int = 60,
+        account_id=None,
+        exclude_own_key_accounts: bool = False,
+    ):
         for job in self.jobs[:limit]:
             job.lease_owner = lease_owner
             job.lease_expires_at = datetime.now(UTC) + timedelta(seconds=lease_seconds)
@@ -115,6 +123,20 @@ def test_normalize_username() -> None:
     assert normalize_username("@IamNekiy") == "@iamnekiy"
 
 
+def test_is_permanent_send_error_classifies_telegram_privacy_rejections() -> None:
+    from app.services.crmchat_connector import CRMChatAPIError
+
+    # Recipient privacy / blocked / gone -> permanent, must NOT be retried.
+    assert OutboundQueueWorker._is_permanent_send_error(
+        CRMChatAPIError("PRIVACY_PREMIUM_REQUIRED PRIVACY_PREMIUM_REQUIRED")
+    )
+    assert OutboundQueueWorker._is_permanent_send_error(Exception("user_privacy_restricted"))
+    assert OutboundQueueWorker._is_permanent_send_error(Exception("PEER_ID_INVALID"))
+    # Transient infra / flood -> retryable, must NOT be classified permanent.
+    assert not OutboundQueueWorker._is_permanent_send_error(Exception("ReadTimeout"))
+    assert not OutboundQueueWorker._is_permanent_send_error(CRMChatAPIError("FLOOD_WAIT_30"))
+
+
 def test_text_typing_delay_is_random_between_min_and_max(monkeypatch) -> None:
     calls = []
 
@@ -138,7 +160,9 @@ def test_text_typing_delay_is_random_between_min_and_max(monkeypatch) -> None:
     assert calls == [(5.0, 10.0)]
 
 
-def test_send_guard_blocks_non_allowlisted_username() -> None:
+def test_send_guard_blocks_non_daivinchik_non_allowlisted() -> None:
+    # Диалог не из разрешённого источника (session.get(Dialog) -> None) и username
+    # не в allowlist -> блок. Это обычный telegram:-собеседник (бот/случайный).
     worker = OutboundQueueWorker(
         FakeSession(make_account()),
         connector=FakeConnector(),
@@ -148,7 +172,46 @@ def test_send_guard_blocks_non_allowlisted_username() -> None:
     job = OutboundJob(target_username="@other", text="hello", scheduled_at=datetime.now(UTC))
 
     with pytest.raises(OutboundSendBlockedError):
-        worker._assert_send_allowed(job)
+        asyncio.run(worker._assert_send_allowed(job))
+
+
+def test_send_guard_allows_daivinchik_intake_dialog() -> None:
+    # Диалог заведён интейком daivinchik -> аутрич разрешён даже без username в
+    # allowlist (динамический лид по взаимной симпатии).
+    from app.models.dialog import Dialog
+
+    account = make_account()
+    dialog = Dialog(
+        id=uuid.uuid4(),
+        account_id=account.id,
+        crmchat_dialog_id="intake:daivinchik:@yulia_k",
+        telegram_username="@yulia_k",
+        status="open",
+    )
+    session = FakeSession(account)
+
+    async def get(model, object_id):
+        if model.__name__ == "Dialog" and object_id == dialog.id:
+            return dialog
+        if model.__name__ == "Account" and object_id == account.id:
+            return account
+        return None
+
+    session.get = get  # type: ignore[assignment]
+    worker = OutboundQueueWorker(
+        session,
+        connector=FakeConnector(),
+        settings=Settings(OUTBOUND_ALLOWED_USERNAMES=""),
+        allow_real_send=True,
+    )
+    job = OutboundJob(
+        dialog_id=dialog.id,
+        target_username="@yulia_k",
+        text="hello",
+        scheduled_at=datetime.now(UTC),
+    )
+    # не бросает -> отправка разрешена
+    asyncio.run(worker._assert_send_allowed(job))
 
 
 def test_send_guard_blocks_when_real_send_disabled() -> None:
@@ -161,7 +224,7 @@ def test_send_guard_blocks_when_real_send_disabled() -> None:
     job = OutboundJob(target_username="@iamnekiy", text="hello", scheduled_at=datetime.now(UTC))
 
     with pytest.raises(OutboundSendBlockedError):
-        worker._assert_send_allowed(job)
+        asyncio.run(worker._assert_send_allowed(job))
 
 
 def test_worker_sends_allowlisted_job_and_updates_message() -> None:
@@ -208,6 +271,64 @@ def test_worker_sends_allowlisted_job_and_updates_message() -> None:
     assert connector.typing_actions == ["sendMessageTypingAction"]
     assert account.next_available_at is not None
     assert session.committed is True
+
+
+def test_worker_enforces_min_dialog_gap() -> None:
+    """Анти-залп: вторая джоба того же диалога в одном батче сдвигается на
+    last_sent + gap, не отправляется и не тратит attempt."""
+    account = make_account()
+    account.send_interval_seconds = 0  # изолируем per-dialog gap от per-account пейсинга
+    dialog_id = uuid.uuid4()
+
+    def make_job(text: str) -> OutboundJob:
+        return OutboundJob(
+            id=uuid.uuid4(),
+            account_id=account.id,
+            dialog_id=dialog_id,
+            target_username="@iamnekiy",
+            peer={"_": "inputPeerUser", "userId": 1, "accessHash": "hash"},
+            text=text,
+            status="queued",
+            scheduled_at=datetime.now(UTC),
+            max_attempts=3,
+        )
+
+    first, second = make_job("первое"), make_job("второе")
+    worker = OutboundQueueWorker(
+        FakeSession(account),
+        connector=FakeConnector(),
+        settings=Settings(
+            OUTBOUND_ALLOWED_USERNAMES="@iamnekiy",
+            OUTBOUND_TYPING_MIN_DELAY_SECONDS=0,
+            OUTBOUND_MIN_DIALOG_GAP_SECONDS=30,
+        ),
+        allow_real_send=True,
+        typing_delay_seconds=0.001,
+    )
+    worker.repository = FakeOutboundRepository([first, second])
+
+    result = asyncio.run(worker.process_queued_batch(limit=2))
+
+    assert result.sent == 1
+    assert result.rescheduled == 1
+    assert first.status == "sent"
+    assert second.status == "queued"  # статус не тронут, attempt не израсходован
+    assert second.attempt_count is None or second.attempt_count == 0
+    assert second.scheduled_at >= first.sent_at + timedelta(seconds=30)
+
+
+def test_claim_ready_batch_sql_orders_groups_and_gates_dialog_fifo() -> None:
+    """Контракт claim-запроса: детерминированный тайбрейкер по reply_group_index
+    (created_at у джоб одной транзакции идентичен) и per-dialog FIFO-гейт."""
+    import inspect
+
+    from app.repositories.outbound_job import OutboundJobRepository
+
+    source = inspect.getsource(OutboundJobRepository.claim_ready_batch)
+    assert source.count("reply_group_index") >= 3  # ORDER BY + обе стороны NOT EXISTS
+    assert "NOT EXISTS" in source
+    assert "prior.dialog_id = outbound_jobs.dialog_id" in source
+    assert "prior.status IN ('queued', 'retry')" in source
 
 
 def test_worker_sends_voice_job_with_recording_action() -> None:

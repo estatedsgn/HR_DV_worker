@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from uuid import UUID
 
-from sqlalchemy import bindparam, select, text
+from sqlalchemy import Integer, bindparam, func, select, text
 
 from app.models.outbound_job import OutboundJob
 from app.repositories.base import BaseRepository
@@ -12,12 +13,42 @@ class OutboundJobRepository(BaseRepository[OutboundJob]):
     model = OutboundJob
 
     async def claim_ready_batch(
-        self, *, lease_owner: str, limit: int = 50, lease_seconds: int = 60
+        self,
+        *,
+        lease_owner: str,
+        limit: int = 50,
+        lease_seconds: int = 60,
+        account_id: str | None = None,
+        exclude_own_key_accounts: bool = False,
     ) -> list[OutboundJob]:
         now = datetime.now(UTC)
         lease_expires_at = now + timedelta(seconds=lease_seconds)
+        # Per-account processes each own their own CRMchat key, so a worker must
+        # only claim jobs for its own account — otherwise it would try to send
+        # another account's message with the wrong key. account_id=None keeps the
+        # global behaviour (single shared worker claims everything), EXCEPT jobs of
+        # accounts that have their own key (exclude_own_key_accounts): those are
+        # served by their own scoped worker, and the global key can't even reach
+        # their workspace ("You do not have access to this workspace").
+        account_filter = "AND account_id = :account_id" if account_id else ""
+        if not account_id and exclude_own_key_accounts:
+            account_filter = (
+                "AND account_id NOT IN ("
+                "SELECT id FROM accounts "
+                "WHERE crmchat_api_key IS NOT NULL AND crmchat_api_key <> ''"
+                ")"
+            )
+        # Все джобы одного ответа пишутся в одной транзакции: created_at у них
+        # ИДЕНТИЧЕН (now() = время начала транзакции), а PK — случайный UUID.
+        # Без третьего члена сортировки порядок внутри группы решал heap order.
+        # reply_group_index монотонно растёт внутри группы (metadata_for_action),
+        # у не-funnel джоб его нет -> COALESCE 0 и старый порядок по created_at.
+        # NOT EXISTS — per-dialog FIFO: джоба N+1 не уйдёт раньше N (ретрай N
+        # сознательно блокирует N+1: порядок в чате важнее латентности).
+        # Гейтим только queued/retry: processing шлёт этот же воркер прямо сейчас
+        # (последовательно), cancelled/dead_letter блокировать не должны.
         query = text(
-            """
+            f"""
             WITH candidates AS (
                 SELECT id
                 FROM outbound_jobs
@@ -28,7 +59,27 @@ class OutboundJobRepository(BaseRepository[OutboundJob]):
                     )
                     AND scheduled_at <= :now
                     AND (lease_expires_at IS NULL OR lease_expires_at <= :now)
-                ORDER BY scheduled_at ASC, created_at ASC
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM outbound_jobs prior
+                        WHERE prior.dialog_id = outbound_jobs.dialog_id
+                          AND prior.id <> outbound_jobs.id
+                          AND prior.status IN ('queued', 'retry')
+                          AND (
+                                prior.scheduled_at,
+                                prior.created_at,
+                                COALESCE((prior.media_metadata->>'reply_group_index')::int, 0)
+                              ) < (
+                                outbound_jobs.scheduled_at,
+                                outbound_jobs.created_at,
+                                COALESCE((outbound_jobs.media_metadata->>'reply_group_index')::int, 0)
+                              )
+                    )
+                    {account_filter}
+                ORDER BY
+                    scheduled_at ASC,
+                    created_at ASC,
+                    COALESCE((media_metadata->>'reply_group_index')::int, 0) ASC
                 LIMIT :limit
                 FOR UPDATE SKIP LOCKED
             )
@@ -45,22 +96,31 @@ class OutboundJobRepository(BaseRepository[OutboundJob]):
             bindparam("lease_owner"),
             bindparam("lease_expires_at"),
         )
-        result = await self.session.execute(
-            query,
-            {
-                "now": now,
-                "limit": limit,
-                "lease_owner": lease_owner,
-                "lease_expires_at": lease_expires_at,
-            },
-        )
+        params = {
+            "now": now,
+            "limit": limit,
+            "lease_owner": lease_owner,
+            "lease_expires_at": lease_expires_at,
+        }
+        if account_id:
+            query = query.bindparams(bindparam("account_id"))
+            # account_id is a UUID column; bind a UUID object so asyncpg encodes it
+            # natively (a plain str would fail the uuid comparison).
+            params["account_id"] = account_id if isinstance(account_id, UUID) else UUID(str(account_id))
+        result = await self.session.execute(query, params)
         ids = [row[0] for row in result.fetchall()]
         if not ids:
             return []
         claimed = await self.session.execute(
             select(OutboundJob)
             .where(OutboundJob.id.in_(ids))
-            .order_by(OutboundJob.scheduled_at.asc(), OutboundJob.created_at.asc())
+            .order_by(
+                OutboundJob.scheduled_at.asc(),
+                OutboundJob.created_at.asc(),
+                func.coalesce(
+                    OutboundJob.media_metadata.op("->>")("reply_group_index").cast(Integer), 0
+                ).asc(),
+            )
         )
         return list(claimed.scalars().all())
 
